@@ -12,7 +12,12 @@ set "BASE_DIR=%APP_DIR:~0,-1%"
 for %%I in ("%BASE_DIR%") do set "APP_BASENAME=%%~nI"
 if not defined APP_BASENAME set "APP_BASENAME=RepoRunner"
 
-set "SHADOW_ROOT=%LocalAppData%\%APP_BASENAME%"
+rem Resolve a writable base (LOCALAPPDATA fallback to TEMP)
+set "USER_BASE=%LOCALAPPDATA%"
+if not defined USER_BASE set "USER_BASE=%LocalAppData%"
+if not defined USER_BASE set "USER_BASE=%TEMP%"
+
+set "SHADOW_ROOT=%USER_BASE%\%APP_BASENAME%"
 set "SHADOW_DIR=%SHADOW_ROOT%\current"
 
 rem If we are NOT already running from the shadow directory, mirror and relaunch
@@ -24,21 +29,45 @@ if not "%SHADOW_DIR_NORM:~-1%"=="\" set "SHADOW_DIR_NORM=%SHADOW_DIR_NORM%\"
 
 if /I not "%APP_DIR_NORM%"=="%SHADOW_DIR_NORM%" (
     echo [INFO] Preparing isolated workspace at "%SHADOW_DIR%"
+    rem Recreate destination
+    if exist "%SHADOW_DIR%" rmdir /S /Q "%SHADOW_DIR%"
     mkdir "%SHADOW_DIR%" >nul 2>&1
 
-    rem Use ROBOCOPY to mirror files, excluding venv, git and temp artefacts
-    rem /MIR mirrors directory tree; /XD excludes dirs; /XF excludes files
-    robocopy "%APP_DIR%" "%SHADOW_DIR%" /MIR /R:2 /W:2 /NFL /NDL /NJH /NJS /XD venv .git __pycache__ /XF app_error.log >nul
-    if errorlevel 8 (
-        echo [WARN] Robocopy reported non-critical issues. Continuing.
+    rem Prefer ROBOCOPY if present
+    where robocopy >nul 2>&1
+    if %errorlevel%==0 (
+        rem Use ROBOCOPY to mirror files, excluding venv, git and temp artefacts
+        rem /MIR mirrors directory tree; /XD excludes dirs; /XF excludes files
+        robocopy "%APP_DIR%" "%SHADOW_DIR%" /MIR /R:2 /W:2 /NFL /NDL /NJH /NJS /XD venv .git __pycache__ /XF app_error.log >nul
+        if errorlevel 8 (
+            echo [WARN] Robocopy reported issues (code !errorlevel!). Attempting to continue.
+        )
+    ) else (
+        rem Fallback to XCOPY (no exact mirror). Copy everything except known folders.
+        xcopy "%APP_DIR%*" "%SHADOW_DIR%\" /E /I /H /Y >nul
+        rem Remove excluded directories if copied
+        if exist "%SHADOW_DIR%\venv" rmdir /S /Q "%SHADOW_DIR%\venv"
+        if exist "%SHADOW_DIR%\.git" rmdir /S /Q "%SHADOW_DIR%\.git"
+        if exist "%SHADOW_DIR%\__pycache__" rmdir /S /Q "%SHADOW_DIR%\__pycache__"
+        if exist "%SHADOW_DIR%\app_error.log" del /F /Q "%SHADOW_DIR%\app_error.log"
     )
 
-    echo [INFO] Relaunching from isolated workspace...
-    set "RUN_FROM_SHADOW=1"
-    start "" "%SHADOW_DIR%\start.bat"
-    popd
-    endlocal
-    exit /b 0
+    rem Verify start.bat exists in shadow
+    if not exist "%SHADOW_DIR%\start.bat" (
+        copy /Y "%APP_DIR%start.bat" "%SHADOW_DIR%\" >nul
+    )
+    if not exist "%SHADOW_DIR%\start.bat" (
+        echo [ERROR] Shadow launch failed: "%SHADOW_DIR%\start.bat" not found.
+        echo [WARN] Running in-place instead of isolated workspace.
+    ) else (
+        echo [INFO] Relaunching from isolated workspace...
+        set "RUN_FROM_SHADOW=1"
+        rem Use cmd /c to ensure .bat is launched correctly with quotes
+        start "" cmd /c "\"%SHADOW_DIR%\start.bat\""
+        popd
+        endlocal
+        exit /b 0
+    )
 )
 
 echo [INFO] Starting setup...
