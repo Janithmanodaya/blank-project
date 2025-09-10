@@ -286,13 +286,50 @@ class App(ctk.CTk):
         else:
             self.append_output("[INFO] No requirements.txt found. Skipping dependency installation.")
 
+    def _run_tool_with_output(self, args, timeout=120):
+        """
+        Run a command, stream its output to the GUI, and enforce a timeout.
+        Returns process return code or None if killed by timeout.
+        """
+        try:
+            self.append_output(f"[TOOL] {' '.join(args)}")
+            proc = subprocess.Popen(
+                args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                universal_newlines=True,
+                creationflags=0
+            )
+            start = time.time()
+            while True:
+                line = proc.stdout.readline()
+                if line:
+                    self.append_output(line.rstrip("\n"))
+                if proc.poll() is not None:
+                    break
+                if time.time() - start > timeout:
+                    self.append_output(f"[WARN] Command timed out after {timeout}s, terminating...")
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    return None
+            return proc.returncode
+        except Exception as e:
+            self.append_output(f"[WARN] Failed to run command: {e}")
+            return None
+
     def ensure_php_available(self) -> str | None:
         """
         Ensures a php.exe is available.
         Returns a directory path to prepend to PATH if a bundled PHP is set up, else None.
         Strategy:
           1) Check PATH and bundled locations.
-          2) Try system package managers (winget, then choco).
+          2) Try system package managers (winget, then choco) with timeouts and streamed logs.
           3) If still missing, guide manual placement.
         """
         # Already available?
@@ -304,32 +341,34 @@ class App(ctk.CTk):
             if (cand / "php.exe").exists():
                 return str(cand)
 
-        # Try winget
-        self.append_output("[INFO] php.exe not found. Trying to install via winget (requires Windows 10/11 Apps Installer)...")
-        try:
-            # Silent install with agreements accepted
-            code = subprocess.call([
-                "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+        # Try winget if available
+        if shutil.which("winget"):
+            self.append_output("[INFO] php.exe not found. Trying to install via winget (requires Windows Apps Installer)...")
+            code = self._run_tool_with_output([
                 "winget", "install", "-e", "--id", "PHP.PHP",
                 "--accept-package-agreements", "--accept-source-agreements", "--silent"
-            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            ], timeout=180)
             if code == 0 and shutil.which("php"):
                 self.append_output("[INFO] PHP installed via winget.")
                 return None
-        except Exception as e:
-            self.append_output(f"[WARN] winget not available or failed: {e}")
+            else:
+                self.append_output("[WARN] winget did not complete PHP installation.")
+        else:
+            self.append_output("[INFO] winget not available on this system. Skipping.")
 
-        # Try Chocolatey
-        self.append_output("[INFO] Trying to install PHP via Chocolatey (requires choco installed and admin)...")
-        try:
-            code = subprocess.call([
-                "cmd", "/c", "choco", "install", "php", "-y", "--no-progress"
-            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Try Chocolatey if available
+        if shutil.which("choco"):
+            self.append_output("[INFO] Trying to install PHP via Chocolatey (requires admin).")
+            code = self._run_tool_with_output([
+                "choco", "install", "php", "-y", "--no-progress"
+            ], timeout=300)
             if code == 0 and shutil.which("php"):
                 self.append_output("[INFO] PHP installed via Chocolatey.")
                 return None
-        except Exception as e:
-            self.append_output(f"[WARN] Chocolatey not available or failed: {e}")
+            else:
+                self.append_output("[WARN] Chocolatey did not complete PHP installation.")
+        else:
+            self.append_output("[INFO] Chocolatey not available on this system. Skipping.")
 
         # Give up with clear instructions
         self.append_output("[ERROR] Could not set up PHP automatically.")
