@@ -6,6 +6,8 @@ import subprocess
 import time
 import json
 import shutil
+import zipfile
+import urllib.request
 from pathlib import Path
 
 import customtkinter as ctk
@@ -113,6 +115,10 @@ class App(ctk.CTk):
         self.selected_files = []
         self.pass_as_args_var = ctk.BooleanVar(value=True)
         self.export_env_var = ctk.BooleanVar(value=True)
+
+        # Where we place auto-downloaded tools (e.g., PHP)
+        self.tools_dir = APP_DIR / "tools"
+        self.tools_dir.mkdir(exist_ok=True)
 
         # Top frame for input controls
         top = ctk.CTkFrame(self)
@@ -280,6 +286,69 @@ class App(ctk.CTk):
         else:
             self.append_output("[INFO] No requirements.txt found. Skipping dependency installation.")
 
+    def ensure_php_available(self) -> str | None:
+        """
+        Ensures a php.exe is available.
+        Returns a directory path to prepend to PATH if a bundled PHP is set up, else None.
+        Tries to download a portable PHP if not found in PATH.
+        """
+        # Already available?
+        if shutil.which("php"):
+            return None
+
+        # Existing bundled location?
+        for cand in [APP_DIR / "php", APP_DIR / "bin" / "php", self.tools_dir / "php"]:
+            if (cand / "php.exe").exists():
+                return str(cand)
+
+        # Attempt to auto-download a portable PHP zip and extract it
+        self.append_output("[INFO] php.exe not found. Attempting to download a portable PHP build...")
+        dest = self.tools_dir / "php"
+        dest.mkdir(parents=True, exist_ok=True)
+
+        # Candidate URLs (x64 thread-safe). We try several known releases.
+        urls = [
+            # PHP 8.2 (VS16)
+            "https://windows.php.net/downloads/releases/php-8.2.24-Win32-vs16-x64.zip",
+            "https://windows.php.net/downloads/releases/php-8.2.23-Win32-vs16-x64.zip",
+            # PHP 8.3 (VS17)
+            "https://windows.php.net/downloads/releases/php-8.3.12-Win32-vs17-x64.zip",
+            "https://windows.php.net/downloads/releases/php-8.3.11-Win32-vs17-x64.zip",
+        ]
+
+        zip_path = self.tools_dir / "php.zip"
+        for url in urls:
+            try:
+                self.append_output(f"[INFO] Downloading: {url}")
+                urllib.request.urlretrieve(url, str(zip_path))
+                if zipfile.is_zipfile(str(zip_path)):
+                    with zipfile.ZipFile(str(zip_path), "r") as zf:
+                        zf.extractall(str(dest))
+                    # Some zips contain files at root; ensure php.exe exists somewhere inside
+                    # Look for php.exe
+                    found = None
+                    for root, dirs, files in os.walk(dest):
+                        if "php.exe" in files:
+                            found = Path(root)
+                            break
+                    if found:
+                        self.append_output("[INFO] Portable PHP downloaded and extracted.")
+                        # If php.exe not directly under dest/php, but in a subdir, we prefer that folder
+                        if found != dest:
+                            return str(found)
+                        return str(dest)
+            except Exception as e:
+                self.append_output(f"[WARN] Failed to download or extract from {url}: {e}")
+            finally:
+                try:
+                    if zip_path.exists():
+                        zip_path.unlink()
+                except Exception:
+                    pass
+
+        self.append_output("[ERROR] Automatic PHP download failed. Please install PHP or place php.exe under ./php, ./bin/php, or ./tools/php.")
+        return None
+
     def find_and_run(self, repo_dir: Path):
         candidates = ["main.py", "app.py", "run.py", "start.py", "st.py"]
         entry = None
@@ -297,28 +366,16 @@ class App(ctk.CTk):
 
         # Preflight: detect if the repository likely needs PHP and ensure it's present
         needs_php = any(repo_dir.rglob("*.php"))
-        php_in_path = shutil.which("php") is not None
-        php_bundle_dir = None
-        if not php_in_path:
-            # Check for a bundled php.exe under common folders
-            for cand in [APP_DIR / "php", APP_DIR / "tools" / "php", APP_DIR / "bin" / "php"]:
-                if (cand / "php.exe").exists():
-                    php_bundle_dir = str(cand)
-                    php_in_path = True
-                    break
-
-        if needs_php and not php_in_path:
-            self.append_output("[ERROR] This repository appears to require PHP (found .php files), but php.exe was not found.")
-            self.append_output("        Install PHP and ensure php.exe is on your PATH, or place a portable PHP under one of:")
-            self.append_output("        - ./php")
-            self.append_output("        - ./tools/php")
-            self.append_output("        - ./bin/php")
-            self.append_output("        Then click Run again.")
-            return
+        php_dir_to_prepend = None
+        if needs_php:
+            php_dir_to_prepend = self.ensure_php_available()
+            if not shutil.which("php") and php_dir_to_prepend is None:
+                # Could not ensure php
+                return
 
         env = os.environ.copy()
-        if php_bundle_dir:
-            env["PATH"] = php_bundle_dir + os.pathsep + env.get("PATH", "")
+        if php_dir_to_prepend:
+            env["PATH"] = php_dir_to_prepend + os.pathsep + env.get("PATH", "")
 
         # Provide selected files to the target script
         if self.export_env_var.get() and self.selected_files:
