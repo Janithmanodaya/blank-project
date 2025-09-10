@@ -58,6 +58,7 @@ if %errorlevel%==0 (
 rem Ensure critical files exist
 if not exist "%WORK_DIR%\app.py" (
     echo [ERROR] Workspace copy failed (missing app.py). Aborting.
+    pause
     popd
     endlocal
     exit /b 1
@@ -179,6 +180,9 @@ set "EXITCODE=%ERRORLEVEL%"
 popd
 
 echo [INFO] Application exited with code %EXITCODE%
+echo.
+echo Press any key to close this window...
+pause >nul
 popd
 endlocal
 exit /b %EXITCODE%
