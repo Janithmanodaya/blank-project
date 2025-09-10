@@ -311,17 +311,18 @@ class App(ctk.CTk):
         self.stop_button = ctk.CTkButton(input_frame, text="Stop Process", command=self.stop_process)
         self.stop_button.pack(side="left")
 
-        # Terminals panel
-        terms_panel = ctk.CTkFrame(self)
-        terms_panel.pack(side="bottom", fill="both", expand=True, padx=10, pady=(0, 10))
+        # Terminals panel host (can detach to a separate window)
+        self.terminal_container = ctk.CTkFrame(self)
+        self.terminal_container.pack(side="bottom", fill="both", expand=True, padx=10, pady=(0, 10))
+        self.term_window = None  # detached window handle
 
-        controls = ctk.CTkFrame(terms_panel)
-        controls.pack(side="top", fill="x", pady=(0, 6))
+        # State
+        self.runner = ProcessRunner(self.append_output)
+        self.current_repo_dir = None
+        self.terminals = []
 
-        self.new_term_btn = ctk.CTkButton(controls, text="New Terminal", command=self.new_terminal)
-        self.new_term_btn.pack(side="left", padx=(0, 8))
-
-        self.close_term_btn = ctk.CTkButton(controls, text="Close Terminal", command=self.close_current_terminal)
+        # Build terminal UI in main view
+        self.build_terminal_ui(self.terminal_container, detached=Fa_codel)
         self.close_term_btn.pack(side="left")
 
         self.term_tabs = ctk.CTkTabview(terms_panel)
@@ -445,6 +446,79 @@ class App(ctk.CTk):
         # Select another tab if exists
         if self.terminals:
             self.term_tabs.set(self.terminals[-1]["name"])
+
+    # ==== Terminal container management (detach/attach) ====
+
+    def build_terminal_ui(self, host, detached: bool = False):
+        # Destroy any existing children of host
+        try:
+            for w in host.winfo_children():
+                w.destroy()
+        except Exception:
+            pass
+
+        terms_panel = ctk.CTkFrame(host)
+        terms_panel.pack(side="top", fill="both", expand=True)
+
+        controls = ctk.CTkFrame(terms_panel)
+        controls.pack(side="top", fill="x", pady=(0, 6))
+
+        self.new_term_btn = ctk.CTkButton(controls, text="New Terminal", command=self.new_terminal)
+        self.new_term_btn.pack(side="left", padx=(0, 8))
+
+        self.close_term_btn = ctk.CTkButton(controls, text="Close Terminal", command=self.close_current_terminal)
+        self.close_term_btn.pack(side="left", padx=(0, 8))
+
+        # Toggle button: detach or attach
+        if detached:
+            toggle_btn = ctk.CTkButton(controls, text="Attach to Main", command=self.attach_terminal)
+        else:
+            toggle_btn = ctk.CTkButton(controls, text="Pop-out Terminal", command=self.detach_terminal)
+        toggle_btn.pack(side="left")
+
+        self.term_tabs = ctk.CTkTabview(terms_panel)
+        self.term_tabs.pack(side="top", fill="both", expand=True)
+
+        # Reset sessions
+        self.terminals = []
+        self.new_terminal(initial=True)
+
+    def detach_terminal(self):
+        if self.term_window is not None:
+            try:
+                self.term_window.lift()
+            except Exception:
+                pass
+            return
+        # Create detachable window and rebuild terminals there
+        win = ctk.CTkToplevel(self)
+        win.title("Terminal")
+        win.geometry("900x400")
+        win.resizable(True, True)
+        self.term_window = win
+        self.build_terminal_ui(win, detached=True)
+
+        def on_close():
+            # When closed, attach back to main automatically
+            try:
+                self.attach_terminal()
+            except Exception:
+                pass
+        try:
+            win.protocol("WM_DELETE_WINDOW", on_close)
+        except Exception:
+            pass
+
+    def attach_terminal(self):
+        # Destroy detachable window if exists
+        if self.term_window is not None:
+            try:
+                self.term_window.destroy()
+            except Exception:
+                pass
+            self.term_window = None
+        # Rebuild in main container
+        self.build_terminal_ui(self.terminal_container, detached=False)
 
     def get_session(self, tab_name):
         for s in self.terminals:
@@ -978,6 +1052,185 @@ class App(ctk.CTk):
             except Exception as e:
                 self.append_output(f"[WARN] Installer script failed: {e}")
 
+    # ==== Manual selection popup for installer and runner ====
+
+    def _run_installer_file(self, file_path: Path, repo_dir: Path):
+        ext = file_path.suffix.lower()
+        try:
+            if ext == ".sh":
+                bash = shutil.which("bash")
+                if not bash:
+                    cand = Path("C:/Program Files/Git/bin/bash.exe")
+                    if cand.exists():
+                        bash = str(cand)
+                if not bash:
+                    self.append_output("[WARN] bash not found. Cannot run shell installer.")
+                    return
+                self.run_and_wait([bash, str(file_path)], cwd=str(repo_dir))
+            elif ext == ".bat" and os.name == "nt":
+                self.run_and_wait(["cmd", "/c", str(file_path)], cwd=str(repo_dir))
+            elif ext == ".ps1":
+                pwsh = shutil.which("powershell") or shutil.which("pwsh")
+                if not pwsh:
+                    self.append_output("[WARN] PowerShell not found. Cannot run PS installer.")
+                    return
+                self.run_and_wait([pwsh, "-ExecutionPolicy", "Bypass", "-File", str(file_path)], cwd=str(repo_dir))
+            elif ext == ".py":
+                self.run_and_wait([sys.executable, str(file_path)], cwd=str(repo_dir))
+            else:
+                self.append_output(f"[WARN] Unsupported installer type: {file_path.name}")
+        except Exception as e:
+            self.append_output(f"[WARN] Manual installer failed: {e}")
+
+    def _run_selected_file(self, file_path: Path, env: dict):
+        p = file_path
+        ext = p.suffix.lower()
+        if ext == ".py":
+            self.run_streaming([sys.executable, str(p)], cwd=str(p.parent), env=env)
+            return
+        if ext == ".sh":
+            bash = shutil.which("bash")
+            if not bash:
+                cand = Path("C:/Program Files/Git/bin/bash.exe")
+                if cand.exists():
+                    bash = str(cand)
+            if bash and Path(str(bash)).exists():
+                self.run_streaming([bash, str(p)], cwd=str(p.parent), env=env)
+                return
+            self.append_output("[ERROR] bash not found to run .sh file.")
+            return
+        if ext == ".bat" and os.name == "nt":
+            self.run_streaming(["cmd", "/c", str(p)], cwd=str(p.parent), env=env)
+            return
+        if ext == ".ps1":
+            pwsh = shutil.which("powershell") or shutil.which("pwsh")
+            if pwsh:
+                self.run_streaming([pwsh, "-ExecutionPolicy", "Bypass", "-File", str(p)], cwd=str(p.parent), env=env)
+                return
+            self.append_output("[ERROR] PowerShell not found to run .ps1 file.")
+            return
+        if ext == ".php":
+            php_dir_to_prepend = self.ensure_php_available()
+            if php_dir_to_prepend:
+                env["PATH"] = php_dir_to_prepend + os.pathsep + env.get("PATH", "")
+            if shutil.which("php"):
+                self.run_streaming(["php", str(p)], cwd=str(p.parent), env=env)
+                return
+            self.append_output("[ERROR] php not found to run .php file.")
+            return
+        self.append_output(f"[ERROR] Unsupported file to run: {p.name}")
+
+    def _guess_install_script(self, repo_dir: Path) -> Path | None:
+        for name in ("install.sh", "setup.sh", "bootstrap.sh", "install.bat", "setup.bat", "install.ps1", "setup.ps1"):
+            p = repo_dir / name
+            if p.exists():
+                return p
+        return None
+
+    def _guess_run_script(self, repo_dir: Path) -> Path | None:
+        # Prefer common python entries
+        for root, _, files in os.walk(repo_dir):
+            for c in ("main.py", "app.py", "run.py", "start.py", "st.py"):
+                if c in files:
+                    return Path(root) / c
+        # Then .sh/.bat/.ps1 in root
+        for pattern in ("*.sh", "*.bat", "*.ps1"):
+            match = next(repo_dir.glob(pattern), None)
+            if match:
+                return match
+        # Then any python in root
+        p = next(repo_dir.glob("*.py"), None)
+        return p
+
+    def prompt_manual_selection(self, repo_dir: Path, env: dict):
+        def _open():
+            win = ctk.CTkToplevel(self)
+            win.title("Select installer (optional) and runner")
+            win.geometry("600x220")
+            win.resizable(True, False)
+            try:
+                win.transient(self)
+                win.grab_set()
+            except Exception:
+                pass
+
+            # Rows
+            row_install = ctk.CTkFrame(win)
+            row_install.pack(fill="x", padx=10, pady=(10, 6))
+            ctk.CTkLabel(row_install, text="Installer (optional):").pack(side="left")
+            inst_entry = ctk.CTkEntry(row_install, width=380)
+            inst_entry.pack(side="left", padx=6, fill="x", expand=True)
+            def browse_inst():
+                p = filedialog.askopenfilename(
+                    title="Select installer script (optional)",
+                    initialdir=str(repo_dir),
+                    filetypes=[("Scripts", "*.sh;*.bat;*.ps1;*.py"), ("All files", "*.*")]
+                )
+                if p:
+                    inst_entry.delete(0, "end")
+                    inst_entry.insert(0, p)
+            ctk.CTkButton(row_install, text="Browse", width=80, command=browse_inst).pack(side="left")
+
+            row_run = ctk.CTkFrame(win)
+            row_run.pack(fill="x", padx=10, pady=(0, 6))
+            ctk.CTkLabel(row_run, text="Runner (required):").pack(side="left")
+            run_entry = ctk.CTkEntry(row_run, width=380)
+            run_entry.pack(side="left", padx=6, fill="x", expand=True)
+            def browse_run():
+                p = filedialog.askopenfilename(
+                    title="Select file to run",
+                    initialdir=str(repo_dir),
+                    filetypes=[("Runnable", "*.py;*.sh;*.bat;*.ps1;*.php"), ("All files", "*.*")]
+                )
+                if p:
+                    run_entry.delete(0, "end")
+                    run_entry.insert(0, p)
+            ctk.CTkButton(row_run, text="Browse", width=80, command=browse_run).pack(side="left")
+
+            # Pre-fill guesses
+            try:
+                gi = self._guess_install_script(repo_dir)
+                if gi:
+                    inst_entry.insert(0, str(gi))
+                gr = self._guess_run_script(repo_dir)
+                if gr:
+                    run_entry.insert(0, str(gr))
+            except Exception:
+                pass
+
+            # Buttons
+            btns = ctk.CTkFrame(win)
+            btns.pack(fill="x", padx=10, pady=(10, 10))
+            skip_var = ctk.BooleanVar(value=True)
+            ctk.CTkCheckBox(btns, text="Skip installer (if specified)", variable=skip_var).pack(side="left")
+
+            def start_now():
+                inst = inst_entry.get().strip()
+                runf = run_entry.get().strip()
+                if not runf:
+                    messagebox.showerror("Missing runner", "Please choose a file to run.")
+                    return
+
+                def worker():
+                    # optional installer
+                    if inst and not skip_var.get():
+                        self._run_installer_file(Path(inst), repo_dir)
+                    # runner
+                    self._run_selected_file(Path(runf), env)
+                threading.Thread(target=worker, daemon=True).start()
+                try:
+                    win.destroy()
+                except Exception:
+                    pass
+
+            ctk.CTkButton(btns, text="Run", command=start_now, width=120).pack(side="right")
+            ctk.CTkButton(btns, text="Cancel", command=win.destroy, width=80).pack(side="right", padx=(0, 8))
+
+        if threading.current_thread() is threading.main_thread():
+            _open()
+        else:
+            self.after(0, _open)
+
     def _run_tool_with_output(self, args, timeout=120):
         """
         Run a command, stream its output to the GUI, and enforce a timeout.
@@ -1343,58 +1596,9 @@ class App(ctk.CTk):
             self.run_streaming(args, cwd=str(chosen_py.parent), env=env)
             return
 
-        # 7) Prompt the user to select a file to run
-        try:
-            self.append_output("[INFO] Please choose a script/file to run (.py/.sh/.bat/.ps1/.php).")
-            path = filedialog.askopenfilename(
-                title="Select an entry script to run",
-                initialdir=str(repo_dir),
-                filetypes=[("Script files", "*.py;*.sh;*.bat;*.ps1;*.php"), ("All files", "*.*")]
-            )
-        except Exception:
-            path = None
-
-        if path:
-            p = Path(path)
-            ext = p.suffix.lower()
-            self.append_output(f"[INFO] Running selected file: {p.name}")
-            if ext == ".py":
-                self.run_streaming([sys.executable, str(p)], cwd=str(p.parent), env=env)
-                return
-            if ext == ".sh":
-                bash = shutil.which("bash") or str(Path("C:/Program Files/Git/bin/bash.exe"))
-                if bash and Path(bash).exists():
-                    self.run_streaming([bash, str(p)], cwd=str(p.parent), env=env)
-                    return
-                self.append_output("[ERROR] bash not found to run .sh file.")
-                return
-            if ext == ".bat" and os.name == "nt":
-                self.run_streaming(["cmd", "/c", str(p)], cwd=str(p.parent), env=env)
-                return
-            if ext == ".ps1":
-                pwsh = shutil.which("powershell") or shutil.which("pwsh")
-                if pwsh:
-                    self.run_streaming([pwsh, "-ExecutionPolicy", "Bypass", "-File", str(p)], cwd=str(p.parent), env=env)
-                    return
-                self.append_output("[ERROR] PowerShell not found to run .ps1 file.")
-                return
-            if ext == ".php":
-                php_dir_to_prepend = self.ensure_php_available()
-                if php_dir_to_prepend:
-                    env["PATH"] = php_dir_to_prepend + os.pathsep + env.get("PATH", "")
-                if shutil.which("php"):
-                    self.run_streaming(["php", str(p)], cwd=str(p.parent), env=env)
-                    return
-                self.append_output("[ERROR] php not found to run .php file.")
-                return
-
-        # 8) Give guidance
-        self.append_output("[ERROR] Could not determine how to run this repository automatically.")
-        self.append_output("        Tips:")
-        self.append_output("        - If it's a Node.js app, ensure Node/NPM is installed and try 'npm start'.")
-        self.append_output("        - If it has a bash script (start.sh/run.sh), install Git Bash and run it.")
-        self.append_output("        - If it's a PHP app, ensure 'php' is available; index.php will auto-run.")
-        self.append_output("        - Otherwise check the README for run instructions.")
+        # 7) Ask the user to select installer (optional) and runner
+        self.prompt_manual_selection(repo_dir, env)
+        return
 
     def run_and_wait(self, args, cwd=None):
         # For short tasks we can just run and stream output synchronously
