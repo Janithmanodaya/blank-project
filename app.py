@@ -219,6 +219,9 @@ class App(ctk.CTk):
         self.web_container.pack(side="top", fill="both", expand=True, padx=8, pady=(0, 8))
 
         self.webview = None
+        self.web_loading = False
+        self.web_loaded_url = None
+        self.web_embed_job = None
         if HtmlFrame is None:
             info = ctk.CTkLabel(self.web_container, text="Embedded preview requires 'tkinterweb'.\nIt's included in requirements and will be installed automatically.")
             info.pack(side="top", pady=20)
@@ -257,28 +260,44 @@ class App(ctk.CTk):
         self.new_terminal(initial=True)
 
     
+    def _embed_now(self, url: str):
+        if not url or HtmlFrame is None:
+            return
+        if self.web_loading:
+            return
+        if self.web_loaded_url == url:
+            return
+        self.web_loading = True
+        try:
+            if self.webview is None:
+                self.webview = HtmlFrame(self.web_container)
+                self.webview.pack(side="top", fill="both", expand=True)
+            # Load with slight delay to avoid re-entrancy during heavy output
+            def _load():
+                try:
+                    self.webview.load_website(url)
+                    self.web_loaded_url = url
+                    self.append_output(f"[INFO] Embedded preview: {url}")
+                except Exception as e:
+                    self.append_output(f"[WARN] Could not embed URL: {e}")
+                finally:
+                    self.web_loading = False
+            self.after(50, _load)
+        except Exception:
+            self.web_loading = False
+
     def embed_last_url(self):
-        def _do():
-            url = self.last_url or self.url_label.get().strip()
-            if not url:
-                messagebox.showinfo("No URL", "No local URL detected yet.")
-                return
-            if HtmlFrame is None:
-                messagebox.showinfo("Missing dependency", "Embedded preview requires 'tkinterweb'. It's listed in requirements.txt.")
-                return
-            try:
-                # Create or reuse webview
-                if self.webview is None:
-                    self.webview = HtmlFrame(self.web_container)
-                    self.webview.pack(side="top", fill="both", expand=True)
-                self.webview.load_website(url)
-                self.append_output(f"[INFO] Embedded preview: {url}")
-            except Exception as e:
-                self.append_output(f"[WARN] Could not embed URL: {e}")
+        url = self.last_url or self.url_label.get().strip()
+        if not url:
+            messagebox.showinfo("No URL", "No local URL detected yet.")
+            return
+        if HtmlFrame is None:
+            messagebox.showinfo("Missing dependency", "Embedded preview requires 'tkinterweb'. It's listed in requirements.txt.")
+            return
         if threading.current_thread() is threading.main_thread():
-            _do()
+            self._embed_now(url)
         else:
-            self.after(0, _do)
+            self.after(0, lambda u=url: self._embed_now(u))
 
     # ===== Terminal-like support =====
 
@@ -532,10 +551,18 @@ class App(ctk.CTk):
                     if url not in self.detected_urls:
                         self.detected_urls.append(url)
                     self.last_url = url
-                    self.url_label.delete(0, "end")
-                    self.url_label.insert(0, url)
-                    # Auto-embed for safety (no external browser)
-                    self.embed_last_url()
+                    try:
+                        self.url_label.delete(0, "end")
+                        self.url_label.insert(0, url)
+                    except Exception:
+                        pass
+                    # Debounce embed to avoid re-entrant crashes
+                    if self.web_embed_job is not None:
+                        try:
+                            self.after_cancel(self.web_embed_job)
+                        except Exception:
+                            pass
+                    self.web_embed_job = self.after(200, self.embed_last_url)
                 if threading.current_thread() is threading.main_thread():
                     _apply()
                 else:
