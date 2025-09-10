@@ -71,39 +71,29 @@ if not defined PYTHON_EXE (
 
 echo [INFO] Using Python: %PYTHON_EXE%
 
-rem Step 3: Create virtual environment (venv) inside the app directory if it doesn't exist
-if not exist "%APP_DIR%venv\Scripts\python.exe" (
-    echo [INFO] Creating virtual environment...
-    "%PYTHON_EXE%" -m venv "%APP_DIR%venv"
-    if %errorlevel% neq 0 (
-        echo [ERROR] Failed to create virtual environment.
-        pause
-        exit /b 1
-    )
+rem ---------------------------------------------------------------------------
+rem Delegate to AppData runner which will:
+rem  - create a temp workspace under AppData
+rem  - create venv in that workspace
+rem  - install requirements
+rem  - launch app.py using the workspace venv
+rem ---------------------------------------------------------------------------
+if exist "%APP_DIR%run_appdata.bat" (
+    echo [INFO] Handing off to run_appdata.bat ...
+    call "%APP_DIR%run_appdata.bat"
+    set "EXITCODE=%ERRORLEVEL%"
+    echo [INFO] run_appdata.bat completed with code %EXITCODE%
+    popd
+    endlocal
+    exit /b %EXITCODE%
 ) else (
-    echo [INFO] Virtual environment already exists.
+    echo [ERROR] run_appdata.bat not found in %APP_DIR%
+    echo         Please ensure run_appdata.bat exists next to start.bat.
+    pause
+    popd
+    endlocal
+    exit /b 1
 )
-
-rem Step 4: Install/upgrade pip and core dependencies
-echo [INFO] Upgrading pip...
-"%APP_DIR%venv\Scripts\python.exe" -m pip install --upgrade pip
-
-if exist "%APP_DIR%requirements.txt" (
-    echo [INFO] Installing requirements from requirements.txt...
-    "%APP_DIR%venv\Scripts\python.exe" -m pip install -r "%APP_DIR%requirements.txt"
-) else (
-    echo [WARN] requirements.txt not found. Skipping dependency install.
-)
-
-rem Launch the GUI application
-echo [INFO] Launching application...
-"%APP_DIR%venv\Scripts\python.exe" "%APP_DIR%app.py"
-set EXITCODE=%ERRORLEVEL%
-
-echo [INFO] Application exited with code %EXITCODE%
-popd
-endlocal
-exit /b %EXITCODE%
 
 goto :eof
 
