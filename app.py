@@ -178,14 +178,10 @@ class App(ctk.CTk):
         self.run_button = ctk.CTkButton(top, text="Run", command=self.on_run_clicked)
         self.run_button.pack(side="left")
 
-        # Owner icon button (right-aligned)
+        # Owner button (right-aligned) - text only (no image)
         top_right = ctk.CTkFrame(top)
         top_right.pack(side="right", padx=(10, 0))
-        try:
-            owner_img = self._load_owner_icon(APP_DIR / "pro.jpg", size=32)
-            self.owner_btn = ctk.CTkButton(top_right, width=36, height=36, text="", image=owner_img, command=self.show_owner_popup)
-        except Exception:
-            self.owner_btn = ctk.CTkButton(top_right, width=80, height=28, text="Owner", command=self.show_owner_popup)
+        self.owner_btn = ctk.CTkButton(top_right, width=80, height=28, text="Owner", command=self.show_owner_popup)
         self.owner_btn.pack(side="right")
 
         # Files frame for selecting input files required by the target repo
@@ -679,6 +675,14 @@ class App(ctk.CTk):
         win.title("Owner")
         win.geometry("300x360")
         win.resizable(False, False)
+        # Keep always on top and modal-like
+        try:
+            win.transient(self)
+            win.attributes("-topmost", True)
+            win.focus_force()
+            win.grab_set()
+        except Exception:
+            pass
 
         # Image
         try:
