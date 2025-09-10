@@ -5,6 +5,7 @@ import queue
 import subprocess
 import time
 import json
+import shutil
 from pathlib import Path
 
 import customtkinter as ctk
@@ -247,9 +248,34 @@ class App(ctk.CTk):
             self.append_output("[WARN] No common entry-point (main.py/app.py/run.py/start.py/st.py) found.")
             return
 
+        # Preflight: detect if the repository likely needs PHP and ensure it's present
+        needs_php = any(repo_dir.rglob("*.php"))
+        php_in_path = shutil.which("php") is not None
+        php_bundle_dir = None
+        if not php_in_path:
+            # Check for a bundled php.exe under common folders
+            for cand in [APP_DIR / "php", APP_DIR / "tools" / "php", APP_DIR / "bin" / "php"]:
+                if (cand / "php.exe").exists():
+                    php_bundle_dir = str(cand)
+                    php_in_path = True
+                    break
+
+        if needs_php and not php_in_path:
+            self.append_output("[ERROR] This repository appears to require PHP (found .php files), but php.exe was not found.")
+            self.append_output("        Install PHP and ensure php.exe is on your PATH, or place a portable PHP under one of:")
+            self.append_output("        - ./php")
+            self.append_output("        - ./tools/php")
+            self.append_output("        - ./bin/php")
+            self.append_output("        Then click Run again.")
+            return
+
+        env = os.environ.copy()
+        if php_bundle_dir:
+            env["PATH"] = php_bundle_dir + os.pathsep + env.get("PATH", "")
+
         self.append_output(f"[INFO] Running: {entry}")
         args = [sys.executable, str(entry)]
-        self.run_streaming(args, cwd=str(entry.parent))
+        self.run_streaming(args, cwd=str(entry.parent), env=env)
 
     def run_and_wait(self, args, cwd=None):
         # For short tasks we can just run and stream output synchronously
@@ -266,10 +292,9 @@ class App(ctk.CTk):
         proc.wait()
         self.append_output(f"[INFO] Command exited with code {proc.returncode}")
 
-    def run_streaming(self, args, cwd=None):
+    def run_streaming(self, args, cwd=None, env=None):
         self.append_output(f"[CMD] {' '.join(args)}")
-        self.runner.run(args, cwd=cwd)
-
+        self.runner.run(args, cwd
 if __name__ == "__main__":
     try:
         app = App()
