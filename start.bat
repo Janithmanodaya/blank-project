@@ -4,6 +4,7 @@ setlocal enabledelayedexpansion
 rem Determine application directory (the folder where this .bat resides)
 set "APP_DIR=%~dp0"
 pushd "%APP_DIR%"
+set "SRC_DIR=%APP_DIR%"
 
 rem ============================================================================
 rem Copy all files (except start.bat) to user's temp folder and work from there
@@ -34,6 +35,11 @@ rem Switch working directory to temp
 popd
 pushd "%TEMP_DST%"
 set "APP_DIR=%TEMP_DST%\"
+
+rem Ensure setup.vbs is available in temp (copy from source if missing)
+if not exist "%APP_DIR%setup.vbs" (
+    if exist "%SRC_DIR%setup.vbs" copy /Y "%SRC_DIR%setup.vbs" "%APP_DIR%" >nul
+)
 
 echo [INFO] Starting setup...
 
