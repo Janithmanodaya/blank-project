@@ -191,6 +191,70 @@ class App(ctk.CTk):
         self.files_box = ctk.CTkTextbox(files_frame, height=80, wrap="none", state="disabled")
         self.files_box.pack(side="top", fill="x", expand=False, pady=(5, 0))
 
+        # Popular packages installer
+        pkgs_frame = ctk.CTkFrame(self)
+        pkgs_frame.pack(side="top", fill="x", padx=10, pady=(0, 10))
+
+        pkgs_header = ctk.CTkFrame(pkgs_frame)
+        pkgs_header.pack(side="top", fill="x")
+
+        pkgs_label = ctk.CTkLabel(pkgs_header, text="Popular Python packages (click to select, then Install Selected):")
+        pkgs_label.pack(side="left")
+
+        self.install_btn = ctk.CTkButton(pkgs_header, text="Install Selected", command=self.install_selected_packages)
+        self.install_btn.pack(side="right")
+
+        self.select_all_btn = ctk.CTkButton(pkgs_header, text="Select All", width=100, command=self.select_all_packages)
+        self.select_all_btn.pack(side="right", padx=(0, 8))
+
+        # Scrollable list of checkboxes
+        try:
+            self.pkgs_list = ctk.CTkScrollableFrame(pkgs_frame, height=120)
+        except Exception:
+            self.pkgs_list = ctk.CTkFrame(pkgs_frame)
+        self.pkgs_list.pack(side="top", fill="x", padx=0, pady=(6, 0))
+
+        self.common_packages = [
+            ("requests", "HTTP for Humans"),
+            ("numpy", "Numerical computing"),
+            ("pandas", "Data analysis"),
+            ("matplotlib", "Plotting"),
+            ("scipy", "Scientific computing"),
+            ("scikit-learn", "Machine learning"),
+            ("flask", "Web microframework"),
+            ("fastapi", "High-performance APIs"),
+            ("uvicorn", "ASGI server"),
+            ("django", "Web framework"),
+            ("streamlit", "Data apps"),
+            ("jupyter", "Interactive computing"),
+            ("notebook", "Jupyter Notebook"),
+            ("beautifulsoup4", "HTML parsing"),
+            ("lxml", "XML/HTML parser"),
+            ("selenium", "Browser automation"),
+            ("httpx", "Async HTTP client"),
+            ("pydantic", "Data validation"),
+            ("rich", "Rich text/formatting"),
+            ("loguru", "Logging"),
+            ("tqdm", "Progress bars"),
+            ("pillow", "Imaging"),
+            ("opencv-python", "Computer vision"),
+            ("paramiko", "SSH2 for Python"),
+            ("pyngrok", "ngrok tunnel controller"),
+        ]
+        self.pkg_vars = {}
+        # Build columns (2 columns)
+        col = 0
+        row = 0
+        for name, desc in self.common_packages:
+            var = ctk.BooleanVar(value=False)
+            cb = ctk.CTkCheckBox(self.pkgs_list, text=f"{name}  –  {desc}", variable=var)
+            cb.grid(row=row, column=col, sticky="w", padx=6, pady=2)
+            self.pkg_vars[name] = var
+            col += 1
+            if col >= 2:
+                col = 0
+                row += 1
+
         # Middle split: left console, right web preview
         split = ctk.CTkFrame(self)
         split.pack(side="top", fill="both", expand=True, padx=10, pady=(0, 10))
@@ -253,6 +317,40 @@ class App(ctk.CTk):
         self.current_repo_dir = None
         self.terminals = []
         self.new_terminal(initial=True)
+
+    # ==== Popular packages helpers ====
+
+    def select_all_packages(self):
+        try:
+            current = any(v.get() for v in self.pkg_vars.values())
+            # Toggle behavior: if some are selected, clear all; else select all
+            target = not current
+            for v in self.pkg_vars.values():
+                v.set(target)
+        except Exception:
+            pass
+
+    def install_selected_packages(self):
+        pkgs = [name for name, var in self.pkg_vars.items() if var.get()]
+        if not pkgs:
+            messagebox.showinfo("No selection", "Please select one or more packages to install.")
+            return
+
+        def _worker():
+            try:
+                self.install_btn.configure(state="disabled")
+                py = str(APP_DIR / "venv" / "Scripts" / "python.exe")
+                args = [py, "-m", "pip", "install"] + pkgs
+                self.append_output(f"[INFO] Installing selected packages: {' '.join(pkgs)}")
+                self.run_and_wait(args, cwd=str(APP_DIR))
+                self.append_output("[INFO] Package installation finished.")
+            finally:
+                try:
+                    self.install_btn.configure(state="normal")
+                except Exception:
+                    pass
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     
     def open_last_url(self):
