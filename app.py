@@ -141,7 +141,7 @@ class App(ctk.CTk):
 
         self.input_entry = ctk.CTkEntry(input_frame, placeholder_text="Type input for the running process and press Enter")
         self.input_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
-        self.input_entry.bind("&lt;Return&gt;", self.on_send_input)
+        self.input_entry.bind("<Return>", self.on_send_input)
 
         self.stop_button = ctk.CTkButton(input_frame, text="Stop Process", command=self.stop_process)
         self.stop_button.pack(side="left")
@@ -158,7 +158,7 @@ class App(ctk.CTk):
     def on_send_input(self, event=None):
         text = self.input_entry.get()
         if text.strip():
-            self.append_output(f"&gt;&gt; {text}")
+            self.append_output(f">> {text}")
             self.runner.send_input(text)
             self.input_entry.delete(0, "end")
 
@@ -200,7 +200,7 @@ class App(ctk.CTk):
         finally:
             self.run_button.configure(state="normal")
 
-    def clone_repo(self, url) -&gt; Path:
+    def clone_repo(self, url) -> Path:
         repo_name = url.rstrip("/").split("/")[-1]
         if repo_name.endswith(".git"):
             repo_name = repo_name[:-4]
@@ -271,5 +271,23 @@ class App(ctk.CTk):
         self.runner.run(args, cwd=cwd)
 
 if __name__ == "__main__":
-    app = App()
-    app.mainloop()
+    try:
+        app = App()
+        app.mainloop()
+    except Exception as e:
+        # Best-effort error visibility if the GUI fails very early
+        try:
+            with open(str(APP_DIR / "app_error.log"), "a", encoding="utf-8") as f:
+                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {repr(e)}\n")
+        except Exception:
+            pass
+        try:
+            import tkinter as tk
+            from tkinter import messagebox as mb
+            root = tk.Tk()
+            root.withdraw()
+            mb.showerror("Application Error", f"An error prevented the UI from starting:\\n{e}")
+            root.destroy()
+        except Exception:
+            pass
+        raise
