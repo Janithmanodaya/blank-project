@@ -220,7 +220,7 @@ class App(ctk.CTk):
             info = ctk.CTkLabel(self.web_container, text="Embedded preview requires 'tkinterweb'.\nIt's included in requirements and will be installed automatically.")
             info.pack(side="top", pady=20)
 
-        # Input to send to running process
+        # Input to send to running process (activity runner)
         input_frame = ctk.CTkFrame(self)
         input_frame.pack(side="bottom", fill="x", padx=10, pady=(0, 10))
 
@@ -231,9 +231,27 @@ class App(ctk.CTk):
         self.stop_button = ctk.CTkButton(input_frame, text="Stop Process", command=self.stop_process)
         self.stop_button.pack(side="left")
 
+        # Terminals panel
+        terms_panel = ctk.CTkFrame(self)
+        terms_panel.pack(side="bottom", fill="both", expand=True, padx=10, pady=(0, 10))
+
+        controls = ctk.CTkFrame(terms_panel)
+        controls.pack(side="top", fill="x", pady=(0, 6))
+
+        self.new_term_btn = ctk.CTkButton(controls, text="New Terminal", command=self.new_terminal)
+        self.new_term_btn.pack(side="left", padx=(0, 8))
+
+        self.close_term_btn = ctk.CTkButton(controls, text="Close Terminal", command=self.close_current_terminal)
+        self.close_term_btn.pack(side="left")
+
+        self.term_tabs = ctk.CTkTabview(terms_panel)
+        self.term_tabs.pack(side="top", fill="both", expand=True)
+
         # State
         self.runner = ProcessRunner(self.append_output)
         self.current_repo_dir = None
+        self.terminals = []
+        self.new_terminal(initial=True)
 
     
     def embed_last_url(self):
@@ -253,6 +271,197 @@ class App(ctk.CTk):
             self.append_output(f"[INFO] Embedded preview: {url}")
         except Exception as e:
             self.append_output(f"[WARN] Could not embed URL: {e}")
+
+    # ===== Terminal-like support =====
+
+    def new_terminal(self, initial=False):
+        idx = len(self.terminals) + 1
+        tab_name = f"term-{idx}"
+        tab = self.term_tabs.add(tab_name)
+
+        # Create widgets
+        text = ctk.CTkTextbox(tab, wrap="word")
+        text.pack(side="top", fill="both", expand=True, padx=6, pady=(6, 3))
+
+        entry = ctk.CTkEntry(tab, placeholder_text="Type a command (supports: clear, cd, pip install ..., ngrok ...) and press Enter")
+        entry.pack(side="top", fill="x", padx=6, pady=(0, 6))
+        # Bind handler with this session context
+        entry.bind("<Return>", lambda e, tname=tab_name: self.on_terminal_enter(tname))
+
+        # Session state
+        session = {
+            "name": tab_name,
+            "text": text,
+            "entry": entry,
+            "cwd": str(self.current_repo_dir or APP_DIR),
+            "runner": None,  # ProcessRunner for long/interactive commands
+        }
+
+        # Per-terminal runner with its own callback
+        def term_append(msg):
+            self._ansi_to_tags_insert(text, msg + "\n")
+            text.see("end")
+            self.update_idletasks()
+        session["runner"] = ProcessRunner(term_append)
+
+        # Prompt
+        self._ansi_to_tags_insert(text, f"\x1b[92m[{tab_name}]\x1b[0m CWD: {session['cwd']}\n")
+        self.terminals.append(session)
+        self.term_tabs.set(tab_name)
+        if not initial:
+            self._ansi_to_tags_insert(text, f"\x1b[90m(type 'help' for hints)\x1b[0m\n")
+
+    def close_current_terminal(self):
+        current = self.term_tabs.get()
+        if not current:
+            return
+        # Find session
+        for i, s in enumerate(self.terminals):
+            if s["name"] == current:
+                try:
+                    self.term_tabs.delete(current)
+                except Exception:
+                    pass
+                # Terminate any running process
+                try:
+                    s["runner"].terminate()
+                except Exception:
+                    pass
+                del self.terminals[i]
+                break
+        # Select another tab if exists
+        if self.terminals:
+            self.term_tabs.set(self.terminals[-1]["name"])
+
+    def get_session(self, tab_name):
+        for s in self.terminals:
+            if s["name"] == tab_name:
+                return s
+        return None
+
+    def term_print(self, session, msg):
+        text = session["text"]
+        self._ansi_to_tags_insert(text, msg + "\n")
+        text.see("end")
+        self.update_idletasks()
+
+    def on_terminal_enter(self, tab_name):
+        session = self.get_session(tab_name)
+        if not session:
+            return
+        entry = session["entry"]
+        cmd = entry.get().strip()
+        entry.delete(0, "end")
+
+        # If an interactive process is running, send input
+        runner = session["runner"]
+        if runner and runner.proc:
+            self.term_print(session, f">> {cmd}")
+            runner.send_input(cmd)
+            return
+
+        if not cmd:
+            return
+
+        # Echo prompt-like line
+        self.term_print(session, f"\x1b[96m{session['cwd']}\x1b[0m> {cmd}")
+
+        # Builtins
+        if cmd.lower() in ("clear", "cls"):
+            try:
+                session["text"].delete("1.0", "end")
+            except Exception:
+                pass
+            return
+
+        if cmd.lower() == "help":
+            self.term_print(session, "Built-ins: clear, cd <dir>, pip install <pkg>, ngrok <args>")
+            self.term_print(session, "General commands are executed via system shell.")
+            return
+
+        if cmd.lower().startswith("cd"):
+            parts = cmd.split(maxsplit=1)
+            if len(parts) == 1:
+                # show cwd
+                self.term_print(session, session["cwd"])
+            else:
+                target = parts[1].strip().strip('"')
+                new_cwd = Path(session["cwd"]).joinpath(target).resolve() if not Path(target).is_absolute() else Path(target)
+                if new_cwd.exists() and new_cwd.is_dir():
+                    session["cwd"] = str(new_cwd)
+                    self.term_print(session, f"Changed directory to {session['cwd']}")
+                else:
+                    self.term_print(session, f"\x1b[31mDirectory not found:\x1b[0m {new_cwd}")
+            return
+
+        if cmd.lower().startswith("pip "):
+            # Route to venv pip
+            args = cmd.split()[1:]
+            py = str((APP_DIR / "venv" / "Scripts" / "python.exe"))
+            full = [py, "-m", "pip"] + args
+            self._terminal_run_process(session, full)
+            return
+
+        if cmd.lower().startswith("ngrok"):
+            ngrok_path = self._ensure_ngrok()
+            if not ngrok_path:
+                self.term_print(session, "\x1b[31mngrok not available.\x1b[0m Set it in settings or install manually.")
+                return
+            args = cmd.split()[1:]
+            full = [ngrok_path] + args
+            self._terminal_run_process(session, full)
+            return
+
+        # Aliases for Linux-like commands on Windows
+        shell_cmd = cmd
+        if os.name == "nt":
+            aliases = {
+                "ls": "dir",
+                "pwd": "cd",
+                "cat": "type",
+                "clear": "cls",
+            }
+            head = cmd.split()[0]
+            if head in aliases:
+                shell_cmd = cmd.replace(head, aliases[head], 1)
+
+        # Run generic command via shell
+        if os.name == "nt":
+            full = ["cmd", "/c", shell_cmd]
+        else:
+            full = ["bash", "-lc", shell_cmd]
+        self._terminal_run_process(session, full)
+
+    def _terminal_run_process(self, session, args):
+        # Run and stream in this terminal; if long-lived, you can still type to stdin
+        try:
+            cwd = session["cwd"]
+            session["runner"].run(args, cwd=cwd)
+        except Exception as e:
+            self.term_print(session, f"\x1b[31mERROR:\x1b[0m {e}")
+
+    def _ensure_ngrok(self):
+        # Check saved path
+        tool_paths = self.settings.get("tool_paths") or {}
+        path = tool_paths.get("ngrok")
+        if path and Path(path).exists():
+            return path
+        # PATH
+        found = shutil.which("ngrok")
+        if found:
+            return found
+        # Ask user to select ngrok.exe manually (no auto-download for safety)
+        try:
+            if messagebox.askyesno("ngrok required", "ngrok not found. Select ngrok executable manually?"):
+                p = filedialog.askopenfilename(title="Select ngrok executable", filetypes=[("ngrok.exe", "ngrok.exe"), ("All files", "*.*")])
+                if p and Path(p).exists():
+                    tool_paths["ngrok"] = p
+                    self.settings["tool_paths"] = tool_paths
+                    save_settings(self.settings)
+                    return p
+        except Exception:
+            pass
+        return None
 
     def refresh_files_box(self):
         self.files_box.configure(state="normal")
@@ -325,7 +534,7 @@ class App(ctk.CTk):
         except Exception:
             pass
 
-    def _init_text_tags(self):
+    def _init_text_tags(self, widget):
         # Foreground colors
         fg_colors = {
             "fg_black": "#000000",
@@ -347,7 +556,7 @@ class App(ctk.CTk):
         }
         for tag, color in fg_colors.items():
             try:
-                self.output_box.tag_configure(tag, foreground=color)
+                widget.tag_configure(tag, foreground=color)
             except Exception:
                 pass
 
@@ -363,25 +572,25 @@ class App(ctk.CTk):
         }
         for tag, color in bg_colors.items():
             try:
-                self.output_box.tag_configure(tag, background=color)
+                widget.tag_configure(tag, background=color)
             except Exception:
                 pass
 
         try:
-            self.output_box.tag_configure("bold", font=("Consolas", 11, "bold"))
+            widget.tag_configure("bold", font=("Consolas", 11, "bold"))
         except Exception:
             pass
 
-    def _ansi_to_tags_insert(self, text: str):
+    def _ansi_to_tags_insert(self, widget, text: str):
         """
         Parse ANSI SGR sequences and insert into Text with tags for colors/bold.
         """
         try:
             import re
-            # Ensure tags initialized
-            if not hasattr(self, "_tags_inited"):
-                self._init_text_tags()
-                self._tags_inited = True
+            # Ensure tags initialized per widget
+            if not hasattr(widget, "_tags_inited"):
+                self._init_text_tags(widget)
+                widget._tags_inited = True  # type: ignore[attr-defined]
 
             # Map SGR to tags
             fg_map = {
@@ -401,7 +610,7 @@ class App(ctk.CTk):
             for m in ansi_re.finditer(text):
                 chunk = text[pos:m.start()]
                 if chunk:
-                    self.output_box.insert("end", chunk, tuple(current_tags) if current_tags else ())
+                    widget.insert("end", chunk, tuple(current_tags) if current_tags else ())
                 codes = m.group(1)
                 if codes == "" or codes == "0":
                     current_tags.clear()
@@ -442,14 +651,14 @@ class App(ctk.CTk):
             # Tail
             tail = text[pos:]
             if tail:
-                self.output_box.insert("end", tail, tuple(current_tags) if current_tags else ())
+                widget.insert("end", tail, tuple(current_tags) if current_tags else ())
         except Exception:
             # Fallback: plain insert
-            self.output_box.insert("end", self.strip_ansi(text))
+            widget.insert("end", self.strip_ansi(text))
 
     def append_output(self, text):
         # Insert with ANSI color support
-        self._ansi_to_tags_insert(text + "\n")
+        self._ansi_to_tags_insert(self.output_box, text + "\n")
         self.output_box.see("end")
         # URL detection based on cleaned text
         clean = self.strip_ansi(text)
