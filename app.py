@@ -208,10 +208,7 @@ class App(ctk.CTk):
         self.url_label = ctk.CTkEntry(web_controls, placeholder_text="Detected local URL will appear here")
         self.url_label.pack(side="left", fill="x", expand=True, padx=(0, 8))
 
-        open_btn = ctk.CTkButton(web_controls, text="Open", width=70, command=self.open_last_url)
-        open_btn.pack(side="left", padx=(0, 8))
-
-        embed_btn = ctk.CTkButton(web_controls, text="Embed", width=70, command=self.embed_last_url)
+        embed_btn = ctk.CTkButton(web_controls, text="Embed/Refresh", width=110, command=self.embed_last_url)
         embed_btn.pack(side="left")
 
         # Web preview pane (if HtmlFrame available)
@@ -238,18 +235,7 @@ class App(ctk.CTk):
         self.runner = ProcessRunner(self.append_output)
         self.current_repo_dir = None
 
-    def open_last_url(self):
-        url = self.last_url or self.url_label.get().strip()
-        if not url:
-            messagebox.showinfo("No URL", "No local URL detected yet.")
-            return
-        import webbrowser
-        try:
-            webbrowser.open(url, new=2)
-            self.append_output(f"[INFO] Opened in browser: {url}")
-        except Exception as e:
-            self.append_output(f"[WARN] Could not open browser: {e}")
-
+    
     def embed_last_url(self):
         url = self.last_url or self.url_label.get().strip()
         if not url:
@@ -325,6 +311,11 @@ class App(ctk.CTk):
                 self.last_url = url
                 self.url_label.delete(0, "end")
                 self.url_label.insert(0, url)
+                # Auto-embed for safety (no external browser)
+                try:
+                    self.embed_last_url()
+                except Exception:
+                    pass
         except Exception:
             pass
 
