@@ -871,12 +871,14 @@ class App(ctk.CTk):
         try:
             repo_dir = self.clone_repo(url)
             self.current_repo_dir = repo_dir
-            self.install_requirements(repo_dir)
+            env = os.environ.copy()
+            self.install_dependencies(repo_dir, env)
             self.find_and_run(repo_dir)
         except Exception as e:
             self.append_output(f"[ERROR] {e}")
         finally:
-            self.run_button.configure(state="normal")
+            self.run_button.configure(state="norm_codealnew"</)
+)
 
     def clone_repo(self, url) -> Path:
         repo_name = url.rstrip("/").split("/")[-1]
@@ -901,14 +903,80 @@ class App(ctk.CTk):
         self.append_output("[INFO] Clone complete.")
         return target_dir
 
-    def install_requirements(self, repo_dir: Path):
+    def install_dependencies(self, repo_dir: Path, env: dict | None = None):
+        """
+        Best-effort dependency setup:
+          - pip install -r requirements.txt if present
+          - pip install . if pyproject.toml or setup.py exists
+          - run install/setup/bootstrap scripts if present (sh/bat/ps1)
+        """
+        # 1) Python requirements
         req = repo_dir / "requirements.txt"
         if req.exists():
-            self.append_output("[INFO] Installing repository requirements...")
+            self.append_output("[INFO] Installing repository requirements (requirements.txt)...")
             args = [sys.executable, "-m", "pip", "install", "-r", str(req)]
             self.run_and_wait(args, cwd=str(repo_dir))
         else:
-            self.append_output("[INFO] No requirements.txt found. Skipping dependency installation.")
+            # Try pyproject.toml or setup.py
+            if (repo_dir / "pyproject.toml").exists() or (repo_dir / "setup.py").exists():
+                self.append_output("[INFO] Installing project as a package (pip install .)...")
+                args = [sys.executable, "-m", "pip", "install", "."]
+                self.run_and_wait(args, cwd=str(repo_dir))
+            else:
+                self.append_output("[INFO] No requirements.txt / pyproject.toml / setup.py found.")
+
+        # 2) Generic installer scripts
+        sh_scripts = ["install.sh", "setup.sh", "bootstrap.sh"]
+        bat_scripts = ["install.bat", "setup.bat"]
+        ps1_scripts = ["install.ps1", "setup.ps1"]
+
+        # Choose first matching script that exists
+        chosen = None
+        chosen_type = None
+        for name in sh_scripts:
+            p = repo_dir / name
+            if p.exists():
+                chosen, chosen_type = p, "sh"
+                break
+        if chosen is None:
+            for name in bat_scripts:
+                p = repo_dir / name
+                if p.exists():
+                    chosen, chosen_type = p, "bat"
+                    break
+        if chosen is None:
+            for name in ps1_scripts:
+                p = repo_dir / name
+                if p.exists():
+                    chosen, chosen_type = p, "ps1"
+                    break
+
+        if chosen:
+            self.append_output(f"[INFO] Running installer script: {chosen.name}")
+            try:
+                if chosen_type == "sh":
+                    bash = shutil.which("bash")
+                    if not bash:
+                        cand = Path("C:/Program Files/Git/bin/bash.exe")
+                        if cand.exists():
+                            bash = str(cand)
+                    if not bash:
+                        self.append_output("[WARN] Bash not found. Skipping shell installer.")
+                    else:
+                        self.run_and_wait([bash, str(chosen)], cwd=str(repo_dir))
+                elif chosen_type == "bat":
+                    if os.name == "nt":
+                        self.run_and_wait(["cmd", "/c", str(chosen)], cwd=str(repo_dir))
+                    else:
+                        self.append_output("[WARN] .bat installer found but not on Windows. Skipping.")
+                elif chosen_type == "ps1":
+                    pwsh = shutil.which("powershell") or shutil.which("pwsh")
+                    if not pwsh:
+                        self.append_output("[WARN] PowerShell not found. Skipping PS installer.")
+                    else:
+                        self.run_and_wait([pwsh, "-ExecutionPolicy", "Bypass", "-File", str(chosen)], cwd=str(repo_dir))
+            except Exception as e:
+                self.append_output(f"[WARN] Installer script failed: {e}")
 
     def _run_tool_with_output(self, args, timeout=120):
         """
@@ -1147,6 +1215,50 @@ class App(ctk.CTk):
         self.run_streaming(args, cwd=str(repo_dir), env=env)
         return True
 
+    def _run_with_bat_if_possible(self, repo_dir: Path, env: dict) -> bool:
+        if os.name != "nt":
+            return False
+        # Typical batch starters
+        bat_candidates = ["start.bat", "run.bat", "serve.bat", "launch.bat"]
+        target = None
+        for c in bat_candidates:
+            p = repo_dir / c
+            if p.exists():
+                target = p
+                break
+        if target is None:
+            for p in repo_dir.glob("*.bat"):
+                target = p
+                break
+        if target is None:
+            return False
+        self.append_output(f"[INFO] Detected batch script: {target.name}. Running via cmd ...")
+        self.run_streaming(["cmd", "/c", str(target)], cwd=str(repo_dir), env=env)
+        return True
+
+    def _run_with_powershell_if_possible(self, repo_dir: Path, env: dict) -> bool:
+        # Look for ps1 scripts that look like starters
+        ps1_candidates = ["start.ps1", "run.ps1", "serve.ps1", "launch.ps1"]
+        target = None
+        for c in ps1_candidates:
+            p = repo_dir / c
+            if p.exists():
+                target = p
+                break
+        if target is None:
+            for p in repo_dir.glob("*.ps1"):
+                target = p
+                break
+        if target is None:
+            return False
+        pwsh = shutil.which("powershell") or shutil.which("pwsh")
+        if not pwsh:
+            self.append_output("[WARN] PowerShell not found on PATH.")
+            return False
+        self.append_output(f"[INFO] Detected PowerShell script: {target.name}. Running via PowerShell ...")
+        self.run_streaming([pwsh, "-ExecutionPolicy", "Bypass", "-File", str(target)], cwd=str(repo_dir), env=env)
+        return True
+
     def find_and_run(self, repo_dir: Path):
         candidates = ["main.py", "app.py", "run.py", "start.py", "st.py"]
         entry = None
@@ -1195,11 +1307,88 @@ class App(ctk.CTk):
         if self._run_with_bash_if_possible(repo_dir, env):
             return
 
-        # 3) Simple PHP app via built-in server (index.php)
+        # 3) Batch script (.bat) on Windows
+        if self._run_with_bat_if_possible(repo_dir, env):
+            return
+
+        # 4) PowerShell script (.ps1)
+        if self._run_with_powershell_if_possible(repo_dir, env):
+            return
+
+        # 5) Simple PHP app via built-in server (index.php)
         if self._run_with_php_server_if_possible(repo_dir, env):
             return
 
-        # 4) Give guidance
+        # 6) Generic Python script fallback: common names anywhere, else any top-level .py
+        common_py_names = ("main", "app", "run", "start", "server", "manage", "cli", "tool", "index")
+        chosen_py = None
+        for root, dirs, files in os.walk(repo_dir):
+            for f in files:
+                if f.endswith(".py"):
+                    stem = Path(f).stem.lower()
+                    if stem in common_py_names or any(stem.startswith(p) for p in common_py_names):
+                        chosen_py = Path(root) / f
+                        break
+            if chosen_py:
+                break
+        if not chosen_py:
+            for f in repo_dir.glob("*.py"):
+                chosen_py = f
+                break
+        if chosen_py:
+            self.append_output(f"[INFO] Fallback: running Python script {chosen_py.name}")
+            args = [sys.executable, str(chosen_py)]
+            if self.pass_as_args_var.get() and self.selected_files:
+                args.extend(self.selected_files)
+            self.run_streaming(args, cwd=str(chosen_py.parent), env=env)
+            return
+
+        # 7) Prompt the user to select a file to run
+        try:
+            self.append_output("[INFO] Please choose a script/file to run (.py/.sh/.bat/.ps1/.php).")
+            path = filedialog.askopenfilename(
+                title="Select an entry script to run",
+                initialdir=str(repo_dir),
+                filetypes=[("Script files", "*.py;*.sh;*.bat;*.ps1;*.php"), ("All files", "*.*")]
+            )
+        except Exception:
+            path = None
+
+        if path:
+            p = Path(path)
+            ext = p.suffix.lower()
+            self.append_output(f"[INFO] Running selected file: {p.name}")
+            if ext == ".py":
+                self.run_streaming([sys.executable, str(p)], cwd=str(p.parent), env=env)
+                return
+            if ext == ".sh":
+                bash = shutil.which("bash") or str(Path("C:/Program Files/Git/bin/bash.exe"))
+                if bash and Path(bash).exists():
+                    self.run_streaming([bash, str(p)], cwd=str(p.parent), env=env)
+                    return
+                self.append_output("[ERROR] bash not found to run .sh file.")
+                return
+            if ext == ".bat" and os.name == "nt":
+                self.run_streaming(["cmd", "/c", str(p)], cwd=str(p.parent), env=env)
+                return
+            if ext == ".ps1":
+                pwsh = shutil.which("powershell") or shutil.which("pwsh")
+                if pwsh:
+                    self.run_streaming([pwsh, "-ExecutionPolicy", "Bypass", "-File", str(p)], cwd=str(p.parent), env=env)
+                    return
+                self.append_output("[ERROR] PowerShell not found to run .ps1 file.")
+                return
+            if ext == ".php":
+                php_dir_to_prepend = self.ensure_php_available()
+                if php_dir_to_prepend:
+                    env["PATH"] = php_dir_to_prepend + os.pathsep + env.get("PATH", "")
+                if shutil.which("php"):
+                    self.run_streaming(["php", str(p)], cwd=str(p.parent), env=env)
+                    return
+                self.append_output("[ERROR] php not found to run .php file.")
+                return
+
+        # 8) Give guidance
         self.append_output("[ERROR] Could not determine how to run this repository automatically.")
         self.append_output("        Tips:")
         self.append_output("        - If it's a Node.js app, ensure Node/NPM is installed and try 'npm start'.")
