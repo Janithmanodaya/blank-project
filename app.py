@@ -1132,7 +1132,12 @@ class App(ctk.CTk):
             win.geometry("600x220")
             win.resizable(True, False)
             try:
-                win.transient(self)
+                # Keep this popup above the terminal (either embedded or detached window)
+                parent = self.term_window if getattr(self, "term_window", None) else self
+                win.transient(parent)
+                win.attributes("-topmost", True)
+                win.lift()
+                win.focus_force()
                 win.grab_set()
             except Exception:
                 pass
