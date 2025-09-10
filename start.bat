@@ -5,6 +5,42 @@ rem Determine application directory (the folder where this .bat resides)
 set "APP_DIR=%~dp0"
 pushd "%APP_DIR%"
 
+rem --------------------------------------------------------------------
+rem Shadow copy to AppData local temp workspace and run from there
+rem --------------------------------------------------------------------
+set "BASE_DIR=%APP_DIR:~0,-1%"
+for %%I in ("%BASE_DIR%") do set "APP_BASENAME=%%~nI"
+if not defined APP_BASENAME set "APP_BASENAME=RepoRunner"
+
+set "SHADOW_ROOT=%LocalAppData%\%APP_BASENAME%"
+set "SHADOW_DIR=%SHADOW_ROOT%\current"
+
+rem If we are NOT already running from the shadow directory, mirror and relaunch
+rem Normalize path comparison with trailing backslash
+set "APP_DIR_NORM=%APP_DIR%"
+if not "%APP_DIR_NORM:~-1%"=="\" set "APP_DIR_NORM=%APP_DIR_NORM%\"
+set "SHADOW_DIR_NORM=%SHADOW_DIR%"
+if not "%SHADOW_DIR_NORM:~-1%"=="\" set "SHADOW_DIR_NORM=%SHADOW_DIR_NORM%\"
+
+if /I not "%APP_DIR_NORM%"=="%SHADOW_DIR_NORM%" (
+    echo [INFO] Preparing isolated workspace at "%SHADOW_DIR%"
+    mkdir "%SHADOW_DIR%" >nul 2>&1
+
+    rem Use ROBOCOPY to mirror files, excluding venv, git and temp artefacts
+    rem /MIR mirrors directory tree; /XD excludes dirs; /XF excludes files
+    robocopy "%APP_DIR%" "%SHADOW_DIR%" /MIR /R:2 /W:2 /NFL /NDL /NJH /NJS /XD venv .git __pycache__ /XF app_error.log >nul
+    if errorlevel 8 (
+        echo [WARN] Robocopy reported non-critical issues. Continuing.
+    )
+
+    echo [INFO] Relaunching from isolated workspace...
+    set "RUN_FROM_SHADOW=1"
+    start "" "%SHADOW_DIR%\start.bat"
+    popd
+    endlocal
+    exit /b 0
+)
+
 echo [INFO] Starting setup...
 
 rem Step 1: Check if Python is available
