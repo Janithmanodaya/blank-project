@@ -135,6 +135,9 @@ class App(ctk.CTk):
         self.title("Repo Runner")
         self.geometry("1100x800")
 
+        # Utility to ensure UI work runs on Tk main thread
+        self._main_thread = threading.current_thread()
+
         self.settings = load_settings()
         self.repos = load_repos()
         self.selected_files = []
@@ -255,22 +258,27 @@ class App(ctk.CTk):
 
     
     def embed_last_url(self):
-        url = self.last_url or self.url_label.get().strip()
-        if not url:
-            messagebox.showinfo("No URL", "No local URL detected yet.")
-            return
-        if HtmlFrame is None:
-            messagebox.showinfo("Missing dependency", "Embedded preview requires 'tkinterweb'. It's listed in requirements.txt.")
-            return
-        try:
-            # Create or reuse webview
-            if self.webview is None:
-                self.webview = HtmlFrame(self.web_container)
-                self.webview.pack(side="top", fill="both", expand=True)
-            self.webview.load_website(url)
-            self.append_output(f"[INFO] Embedded preview: {url}")
-        except Exception as e:
-            self.append_output(f"[WARN] Could not embed URL: {e}")
+        def _do():
+            url = self.last_url or self.url_label.get().strip()
+            if not url:
+                messagebox.showinfo("No URL", "No local URL detected yet.")
+                return
+            if HtmlFrame is None:
+                messagebox.showinfo("Missing dependency", "Embedded preview requires 'tkinterweb'. It's listed in requirements.txt.")
+                return
+            try:
+                # Create or reuse webview
+                if self.webview is None:
+                    self.webview = HtmlFrame(self.web_container)
+                    self.webview.pack(side="top", fill="both", expand=True)
+                self.webview.load_website(url)
+                self.append_output(f"[INFO] Embedded preview: {url}")
+            except Exception as e:
+                self.append_output(f"[WARN] Could not embed URL: {e}")
+        if threading.current_thread() is threading.main_thread():
+            _do()
+        else:
+            self.after(0, _do)
 
     # ===== Terminal-like support =====
 
@@ -299,9 +307,14 @@ class App(ctk.CTk):
 
         # Per-terminal runner with its own callback
         def term_append(msg):
-            self._ansi_to_tags_insert(text, msg + "\n")
-            text.see("end")
-            self.update_idletasks()
+            def _do(m=msg):
+                self._ansi_to_tags_insert(text, m + "\n")
+                text.see("end")
+                self.update_idletasks()
+            if threading.current_thread() is threading.main_thread():
+                _do()
+            else:
+                self.after(0, _do)
         session["runner"] = ProcessRunner(term_append)
 
         # Prompt
@@ -515,16 +528,18 @@ class App(ctk.CTk):
             m = re.search(r"(https?://(?:localhost|127\.0\.0\.1|0\.0\.0\.0):\d+(?:/\S*)?)", s, re.I)
             if m:
                 url = m.group(1)
-                if url not in self.detected_urls:
-                    self.detected_urls.append(url)
-                self.last_url = url
-                self.url_label.delete(0, "end")
-                self.url_label.insert(0, url)
-                # Auto-embed for safety (no external browser)
-                try:
+                def _apply():
+                    if url not in self.detected_urls:
+                        self.detected_urls.append(url)
+                    self.last_url = url
+                    self.url_label.delete(0, "end")
+                    self.url_label.insert(0, url)
+                    # Auto-embed for safety (no external browser)
                     self.embed_last_url()
-                except Exception:
-                    pass
+                if threading.current_thread() is threading.main_thread():
+                    _apply()
+                else:
+                    self.after(0, _apply)
         except Exception:
             pass
 
@@ -656,7 +671,7 @@ class App(ctk.CTk):
             # Fallback: plain insert
             widget.insert("end", self.strip_ansi(text))
 
-    def append_output(self, text):
+    def _append_output_ui(self, text):
         # Insert with ANSI color support
         self._ansi_to_tags_insert(self.output_box, text + "\n")
         self.output_box.see("end")
@@ -664,6 +679,12 @@ class App(ctk.CTk):
         clean = self.strip_ansi(text)
         self.detect_url(clean)
         self.update_idletasks()
+
+    def append_output(self, text):
+        if threading.current_thread() is threading.main_thread():
+            self._append_output_ui(text)
+        else:
+            self.after(0, lambda t=text: self._append_output_ui(t))
 
     def on_run_clicked(self):
         url = self.url_entry.get().strip()
