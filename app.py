@@ -145,6 +145,7 @@ class App(ctk.CTk):
         self.export_env_var = ctk.BooleanVar(value=True)
         self.detected_urls = []
         self.last_url = None
+        self.opened_urls = set()
 
         # Where we place auto-downloaded tools (e.g., PHP)
         self.tools_dir = APP_DIR / "tools"
@@ -204,27 +205,21 @@ class App(ctk.CTk):
         self.output_box = ctk.CTkTextbox(left, wrap="word")
         self.output_box.pack(side="top", fill="both", expand=True)
 
-        # Web preview controls
+        # Web controls (external browser only)
         web_controls = ctk.CTkFrame(right)
         web_controls.pack(side="top", fill="x", padx=8, pady=8)
 
         self.url_label = ctk.CTkEntry(web_controls, placeholder_text="Detected local URL will appear here")
         self.url_label.pack(side="left", fill="x", expand=True, padx=(0, 8))
 
-        embed_btn = ctk.CTkButton(web_controls, text="Embed/Refresh", width=110, command=self.embed_last_url)
-        embed_btn.pack(side="left")
+        open_btn = ctk.CTkButton(web_controls, text="Open in Browser", width=130, command=self.open_last_url)
+        open_btn.pack(side="left")
 
-        # Web preview pane (if HtmlFrame available)
+        # Placeholder panel (no embedded browser)
         self.web_container = ctk.CTkFrame(right)
         self.web_container.pack(side="top", fill="both", expand=True, padx=8, pady=(0, 8))
-
-        self.webview = None
-        self.web_loading = False
-        self.web_loaded_url = None
-        self.web_embed_job = None
-        if HtmlFrame is None:
-            info = ctk.CTkLabel(self.web_container, text="Embedded preview requires 'tkinterweb'.\nIt's included in requirements and will be installed automatically.")
-            info.pack(side="top", pady=20)
+        info = ctk.CTkLabel(self.web_container, text="Web preview disabled.\nLinks will open in your default browser.")
+        info.pack(side="top", pady=20)
 
         # Input to send to running process (activity runner)
         input_frame = ctk.CTkFrame(self)
@@ -260,44 +255,17 @@ class App(ctk.CTk):
         self.new_terminal(initial=True)
 
     
-    def _embed_now(self, url: str):
-        if not url or HtmlFrame is None:
-            return
-        if self.web_loading:
-            return
-        if self.web_loaded_url == url:
-            return
-        self.web_loading = True
-        try:
-            if self.webview is None:
-                self.webview = HtmlFrame(self.web_container)
-                self.webview.pack(side="top", fill="both", expand=True)
-            # Load with slight delay to avoid re-entrancy during heavy output
-            def _load():
-                try:
-                    self.webview.load_website(url)
-                    self.web_loaded_url = url
-                    self.append_output(f"[INFO] Embedded preview: {url}")
-                except Exception as e:
-                    self.append_output(f"[WARN] Could not embed URL: {e}")
-                finally:
-                    self.web_loading = False
-            self.after(50, _load)
-        except Exception:
-            self.web_loading = False
-
-    def embed_last_url(self):
+    def open_last_url(self):
         url = self.last_url or self.url_label.get().strip()
         if not url:
             messagebox.showinfo("No URL", "No local URL detected yet.")
             return
-        if HtmlFrame is None:
-            messagebox.showinfo("Missing dependency", "Embedded preview requires 'tkinterweb'. It's listed in requirements.txt.")
-            return
-        if threading.current_thread() is threading.main_thread():
-            self._embed_now(url)
-        else:
-            self.after(0, lambda u=url: self._embed_now(u))
+        import webbrowser
+        try:
+            webbrowser.open(url, new=2)
+            self.append_output(f"[INFO] Opened in browser: {url}")
+        except Exception as e:
+            self.append_output(f"[WARN] Could not open browser: {e}")
 
     # ===== Terminal-like support =====
 
@@ -556,13 +524,10 @@ class App(ctk.CTk):
                         self.url_label.insert(0, url)
                     except Exception:
                         pass
-                    # Debounce embed to avoid re-entrant crashes
-                    if self.web_embed_job is not None:
-                        try:
-                            self.after_cancel(self.web_embed_job)
-                        except Exception:
-                            pass
-                    self.web_embed_job = self.after(200, self.embed_last_url)
+                    # Open externally once per URL for safety
+                    if url not in self.opened_urls:
+                        self.opened_urls.add(url)
+                        self.open_last_url()
                 if threading.current_thread() is threading.main_thread():
                     _apply()
                 else:
