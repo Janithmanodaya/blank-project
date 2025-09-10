@@ -290,7 +290,10 @@ class App(ctk.CTk):
         """
         Ensures a php.exe is available.
         Returns a directory path to prepend to PATH if a bundled PHP is set up, else None.
-        Tries to download a portable PHP if not found in PATH.
+        Strategy:
+          1) Check PATH and bundled locations.
+          2) Try system package managers (winget, then choco).
+          3) If still missing, guide manual placement.
         """
         # Already available?
         if shutil.which("php"):
@@ -301,57 +304,42 @@ class App(ctk.CTk):
             if (cand / "php.exe").exists():
                 return str(cand)
 
-        # Attempt to auto-download a portable PHP zip and extract it
-        self.append_output("[INFO] php.exe not found. Attempting to download a portable PHP build...")
-        dest = self.tools_dir / "php"
-        dest.mkdir(parents=True, exist_ok=True)
+        # Try winget
+        self.append_output("[INFO] php.exe not found. Trying to install via winget (requires Windows 10/11 Apps Installer)...")
+        try:
+            # Silent install with agreements accepted
+            code = subprocess.call([
+                "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                "winget", "install", "-e", "--id", "PHP.PHP",
+                "--accept-package-agreements", "--accept-source-agreements", "--silent"
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if code == 0 and shutil.which("php"):
+                self.append_output("[INFO] PHP installed via winget.")
+                return None
+        except Exception as e:
+            self.append_output(f"[WARN] winget not available or failed: {e}")
 
-        # Prefer latest endpoints to avoid 404 on specific versions
-        # We try both NTS and TS builds for common toolchains (VS17 for 8.3+, VS16 for 8.2)
-        arch = "x64"
-        candidates = [
-            # Latest stable (8.3) - VS17
-            f"https://windows.php.net/downloads/releases/latest/php-8.3-nts-Win32-vs17-{arch}.zip",
-            f"https://windows.php.net/downloads/releases/latest/php-8.3-Win32-vs17-{arch}.zip",
-            # Previous stable (8.2) - VS16
-            f"https://windows.php.net/downloads/releases/latest/php-8.2-nts-Win32-vs16-{arch}.zip",
-            f"https://windows.php.net/downloads/releases/latest/php-8.2-Win32-vs16-{arch}.zip",
-            # Generic 'latest' (may point to newest major)
-            f"https://windows.php.net/downloads/releases/latest/php-nts-Win32-vs17-{arch}.zip",
-            f"https://windows.php.net/downloads/releases/latest/php-Win32-vs17-{arch}.zip",
-            f"https://windows.php.net/downloads/releases/latest/php-nts-Win32-vs16-{arch}.zip",
-            f"https://windows.php.net/downloads/releases/latest/php-Win32-vs16-{arch}.zip",
-        ]
+        # Try Chocolatey
+        self.append_output("[INFO] Trying to install PHP via Chocolatey (requires choco installed and admin)...")
+        try:
+            code = subprocess.call([
+                "cmd", "/c", "choco", "install", "php", "-y", "--no-progress"
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if code == 0 and shutil.which("php"):
+                self.append_output("[INFO] PHP installed via Chocolatey.")
+                return None
+        except Exception as e:
+            self.append_output(f"[WARN] Chocolatey not available or failed: {e}")
 
-        zip_path = self.tools_dir / "php.zip"
-        for url in candidates:
-            try:
-                self.append_output(f"[INFO] Downloading: {url}")
-                urllib.request.urlretrieve(url, str(zip_path))
-                if not zipfile.is_zipfile(str(zip_path)):
-                    raise RuntimeError("Downloaded file is not a valid zip")
-                with zipfile.ZipFile(str(zip_path), "r") as zf:
-                    zf.extractall(str(dest))
-                # Look for php.exe within extracted contents
-                found = None
-                for root, dirs, files in os.walk(dest):
-                    if "php.exe" in files:
-                        found = Path(root)
-                        break
-                if found:
-                    self.append_output("[INFO] Portable PHP downloaded and extracted.")
-                    return str(found)
-            except Exception as e:
-                self.append_output(f"[WARN] Failed to download or extract from {url}: {e}")
-            finally:
-                try:
-                    if zip_path.exists():
-                        zip_path.unlink()
-                except Exception:
-                    pass
-
-        self.append_output("[ERROR] Automatic PHP download failed (all candidates returned 404 or invalid).")
-        self.append_output("        Please install PHP or place php.exe under ./php, ./bin/php, or ./tools/php, then try again.")
+        # Give up with clear instructions
+        self.append_output("[ERROR] Could not set up PHP automatically.")
+        self.append_output("        Install PHP via:")
+        self.append_output("        - winget: winget install -e --id PHP.PHP")
+        self.append_output("        - Chocolatey: choco install php -y")
+        self.append_output("        Or place a portable php.exe under one of:")
+        self.append_output("        - ./php")
+        self.append_output("        - ./bin/php")
+        self.append_output("        - ./tools/php")
         return None
 
     def find_and_run(self, repo_dir: Path):
