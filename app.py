@@ -13,6 +13,15 @@ from pathlib import Path
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 
+# Image utilities for owner icon
+try:
+    from PIL import Image, ImageOps, ImageDraw
+except Exception:
+    Image = None
+    ImageOps = None
+    ImageDraw = None
+
+# Kept for backward compatibility, but embedded web view is disabled in current build
 try:
     from tkinterweb import HtmlFrame  # lightweight embedded browser
 except Exception:
@@ -168,6 +177,16 @@ class App(ctk.CTk):
 
         self.run_button = ctk.CTkButton(top, text="Run", command=self.on_run_clicked)
         self.run_button.pack(side="left")
+
+        # Owner icon button (right-aligned)
+        top_right = ctk.CTkFrame(top)
+        top_right.pack(side="right", padx=(10, 0))
+        try:
+            owner_img = self._load_owner_icon(APP_DIR / "pro.jpg", size=32)
+            self.owner_btn = ctk.CTkButton(top_right, width=36, height=36, text="", image=owner_img, command=self.show_owner_popup)
+        except Exception:
+            self.owner_btn = ctk.CTkButton(top_right, width=80, height=28, text="Owner", command=self.show_owner_popup)
+        self.owner_btn.pack(side="right")
 
         # Files frame for selecting input files required by the target repo
         files_frame = ctk.CTkFrame(self)
@@ -638,6 +657,54 @@ class App(ctk.CTk):
             self.output_box.delete("1.0", "end")
         except Exception:
             pass
+
+    # ==== Owner icon helpers ====
+
+    def _load_owner_icon(self, path: Path, size=32):
+        # Return a CTkImage with circular-cropped owner photo if Pillow is available
+        if Image is None:
+            raise RuntimeError("Pillow not available")
+        img = Image.open(str(path)).convert("RGBA")
+        img = ImageOps.fit(img, (size, size), Image.LANCZOS)
+        # circular mask
+        mask = Image.new("L", (size, size), 0)
+        draw = ImageDraw.Draw(mask)
+        draw.ellipse((0, 0, size, size), fill=255)
+        img.putalpha(mask)
+        return ctk.CTkImage(light_image=img, dark_image=img, size=(size, size))
+
+    def show_owner_popup(self):
+        import webbrowser
+        win = ctk.CTkToplevel(self)
+        win.title("Owner")
+        win.geometry("300x360")
+        win.resizable(False, False)
+
+        # Image
+        try:
+            avatar = self._load_owner_icon(APP_DIR / "pro.jpg", size=120)
+            img_label = ctk.CTkLabel(win, image=avatar, text="")
+            # keep reference to avoid GC
+            img_label.image = avatar
+            img_label.pack(pady=(20, 10))
+        except Exception:
+            ctk.CTkLabel(win, text="(owner image not found: pro.jpg)").pack(pady=(20, 10))
+
+        # Name
+        ctk.CTkLabel(win, text="Janith Manodya", font=("Arial", 16, "bold")).pack(pady=(0, 6))
+
+        # Facebook link button
+        def open_fb():
+            try:
+                webbrowser.open("https://web.facebook.com/janith.manodaya.3", new=2)
+            except Exception:
+                pass
+        fb_btn = ctk.CTkButton(win, text="Open Facebook", command=open_fb, width=160)
+        fb_btn.pack(pady=(6, 12))
+
+        # Close button
+        close_btn = ctk.CTkButton(win, text="Close", command=win.destroy, width=100)
+        close_btn.pack(pady=(0, 12))
 
     def _init_text_tags(self, widget):
         # Foreground colors
