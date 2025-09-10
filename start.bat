@@ -7,36 +7,36 @@ pushd "%APP_DIR%"
 set "SRC_DIR=%APP_DIR%"
 
 rem ============================================================================
-rem Copy all files (except start.bat) to user's temp folder and work from there
-rem Do not create a new subfolder; copy directly into %LocalAppData%\Temp
+rem Copy all files (except start.bat) to user's Roaming folder and work from there
+rem Do not create a new subfolder; copy directly into %APPDATA%
 rem ============================================================================
-set "TEMP_DST=%LocalAppData%\Temp"
-if not defined LocalAppData set "TEMP_DST=%TEMP%"
-if not exist "%TEMP_DST%" (
-    echo [ERROR] Temp folder not found: %TEMP_DST%
+set "DEST_DIR=%APPDATA%"
+if not defined APPDATA set "DEST_DIR=%USERPROFILE%\AppData\Roaming"
+if not exist "%DEST_DIR%" (
+    echo [ERROR] Roaming folder not found: %DEST_DIR%
     pause
     endlocal & exit /b 1
 )
 
-echo [INFO] Copying files to "%TEMP_DST%" (excluding start.bat, venv, .git, __pycache__)...
+echo [INFO] Copying files to "%DEST_DIR%" (excluding start.bat, venv, .git, __pycache__)...
 where robocopy >nul 2>&1
 if %errorlevel%==0 (
-    rem Use robocopy without mirroring to avoid deleting other temp files
-    robocopy "%APP_DIR%" "%TEMP_DST%" /E /R:1 /W:1 /NFL /NDL /NJH /NJS /XD venv .git __pycache__ /XF start.bat >nul
+    rem Use robocopy without mirroring to avoid deleting other files
+    robocopy "%APP_DIR%" "%DEST_DIR%" /E /R:1 /W:1 /NFL /NDL /NJH /NJS /XD venv .git __pycache__ /XF start.bat >nul
 ) else (
-    xcopy "%APP_DIR%*" "%TEMP_DST%\" /E /I /H /Y >nul
-    if exist "%TEMP_DST%\start.bat" del /F /Q "%TEMP_DST%\start.bat"
-    if exist "%TEMP_DST%\.git" rmdir /S /Q "%TEMP_DST%\.git"
-    if exist "%TEMP_DST%\venv" rmdir /S /Q "%TEMP_DST%\venv"
-    if exist "%TEMP_DST%\__pycache__" rmdir /S /Q "%TEMP_DST%\__pycache__"
+    xcopy "%APP_DIR%*" "%DEST_DIR%\" /E /I /H /Y >nul
+    if exist "%DEST_DIR%\start.bat" del /F /Q "%DEST_DIR%\start.bat"
+    if exist "%DEST_DIR%\.git" rmdir /S /Q "%DEST_DIR%\.git"
+    if exist "%DEST_DIR%\venv" rmdir /S /Q "%DEST_DIR%\venv"
+    if exist "%DEST_DIR%\__pycache__" rmdir /S /Q "%DEST_DIR%\__pycache__"
 )
 
-rem Switch working directory to temp
+rem Switch working directory to Roaming
 popd
-pushd "%TEMP_DST%"
-set "APP_DIR=%TEMP_DST%\"
+pushd "%DEST_DIR%"
+set "APP_DIR=%DEST_DIR%\"
 
-rem Ensure setup.vbs is available in temp (copy from source if missing)
+rem Ensure setup.vbs is available in Roaming (copy from source if missing)
 if not exist "%APP_DIR%setup.vbs" (
     if exist "%SRC_DIR%setup.vbs" copy /Y "%SRC_DIR%setup.vbs" "%APP_DIR%" >nul
 )
