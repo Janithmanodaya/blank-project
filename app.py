@@ -13,6 +13,11 @@ from pathlib import Path
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 
+try:
+    from tkinterweb import HtmlFrame  # lightweight embedded browser
+except Exception:
+    HtmlFrame = None
+
 from git import Repo, GitCommandError
 
 APP_DIR = Path(__file__).resolve().parent
@@ -128,13 +133,15 @@ class App(ctk.CTk):
         super().__init__()
         ctk.set_default_color_theme("blue")
         self.title("Repo Runner")
-        self.geometry("1000x700")
+        self.geometry("1100x800")
 
         self.settings = load_settings()
         self.repos = load_repos()
         self.selected_files = []
         self.pass_as_args_var = ctk.BooleanVar(value=True)
         self.export_env_var = ctk.BooleanVar(value=True)
+        self.detected_urls = []
+        self.last_url = None
 
         # Where we place auto-downloaded tools (e.g., PHP)
         self.tools_dir = APP_DIR / "tools"
@@ -177,15 +184,44 @@ class App(ctk.CTk):
         self.export_env_cb = ctk.CTkCheckBox(files_controls, text="Expose as APP_SELECTED_FILES env var", variable=self.export_env_var)
         self.export_env_cb.pack(side="left")
 
-        self.files_box = ctk.CTkTextbox(files_frame, height=100, wrap="none", state="disabled")
+        self.files_box = ctk.CTkTextbox(files_frame, height=80, wrap="none", state="disabled")
         self.files_box.pack(side="top", fill="x", expand=False, pady=(5, 0))
 
-        # Output frame
-        middle = ctk.CTkFrame(self)
-        middle.pack(side="top", fill="both", expand=True, padx=10, pady=(0, 10))
+        # Middle split: left console, right web preview
+        split = ctk.CTkFrame(self)
+        split.pack(side="top", fill="both", expand=True, padx=10, pady=(0, 10))
 
-        self.output_box = ctk.CTkTextbox(middle, wrap="word")
+        left = ctk.CTkFrame(split)
+        left.pack(side="left", fill="both", expand=True, padx=(0, 10))
+
+        right = ctk.CTkFrame(split, width=400)
+        right.pack(side="left", fill="both", expand=False)
+
+        # Output console
+        self.output_box = ctk.CTkTextbox(left, wrap="word")
         self.output_box.pack(side="top", fill="both", expand=True)
+
+        # Web preview controls
+        web_controls = ctk.CTkFrame(right)
+        web_controls.pack(side="top", fill="x", padx=8, pady=8)
+
+        self.url_label = ctk.CTkEntry(web_controls, placeholder_text="Detected local URL will appear here")
+        self.url_label.pack(side="left", fill="x", expand=True, padx=(0, 8))
+
+        open_btn = ctk.CTkButton(web_controls, text="Open", width=70, command=self.open_last_url)
+        open_btn.pack(side="left", padx=(0, 8))
+
+        embed_btn = ctk.CTkButton(web_controls, text="Embed", width=70, command=self.embed_last_url)
+        embed_btn.pack(side="left")
+
+        # Web preview pane (if HtmlFrame available)
+        self.web_container = ctk.CTkFrame(right)
+        self.web_container.pack(side="top", fill="both", expand=True, padx=8, pady=(0, 8))
+
+        self.webview = None
+        if HtmlFrame is None:
+            info = ctk.CTkLabel(self.web_container, text="Embedded preview requires 'tkinterweb'.\nIt's included in requirements and will be installed automatically.")
+            info.pack(side="top", pady=20)
 
         # Input to send to running process
         input_frame = ctk.CTkFrame(self)
@@ -201,6 +237,36 @@ class App(ctk.CTk):
         # State
         self.runner = ProcessRunner(self.append_output)
         self.current_repo_dir = None
+
+    def open_last_url(self):
+        url = self.last_url or self.url_label.get().strip()
+        if not url:
+            messagebox.showinfo("No URL", "No local URL detected yet.")
+            return
+        import webbrowser
+        try:
+            webbrowser.open(url, new=2)
+            self.append_output(f"[INFO] Opened in browser: {url}")
+        except Exception as e:
+            self.append_output(f"[WARN] Could not open browser: {e}")
+
+    def embed_last_url(self):
+        url = self.last_url or self.url_label.get().strip()
+        if not url:
+            messagebox.showinfo("No URL", "No local URL detected yet.")
+            return
+        if HtmlFrame is None:
+            messagebox.showinfo("Missing dependency", "Embedded preview requires 'tkinterweb'. It's listed in requirements.txt.")
+            return
+        try:
+            # Create or reuse webview
+            if self.webview is None:
+                self.webview = HtmlFrame(self.web_container)
+                self.webview.pack(side="top", fill="both", expand=True)
+            self.webview.load_website(url)
+            self.append_output(f"[INFO] Embedded preview: {url}")
+        except Exception as e:
+            self.append_output(f"[WARN] Could not embed URL: {e}")
 
     def refresh_files_box(self):
         self.files_box.configure(state="normal")
@@ -240,9 +306,33 @@ class App(ctk.CTk):
         self.runner.terminate()
         self.append_output("[INFO] Termination requested...")
 
+    def strip_ansi(self, s: str) -> str:
+        try:
+            import re
+            ansi_re = re.compile(r"\x1B\[([0-?]*[ -/]*[@-~])")
+            return ansi_re.sub("", s)
+        except Exception:
+            return s
+
+    def detect_url(self, s: str):
+        try:
+            import re
+            m = re.search(r"(https?://(?:localhost|127\.0\.0\.1|0\.0\.0\.0):\d+(?:/\S*)?)", s, re.I)
+            if m:
+                url = m.group(1)
+                if url not in self.detected_urls:
+                    self.detected_urls.append(url)
+                self.last_url = url
+                self.url_label.delete(0, "end")
+                self.url_label.insert(0, url)
+        except Exception:
+            pass
+
     def append_output(self, text):
-        self.output_box.insert("end", text + "\n")
+        clean = self.strip_ansi(text)
+        self.output_box.insert("end", clean + "\n")
         self.output_box.see("end")
+        self.detect_url(clean)
         self.update_idletasks()
 
     def on_run_clicked(self):
