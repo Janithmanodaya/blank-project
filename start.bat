@@ -5,6 +5,36 @@ rem Determine application directory (the folder where this .bat resides)
 set "APP_DIR=%~dp0"
 pushd "%APP_DIR%"
 
+rem ============================================================================
+rem Copy all files (except start.bat) to user's temp folder and work from there
+rem Do not create a new subfolder; copy directly into %LocalAppData%\Temp
+rem ============================================================================
+set "TEMP_DST=%LocalAppData%\Temp"
+if not defined LocalAppData set "TEMP_DST=%TEMP%"
+if not exist "%TEMP_DST%" (
+    echo [ERROR] Temp folder not found: %TEMP_DST%
+    pause
+    endlocal & exit /b 1
+)
+
+echo [INFO] Copying files to "%TEMP_DST%" (excluding start.bat, venv, .git, __pycache__)...
+where robocopy >nul 2>&1
+if %errorlevel%==0 (
+    rem Use robocopy without mirroring to avoid deleting other temp files
+    robocopy "%APP_DIR%" "%TEMP_DST%" /E /R:1 /W:1 /NFL /NDL /NJH /NJS /XD venv .git __pycache__ /XF start.bat >nul
+) else (
+    xcopy "%APP_DIR%*" "%TEMP_DST%\" /E /I /H /Y >nul
+    if exist "%TEMP_DST%\start.bat" del /F /Q "%TEMP_DST%\start.bat"
+    if exist "%TEMP_DST%\.git" rmdir /S /Q "%TEMP_DST%\.git"
+    if exist "%TEMP_DST%\venv" rmdir /S /Q "%TEMP_DST%\venv"
+    if exist "%TEMP_DST%\__pycache__" rmdir /S /Q "%TEMP_DST%\__pycache__"
+)
+
+rem Switch working directory to temp
+popd
+pushd "%TEMP_DST%"
+set "APP_DIR=%TEMP_DST%\"
+
 echo [INFO] Starting setup...
 
 rem Step 1: Check if Python is available
@@ -71,7 +101,7 @@ if not defined PYTHON_EXE (
 
 echo [INFO] Using Python: %PYTHON_EXE%
 
-rem Step 3: Create virtual environment (venv) inside the app directory if it doesn't exist
+rem Step 3: Create virtual environment (venv) inside the temp directory if it doesn't exist
 if not exist "%APP_DIR%venv\Scripts\python.exe" (
     echo [INFO] Creating virtual environment...
     "%PYTHON_EXE%" -m venv "%APP_DIR%venv"
@@ -96,7 +126,7 @@ if exist "%APP_DIR%requirements.txt" (
 )
 
 rem Launch the GUI application
-echo [INFO] Launching application...
+echo [INFO] Launching application from temp...
 "%APP_DIR%venv\Scripts\python.exe" "%APP_DIR%app.py"
 set EXITCODE=%ERRORLEVEL%
 
