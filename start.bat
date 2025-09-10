@@ -1,6 +1,9 @@
 @echo off
 setlocal enabledelayedexpansion
 
+rem Keep console open by default unless AUTO_CLOSE=1 is set
+if not defined AUTO_CLOSE set "AUTO_CLOSE=0"
+
 rem Determine application directory (the folder where this .bat resides)
 set "APP_DIR=%~dp0"
 pushd "%APP_DIR%"
@@ -20,7 +23,7 @@ if %errorlevel% neq 0 (
             echo [ERROR] Could not obtain python_installer.exe automatically.
             echo Please download the official Python installer (e.g. from https://www.python.org/downloads/windows/),
             echo save it as python_installer.exe next to this start.bat, then rerun.
-            pause
+            if "%AUTO_CLOSE%"=="0" pause
             exit /b 1
         )
     )
@@ -28,7 +31,7 @@ if %errorlevel% neq 0 (
     if not exist "%APP_DIR%setup.vbs" (
         echo [ERROR] setup.vbs not found in %APP_DIR%
         echo The helper script is required to run the installer silently.
-        pause
+        if "%AUTO_CLOSE%"=="0" pause
         exit /b 1
     )
 
@@ -65,7 +68,7 @@ for %%D in ("%LocalAppData%\Programs\Python" "%ProgramFiles%\Python311" "%Progra
 if not defined PYTHON_EXE (
     echo [ERROR] Python could not be found after installation attempt.
     echo Please ensure Python is installed and available on PATH, then rerun.
-    pause
+    if "%AUTO_CLOSE%"=="0" pause
     exit /b 1
 )
 
@@ -83,13 +86,14 @@ if exist "%APP_DIR%run_appdata.bat" (
     call "%APP_DIR%run_appdata.bat"
     set "EXITCODE=%ERRORLEVEL%"
     echo [INFO] run_appdata.bat completed with code %EXITCODE%
+    if "%AUTO_CLOSE%"=="0" pause
     popd
     endlocal
     exit /b %EXITCODE%
 ) else (
     echo [ERROR] run_appdata.bat not found in %APP_DIR%
     echo         Please ensure run_appdata.bat exists next to start.bat.
-    pause
+    if "%AUTO_CLOSE%"=="0" pause
     popd
     endlocal
     exit /b 1
