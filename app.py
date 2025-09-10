@@ -319,10 +319,140 @@ class App(ctk.CTk):
         except Exception:
             pass
 
+    def clear_console(self):
+        try:
+            self.output_box.delete("1.0", "end")
+        except Exception:
+            pass
+
+    def _init_text_tags(self):
+        # Foreground colors
+        fg_colors = {
+            "fg_black": "#000000",
+            "fg_red": "#cc0000",
+            "fg_green": "#00aa00",
+            "fg_yellow": "#bb8800",
+            "fg_blue": "#0066cc",
+            "fg_magenta": "#aa00aa",
+            "fg_cyan": "#008888",
+            "fg_white": "#dddddd",
+            "fg_bblack": "#555555",   # bright black (gray)
+            "fg_bred": "#ff5555",
+            "fg_bgreen": "#55ff55",
+            "fg_byellow": "#ffff55",
+            "fg_bblue": "#5599ff",
+            "fg_bmagenta": "#ff55ff",
+            "fg_bcyan": "#55ffff",
+            "fg_bwhite": "#ffffff",
+        }
+        for tag, color in fg_colors.items():
+            try:
+                self.output_box.tag_configure(tag, foreground=color)
+            except Exception:
+                pass
+
+        # Backgrounds (limited set to avoid visual clutter)
+        bg_colors = {
+            "bg_red": "#440000",
+            "bg_green": "#003300",
+            "bg_yellow": "#3a2e00",
+            "bg_blue": "#001a33",
+            "bg_magenta": "#2a0033",
+            "bg_cyan": "#003333",
+            "bg_white": "#666666",
+        }
+        for tag, color in bg_colors.items():
+            try:
+                self.output_box.tag_configure(tag, background=color)
+            except Exception:
+                pass
+
+        try:
+            self.output_box.tag_configure("bold", font=("Consolas", 11, "bold"))
+        except Exception:
+            pass
+
+    def _ansi_to_tags_insert(self, text: str):
+        """
+        Parse ANSI SGR sequences and insert into Text with tags for colors/bold.
+        """
+        try:
+            import re
+            # Ensure tags initialized
+            if not hasattr(self, "_tags_inited"):
+                self._init_text_tags()
+                self._tags_inited = True
+
+            # Map SGR to tags
+            fg_map = {
+                30: "fg_black", 31: "fg_red", 32: "fg_green", 33: "fg_yellow",
+                34: "fg_blue", 35: "fg_magenta", 36: "fg_cyan", 37: "fg_white",
+                90: "fg_bblack", 91: "fg_bred", 92: "fg_bgreen", 93: "fg_byellow",
+                94: "fg_bblue", 95: "fg_bmagenta", 96: "fg_bcyan", 97: "fg_bwhite",
+            }
+            bg_map = {
+                41: "bg_red", 42: "bg_green", 43: "bg_yellow",
+                44: "bg_blue", 45: "bg_magenta", 46: "bg_cyan", 47: "bg_white",
+            }
+
+            ansi_re = re.compile(r"\x1b\[([0-9;]*)m")
+            pos = 0
+            current_tags = set()
+            for m in ansi_re.finditer(text):
+                chunk = text[pos:m.start()]
+                if chunk:
+                    self.output_box.insert("end", chunk, tuple(current_tags) if current_tags else ())
+                codes = m.group(1)
+                if codes == "" or codes == "0":
+                    current_tags.clear()
+                else:
+                    for c in codes.split(";"):
+                        try:
+                            n = int(c)
+                        except ValueError:
+                            continue
+                        if n == 0:
+                            current_tags.clear()
+                        elif n == 1:
+                            current_tags.add("bold")
+                        elif n in fg_map:
+                            # remove existing fg tags
+                            for t in list(current_tags):
+                                if t.startswith("fg_"):
+                                    current_tags.discard(t)
+                            current_tags.add(fg_map[n])
+                        elif n in bg_map:
+                            for t in list(current_tags):
+                                if t.startswith("bg_"):
+                                    current_tags.discard(t)
+                            current_tags.add(bg_map[n])
+                        elif n == 39:
+                            # default foreground
+                            for t in list(current_tags):
+                                if t.startswith("fg_"):
+                                    current_tags.discard(t)
+                        elif n == 49:
+                            for t in list(current_tags):
+                                if t.startswith("bg_"):
+                                    current_tags.discard(t)
+                        else:
+                            # ignore unsupported attributes
+                            pass
+                pos = m.end()
+            # Tail
+            tail = text[pos:]
+            if tail:
+                self.output_box.insert("end", tail, tuple(current_tags) if current_tags else ())
+        except Exception:
+            # Fallback: plain insert
+            self.output_box.insert("end", self.strip_ansi(text))
+
     def append_output(self, text):
-        clean = self.strip_ansi(text)
-        self.output_box.insert("end", clean + "\n")
+        # Insert with ANSI color support
+        self._ansi_to_tags_insert(text + "\n")
         self.output_box.see("end")
+        # URL detection based on cleaned text
+        clean = self.strip_ansi(text)
         self.detect_url(clean)
         self.update_idletasks()
 
@@ -338,6 +468,8 @@ class App(ctk.CTk):
             save_repos(self.repos)
             self.repo_dropdown.configure(values=self.repos)
 
+        # Clear previous logs for a clean session
+        self.clear_console()
         self.run_button.configure(state="disabled")
         self.append_output(f"[INFO] Starting workflow for {url} ...")
 
