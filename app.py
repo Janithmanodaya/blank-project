@@ -306,37 +306,41 @@ class App(ctk.CTk):
         dest = self.tools_dir / "php"
         dest.mkdir(parents=True, exist_ok=True)
 
-        # Candidate URLs (x64 thread-safe). We try several known releases.
-        urls = [
-            # PHP 8.2 (VS16)
-            "https://windows.php.net/downloads/releases/php-8.2.24-Win32-vs16-x64.zip",
-            "https://windows.php.net/downloads/releases/php-8.2.23-Win32-vs16-x64.zip",
-            # PHP 8.3 (VS17)
-            "https://windows.php.net/downloads/releases/php-8.3.12-Win32-vs17-x64.zip",
-            "https://windows.php.net/downloads/releases/php-8.3.11-Win32-vs17-x64.zip",
+        # Prefer latest endpoints to avoid 404 on specific versions
+        # We try both NTS and TS builds for common toolchains (VS17 for 8.3+, VS16 for 8.2)
+        arch = "x64"
+        candidates = [
+            # Latest stable (8.3) - VS17
+            f"https://windows.php.net/downloads/releases/latest/php-8.3-nts-Win32-vs17-{arch}.zip",
+            f"https://windows.php.net/downloads/releases/latest/php-8.3-Win32-vs17-{arch}.zip",
+            # Previous stable (8.2) - VS16
+            f"https://windows.php.net/downloads/releases/latest/php-8.2-nts-Win32-vs16-{arch}.zip",
+            f"https://windows.php.net/downloads/releases/latest/php-8.2-Win32-vs16-{arch}.zip",
+            # Generic 'latest' (may point to newest major)
+            f"https://windows.php.net/downloads/releases/latest/php-nts-Win32-vs17-{arch}.zip",
+            f"https://windows.php.net/downloads/releases/latest/php-Win32-vs17-{arch}.zip",
+            f"https://windows.php.net/downloads/releases/latest/php-nts-Win32-vs16-{arch}.zip",
+            f"https://windows.php.net/downloads/releases/latest/php-Win32-vs16-{arch}.zip",
         ]
 
         zip_path = self.tools_dir / "php.zip"
-        for url in urls:
+        for url in candidates:
             try:
                 self.append_output(f"[INFO] Downloading: {url}")
                 urllib.request.urlretrieve(url, str(zip_path))
-                if zipfile.is_zipfile(str(zip_path)):
-                    with zipfile.ZipFile(str(zip_path), "r") as zf:
-                        zf.extractall(str(dest))
-                    # Some zips contain files at root; ensure php.exe exists somewhere inside
-                    # Look for php.exe
-                    found = None
-                    for root, dirs, files in os.walk(dest):
-                        if "php.exe" in files:
-                            found = Path(root)
-                            break
-                    if found:
-                        self.append_output("[INFO] Portable PHP downloaded and extracted.")
-                        # If php.exe not directly under dest/php, but in a subdir, we prefer that folder
-                        if found != dest:
-                            return str(found)
-                        return str(dest)
+                if not zipfile.is_zipfile(str(zip_path)):
+                    raise RuntimeError("Downloaded file is not a valid zip")
+                with zipfile.ZipFile(str(zip_path), "r") as zf:
+                    zf.extractall(str(dest))
+                # Look for php.exe within extracted contents
+                found = None
+                for root, dirs, files in os.walk(dest):
+                    if "php.exe" in files:
+                        found = Path(root)
+                        break
+                if found:
+                    self.append_output("[INFO] Portable PHP downloaded and extracted.")
+                    return str(found)
             except Exception as e:
                 self.append_output(f"[WARN] Failed to download or extract from {url}: {e}")
             finally:
@@ -346,7 +350,8 @@ class App(ctk.CTk):
                 except Exception:
                     pass
 
-        self.append_output("[ERROR] Automatic PHP download failed. Please install PHP or place php.exe under ./php, ./bin/php, or ./tools/php.")
+        self.append_output("[ERROR] Automatic PHP download failed (all candidates returned 404 or invalid).")
+        self.append_output("        Please install PHP or place php.exe under ./php, ./bin/php, or ./tools/php, then try again.")
         return None
 
     def find_and_run(self, repo_dir: Path):
