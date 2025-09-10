@@ -1059,6 +1059,94 @@ class App(ctk.CTk):
         self.append_output("        Or set a custom path via manual selection when prompted.")
         return None
 
+    def _run_with_node_if_possible(self, repo_dir: Path, env: dict) -> bool:
+        pkg = repo_dir / "package.json"
+        if not pkg.exists():
+            return False
+        try:
+            import json as _json
+            data = _json.loads(pkg.read_text(encoding="utf-8"))
+            scripts = (data.get("scripts") or {}) if isinstance(data, dict) else {}
+            # Choose a common start script
+            script = None
+            for key in ("dev", "start", "serve"):
+                if key in scripts:
+                    script = key
+                    break
+            if script is None:
+                self.append_output("[INFO] package.json found but no 'start'/'dev'/'serve' script.")
+                return False
+        except Exception as e:
+            self.append_output(f"[WARN] Could not parse package.json: {e}")
+            return False
+
+        # Check node and npm availability
+        node = shutil.which("node")
+        npm = shutil.which("npm")
+        if not node or not npm:
+            self.append_output("[WARN] Node.js/NPM not found on PATH. Install Node.js to run this repo.")
+            return False
+
+        # Install and run
+        self.append_output("[INFO] Detected Node project. Running 'npm install' then 'npm run {script}'...")
+        self.run_and_wait([npm, "install"], cwd=str(repo_dir))
+        self.run_streaming([npm, "run", script], cwd=str(repo_dir), env=env)
+        return True
+
+    def _run_with_bash_if_possible(self, repo_dir: Path, env: dict) -> bool:
+        # Find a bash script that looks like an entry
+        sh_candidates = [
+            "start.sh", "run.sh", "serve.sh", "launch.sh", "bootstrap.sh",
+            "zphisher.sh"
+        ]
+        target = None
+        for c in sh_candidates:
+            p = repo_dir / c
+            if p.exists():
+                target = p
+                break
+        if target is None:
+            # last resort: any top-level .sh
+            for p in repo_dir.glob("*.sh"):
+                target = p
+                break
+        if target is None:
+            return False
+
+        # Locate bash (Git Bash or WSL bash or any bash)
+        bash = shutil.which("bash")
+        if not bash:
+            # Common Git Bash location
+            cand = Path("C:/Program Files/Git/bin/bash.exe")
+            if cand.exists():
+                bash = str(cand)
+        if not bash:
+            self.append_output("[WARN] Bash script detected but 'bash' not found. Install Git for Windows or enable WSL.")
+            return False
+
+        self.append_output(f"[INFO] Detected bash script: {target.name}. Running via bash...")
+        self.run_streaming([bash, str(target)], cwd=str(repo_dir), env=env)
+        return True
+
+    def _run_with_php_server_if_possible(self, repo_dir: Path, env: dict) -> bool:
+        # Simple heuristic: index.php present
+        idx = repo_dir / "index.php"
+        if not idx.exists():
+            return False
+
+        php_dir_to_prepend = self.ensure_php_available()
+        if not shutil.which("php") and php_dir_to_prepend is None:
+            return False
+        if php_dir_to_prepend:
+            env["PATH"] = php_dir_to_prepend + os.pathsep + env.get("PATH", "")
+
+        # Choose port
+        port = "8000"
+        self.append_output(f"[INFO] Detected PHP app. Running: php -S localhost:{port} -t .")
+        args = ["php", "-S", f"localhost:{port}", "-t", "."]
+        self.run_streaming(args, cwd=str(repo_dir), env=env)
+        return True
+
     def find_and_run(self, repo_dir: Path):
         candidates = ["main.py", "app.py", "run.py", "start.py", "st.py"]
         entry = None
@@ -1070,33 +1158,54 @@ class App(ctk.CTk):
             if entry:
                 break
 
-        if not entry:
-            self.append_output("[WARN] No common entry-point (main.py/app.py/run.py/start.py/st.py) found.")
+        env = os.environ.copy()
+
+        if entry:
+            # Preflight: detect if the repository likely needs PHP and ensure it's present
+            needs_php = any(repo_dir.rglob("*.php"))
+            php_dir_to_prepend = None
+            if needs_php:
+                php_dir_to_prepend = self.ensure_php_available()
+                if not shutil.which("php") and php_dir_to_prepend is None:
+                    # Could not ensure php
+                    return
+            if php_dir_to_prepend:
+                env["PATH"] = php_dir_to_prepend + os.pathsep + env.get("PATH", "")
+
+            # Provide selected files to the target script
+            if self.export_env_var.get() and self.selected_files:
+                env["APP_SELECTED_FILES"] = ";".join(self.selected_files)
+                env["APP_SELECTED_FILE"] = self.selected_files[0]
+
+            self.append_output(f"[INFO] Running: {entry}")
+            args = [sys.executable, str(entry)]
+            if self.pass_as_args_var.get() and self.selected_files:
+                args.extend(self.selected_files)
+            self.run_streaming(args, cwd=str(entry.parent), env=env)
             return
 
-        # Preflight: detect if the repository likely needs PHP and ensure it's present
-        needs_php = any(repo_dir.rglob("*.php"))
-        php_dir_to_prepend = None
-        if needs_php:
-            php_dir_to_prepend = self.ensure_php_available()
-            if not shutil.which("php") and php_dir_to_prepend is None:
-                # Could not ensure php
-                return
+        # If no Python entry found, try broader heuristics
+        self.append_output("[WARN] No common Python entry-point found. Trying other strategies...")
 
-        env = os.environ.copy()
-        if php_dir_to_prepend:
-            env["PATH"] = php_dir_to_prepend + os.pathsep + env.get("PATH", "")
+        # 1) Node.js project via package.json
+        if self._run_with_node_if_possible(repo_dir, env):
+            return
 
-        # Provide selected files to the target script
-        if self.export_env_var.get() and self.selected_files:
-            env["APP_SELECTED_FILES"] = ";".join(self.selected_files)
-            env["APP_SELECTED_FILE"] = self.selected_files[0]
+        # 2) Bash script (e.g. zphisher.sh)
+        if self._run_with_bash_if_possible(repo_dir, env):
+            return
 
-        self.append_output(f"[INFO] Running: {entry}")
-        args = [sys.executable, str(entry)]
-        if self.pass_as_args_var.get() and self.selected_files:
-            args.extend(self.selected_files)
-        self.run_streaming(args, cwd=str(entry.parent), env=env)
+        # 3) Simple PHP app via built-in server (index.php)
+        if self._run_with_php_server_if_possible(repo_dir, env):
+            return
+
+        # 4) Give guidance
+        self.append_output("[ERROR] Could not determine how to run this repository automatically.")
+        self.append_output("        Tips:")
+        self.append_output("        - If it's a Node.js app, ensure Node/NPM is installed and try 'npm start'.")
+        self.append_output("        - If it has a bash script (start.sh/run.sh), install Git Bash and run it.")
+        self.append_output("        - If it's a PHP app, ensure 'php' is available; index.php will auto-run.")
+        self.append_output("        - Otherwise check the README for run instructions.")
 
     def run_and_wait(self, args, cwd=None):
         # For short tasks we can just run and stream output synchronously
