@@ -110,6 +110,9 @@ class App(ctk.CTk):
         self.geometry("1000x700")
 
         self.repos = load_repos()
+        self.selected_files = []
+        self.pass_as_args_var = ctk.BooleanVar(value=True)
+        self.export_env_var = ctk.BooleanVar(value=True)
 
         # Top frame for input controls
         top = ctk.CTkFrame(self)
@@ -128,6 +131,28 @@ class App(ctk.CTk):
 
         self.run_button = ctk.CTkButton(top, text="Run", command=self.on_run_clicked)
         self.run_button.pack(side="left")
+
+        # Files frame for selecting input files required by the target repo
+        files_frame = ctk.CTkFrame(self)
+        files_frame.pack(side="top", fill="x", padx=10, pady=(0, 10))
+
+        files_controls = ctk.CTkFrame(files_frame)
+        files_controls.pack(side="top", fill="x")
+
+        add_btn = ctk.CTkButton(files_controls, text="Add File(s)", command=self.add_files)
+        add_btn.pack(side="left", padx=(0, 10))
+
+        clear_btn = ctk.CTkButton(files_controls, text="Clear List", command=self.clear_files)
+        clear_btn.pack(side="left")
+
+        self.pass_args_cb = ctk.CTkCheckBox(files_controls, text="Pass selected files as CLI args", variable=self.pass_as_args_var)
+        self.pass_args_cb.pack(side="left", padx=(20, 10))
+
+        self.export_env_cb = ctk.CTkCheckBox(files_controls, text="Expose as APP_SELECTED_FILES env var", variable=self.export_env_var)
+        self.export_env_cb.pack(side="left")
+
+        self.files_box = ctk.CTkTextbox(files_frame, height=100, wrap="none", state="disabled")
+        self.files_box.pack(side="top", fill="x", expand=False, pady=(5, 0))
 
         # Output frame
         middle = ctk.CTkFrame(self)
@@ -150,6 +175,28 @@ class App(ctk.CTk):
         # State
         self.runner = ProcessRunner(self.append_output)
         self.current_repo_dir = None
+
+    def refresh_files_box(self):
+        self.files_box.configure(state="normal")
+        self.files_box.delete("1.0", "end")
+        if self.selected_files:
+            for p in self.selected_files:
+                self.files_box.insert("end", p + "\n")
+        else:
+            self.files_box.insert("end", "(no files selected)\n")
+        self.files_box.configure(state="disabled")
+
+    def add_files(self):
+        paths = filedialog.askopenfilenames(title="Select file(s) for the target repository")
+        if paths:
+            for p in paths:
+                if p not in self.selected_files:
+                    self.selected_files.append(p)
+            self.refresh_files_box()
+
+    def clear_files(self):
+        self.selected_files = []
+        self.refresh_files_box()
 
     def on_dropdown_select(self, value):
         if value and value != "Select a saved repository":
@@ -273,8 +320,15 @@ class App(ctk.CTk):
         if php_bundle_dir:
             env["PATH"] = php_bundle_dir + os.pathsep + env.get("PATH", "")
 
+        # Provide selected files to the target script
+        if self.export_env_var.get() and self.selected_files:
+            env["APP_SELECTED_FILES"] = ";".join(self.selected_files)
+            env["APP_SELECTED_FILE"] = self.selected_files[0]
+
         self.append_output(f"[INFO] Running: {entry}")
         args = [sys.executable, str(entry)]
+        if self.pass_as_args_var.get() and self.selected_files:
+            args.extend(self.selected_files)
         self.run_streaming(args, cwd=str(entry.parent), env=env)
 
     def run_and_wait(self, args, cwd=None):
@@ -294,10 +348,16 @@ class App(ctk.CTk):
 
     def run_streaming(self, args, cwd=None, env=None):
         self.append_output(f"[CMD] {' '.join(args)}")
-        self.runner.run(args, cwd
+        self.runner.run(args, cwd=cwd, env=env)
+
 if __name__ == "__main__":
     try:
         app = App()
+        # Initialize files box text with placeholder
+        try:
+            app.refresh_files_box()
+        except Exception:
+            pass
         app.mainloop()
     except Exception as e:
         # Best-effort error visibility if the GUI fails very early
@@ -311,7 +371,7 @@ if __name__ == "__main__":
             from tkinter import messagebox as mb
             root = tk.Tk()
             root.withdraw()
-            mb.showerror("Application Error", f"An error prevented the UI from starting:\\n{e}")
+            mb.showerror("Application Error", f"An error prevented the UI from starting:\n{e}")
             root.destroy()
         except Exception:
             pass
