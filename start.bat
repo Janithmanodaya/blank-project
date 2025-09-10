@@ -60,13 +60,16 @@ if /I not "%APP_DIR_NORM%"=="%SHADOW_DIR_NORM%" (
         echo [ERROR] Shadow launch failed: "%SHADOW_DIR%\start.bat" not found.
         echo [WARN] Running in-place instead of isolated workspace.
     ) else (
-        echo [INFO] Relaunching from isolated workspace...
+        echo [INFO] Relaunching from isolated workspace (same window)...
         set "RUN_FROM_SHADOW=1"
-        rem Use cmd /c to ensure .bat is launched correctly with quotes
-        start "" cmd /c "\"%SHADOW_DIR%\start.bat\""
+        rem Change directory and re-enter start.bat in the same console to avoid flash/close issues
         popd
         endlocal
-        exit /b 0
+        pushd "%SHADOW_DIR%"
+        call "%SHADOW_DIR%\start.bat"
+        set EXITCODE=%ERRORLEVEL%
+        popd
+        exit /b %EXITCODE%
     )
 )
 
