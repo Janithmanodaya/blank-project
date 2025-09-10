@@ -19,12 +19,31 @@ APP_DIR = Path(__file__).resolve().parent
 CLONES_DIR = APP_DIR / "cloned_repos"
 CLONES_DIR.mkdir(exist_ok=True)
 REPOS_JSON = APP_DIR / "repos.json"
+SETTINGS_JSON = APP_DIR / "settings.json"
 
 DEFAULT_REPOS = [
     "https://github.com/psf/requests",
     "https://github.com/pallets/flask",
     "https://github.com/streamlit/streamlit-example",
 ]
+
+def load_settings():
+    if SETTINGS_JSON.exists():
+        try:
+            with open(SETTINGS_JSON, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            pass
+    return {}
+
+def save_settings(d):
+    try:
+        with open(SETTINGS_JSON, "w", encoding="utf-8") as f:
+            json.dump(d, f, indent=2)
+    except Exception:
+        pass
 
 def load_repos():
     if REPOS_JSON.exists():
@@ -111,6 +130,7 @@ class App(ctk.CTk):
         self.title("Repo Runner")
         self.geometry("1000x700")
 
+        self.settings = load_settings()
         self.repos = load_repos()
         self.selected_files = []
         self.pass_as_args_var = ctk.BooleanVar(value=True)
@@ -341,6 +361,13 @@ class App(ctk.CTk):
             if (cand / "php.exe").exists():
                 return str(cand)
 
+        # Check user-configured php.exe first
+        php_cfg = (self.settings.get("tool_paths", {}) or {}).get("php")
+        if php_cfg and Path(php_cfg).exists():
+            php_dir = str(Path(php_cfg).parent)
+            self.append_output(f"[INFO] Using PHP from settings: {php_cfg}")
+            return php_dir
+
         # Try winget if available
         if shutil.which("winget"):
             self.append_output("[INFO] php.exe not found. Trying to install via winget (requires Windows Apps Installer)...")
@@ -356,29 +383,76 @@ class App(ctk.CTk):
         else:
             self.append_output("[INFO] winget not available on this system. Skipping.")
 
-        # Try Chocolatey if available
-        if shutil.which("choco"):
-            self.append_output("[INFO] Trying to install PHP via Chocolatey (requires admin).")
-            code = self._run_tool_with_output([
-                "choco", "install", "php", "-y", "--no-progress"
-            ], timeout=300)
-            if code == 0 and shutil.which("php"):
-                self.append_output("[INFO] PHP installed via Chocolatey.")
+        # Try Scoop (user-mode, no admin)
+        scoop = shutil.which("scoop")
+        if scoop:
+            self.append_output("[INFO] Trying to install PHP via Scoop (no admin required).")
+            code = self._run_tool_with_output(["scoop", "install", "php"], timeout=300)
+            # Check typical scoop shim location
+            userprofile = os.environ.get("USERPROFILE") or str(Path.home())
+            scoop_php = Path(userprofile) / "scoop" / "shims" / "php.exe"
+            if code == 0 and (shutil.which("php") or scoop_php.exists()):
+                self.append_output("[INFO] PHP installed via Scoop.")
+                if scoop_php.exists():
+                    return str(scoop_php.parent)
                 return None
             else:
-                self.append_output("[WARN] Chocolatey did not complete PHP installation.")
+                self.append_output("[WARN] Scoop did not complete PHP installation or shims not found.")
+        else:
+            self.append_output("[INFO] Scoop not available on this system. Skipping.")
+
+        # Try Chocolatey if available and we appear to be elevated
+        is_admin = False
+        try:
+            import ctypes
+            is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
+        except Exception:
+            pass
+
+        if shutil.which("choco"):
+            if is_admin:
+                self.append_output("[INFO] Trying to install PHP via Chocolatey (admin detected).")
+                code = self._run_tool_with_output([
+                    "choco", "install", "php", "-y", "--no-progress"
+                ], timeout=300)
+                if code == 0 and shutil.which("php"):
+                    self.append_output("[INFO] PHP installed via Chocolatey.")
+                    return None
+                else:
+                    self.append_output("[WARN] Chocolatey did not complete PHP installation.")
+            else:
+                self.append_output("[INFO] Chocolatey present but no admin rights. Skipping non-elevated install.")
         else:
             self.append_output("[INFO] Chocolatey not available on this system. Skipping.")
 
+        # Offer manual selection of php.exe
+        self.append_output("[INFO] Unable to install PHP automatically. Select php.exe manually?")
+        try:
+            resp = messagebox.askyesno("PHP required", "Automatic PHP setup failed.\nDo you want to select an existing php.exe manually?")
+        except Exception:
+            resp = False
+        if resp:
+            path = filedialog.askopenfilename(title="Select php.exe", filetypes=[("php.exe", "php.exe"), ("All files", "*.*")])
+            if path and Path(path).exists():
+                self.append_output(f"[INFO] Using manually selected php.exe: {path}")
+                # Persist to settings
+                tool_paths = self.settings.get("tool_paths") or {}
+                tool_paths["php"] = path
+                self.settings["tool_paths"] = tool_paths
+                save_settings(self.settings)
+                return str(Path(path).parent)
+
         # Give up with clear instructions
         self.append_output("[ERROR] Could not set up PHP automatically.")
-        self.append_output("        Install PHP via:")
+        self.append_output("        Install PHP via one of:")
         self.append_output("        - winget: winget install -e --id PHP.PHP")
-        self.append_output("        - Chocolatey: choco install php -y")
+        self.append_output("        - Scoop (no admin): scoop install php")
+        self.append_output("        - Chocolatey (admin): choco install php -y")
         self.append_output("        Or place a portable php.exe under one of:")
         self.append_output("        - ./php")
         self.append_output("        - ./bin/php")
         self.append_output("        - ./tools/php")
+        self.append_output("        Or set a custom path via manual selection when prompted.")
         return None
 
     def find_and_run(self, repo_dir: Path):
