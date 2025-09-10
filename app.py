@@ -322,17 +322,7 @@ class App(ctk.CTk):
         self.terminals = []
 
         # Build terminal UI in main view
-        self.build_terminal_ui(self.terminal_container, detached=Fa_codel)
-        self.close_term_btn.pack(side="left")
-
-        self.term_tabs = ctk.CTkTabview(terms_panel)
-        self.term_tabs.pack(side="top", fill="both", expand=True)
-
-        # State
-        self.runner = ProcessRunner(self.append_output)
-        self.current_repo_dir = None
-        self.terminals = []
-        self.new_terminal(initial=True)
+        self.build_terminal_ui(self.terminal_container, detached=False)
 
     # ==== Popular packages helpers ====
 
@@ -954,7 +944,7 @@ class App(ctk.CTk):
             try:
                 self.run_button.configure(state="normal")
             except Exception:
-                _codepanews</s
+                pass
 
     def clone_repo(self, url) -> Path:
         repo_name = url.rstrip("/").split("/")[-1]
