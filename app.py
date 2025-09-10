@@ -951,8 +951,10 @@ class App(ctk.CTk):
         except Exception as e:
             self.append_output(f"[ERROR] {e}")
         finally:
-            self.run_button.configure(state="norm_codealnew"</)
-)
+            try:
+                self.run_button.configure(state="normal")
+            except Exception:
+                _codepanews</s
 
     def clone_repo(self, url) -> Path:
         repo_name = url.rstrip("/").split("/")[-1]
@@ -1029,13 +1031,9 @@ class App(ctk.CTk):
             self.append_output(f"[INFO] Running installer script: {chosen.name}")
             try:
                 if chosen_type == "sh":
-                    bash = shutil.which("bash")
+                    bash = self.ensure_bash_available()
                     if not bash:
-                        cand = Path("C:/Program Files/Git/bin/bash.exe")
-                        if cand.exists():
-                            bash = str(cand)
-                    if not bash:
-                        self.append_output("[WARN] Bash not found. Skipping shell installer.")
+                        self.append_output("[WARN] Bash not available. Skipping shell installer.")
                     else:
                         self.run_and_wait([bash, str(chosen)], cwd=str(repo_dir))
                 elif chosen_type == "bat":
@@ -1058,13 +1056,9 @@ class App(ctk.CTk):
         ext = file_path.suffix.lower()
         try:
             if ext == ".sh":
-                bash = shutil.which("bash")
+                bash = self.ensure_bash_available()
                 if not bash:
-                    cand = Path("C:/Program Files/Git/bin/bash.exe")
-                    if cand.exists():
-                        bash = str(cand)
-                if not bash:
-                    self.append_output("[WARN] bash not found. Cannot run shell installer.")
+                    self.append_output("[WARN] bash not available. Cannot run shell installer.")
                     return
                 self.run_and_wait([bash, str(file_path)], cwd=str(repo_dir))
             elif ext == ".bat" and os.name == "nt":
@@ -1089,13 +1083,12 @@ class App(ctk.CTk):
             self.run_streaming([sys.executable, str(p)], cwd=str(p.parent), env=env)
             return
         if ext == ".sh":
-            bash = shutil.which("bash")
-            if not bash:
-                cand = Path("C:/Program Files/Git/bin/bash.exe")
-                if cand.exists():
-                    bash = str(cand)
-            if bash and Path(str(bash)).exists():
+            bash = self.ensure_bash_available()
+            if bash:
                 self.run_streaming([bash, str(p)], cwd=str(p.parent), env=env)
+                return
+            self.append_output("[ERROR] bash not found to run .sh file.")
+            re_code   self.run_streaming([bash, str(p)], cwd=str(p.parent), env=env)
                 return
             self.append_output("[ERROR] bash not found to run .sh file.")
             return
@@ -1380,6 +1373,122 @@ class App(ctk.CTk):
         self.append_output("        Or set a custom path via manual selection when prompted.")
         return None
 
+    def ensure_bash_available(self) -> str | None:
+        """
+        Ensures a bash executable is available on Windows (Git Bash).
+        Returns the full path to bash.exe if available or installed, else None.
+        """
+        # User-configured path
+        tool_paths = self.settings.get("tool_paths") or {}
+        bash_cfg = tool_paths.get("bash")
+        if bash_cfg and Path(bash_cfg).exists():
+            return bash_cfg
+
+        # PATH
+        found = shutil.which("bash")
+        if found:
+            return found
+
+        # Typical Git Bash locations
+        candidates = [
+            Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Git" / "bin" / "bash.exe",
+            Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Git" / "usr" / "bin" / "bash.exe",
+            Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Git" / "bin" / "bash.exe",
+            Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Git" / "usr" / "bin" / "bash.exe",
+        ]
+        for c in candidates:
+            if c.exists():
+                return str(c)
+
+        # Try winget
+        if shutil.which("winget"):
+            self.append_output("[INFO] bash not found. Trying to install Git for Windows via winget...")
+            code = self._run_tool_with_output([
+                "winget", "install", "-e", "--id", "Git.Git",
+                "--accept-package-agreements", "--accept-source-agreements", "--silent"
+            ], timeout=300)
+            if code == 0:
+                # Re-check
+                found = shutil.which("bash")
+                if found:
+                    return found
+                for c in candidates:
+                    if c.exists():
+                        return str(c)
+            else:
+                self.append_output("[WARN] winget did not complete Git installation.")
+        else:
+            self.append_output("[INFO] winget not available on this system. Skipping.")
+
+        # Try Scoop (user-mode)
+        if shutil.which("scoop"):
+            self.append_output("[INFO] Trying to install Git via Scoop (no admin required).")
+            code = self._run_tool_with_output(["scoop", "install", "git"], timeout=300)
+            userprofile = os.environ.get("USERPROFILE") or str(Path.home())
+            scoop_bash = Path(userprofile) / "scoop" / "apps" / "git" / "current" / "usr" / "bin" / "bash.exe"
+            scoop_shim = Path(userprofile) / "scoop" / "shims" / "bash.exe"
+            if code == 0:
+                if shutil.which("bash"):
+                    return shutil.which("bash")
+                if scoop_bash.exists():
+                    return str(scoop_bash)
+                if scoop_shim.exists():
+                    return str(scoop_shim)
+            else:
+                self.append_output("[WARN] Scoop did not complete Git installation.")
+        else:
+            self.append_output("[INFO] Scoop not available on this system. Skipping.")
+
+        # Try Chocolatey (admin)
+        is_admin = False
+        try:
+            import ctypes
+            is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
+        except Exception:
+            pass
+        if shutil.which("choco"):
+            if is_admin:
+                self.append_output("[INFO] Trying to install Git via Chocolatey (admin detected).")
+                code = self._run_tool_with_output(["choco", "install", "git", "-y", "--no-progress"], timeout=300)
+                if code == 0:
+                    found = shutil.which("bash")
+                    if found:
+                        return found
+                    for c in candidates:
+                        if c.exists():
+                            return str(c)
+                else:
+                    self.append_output("[WARN] Chocolatey did not complete Git installation.")
+            else:
+                self.append_output("[INFO] Chocolatey present but no admin rights. Skipping non-elevated install.")
+        else:
+            self.append_output("[INFO] Chocolatey not available on this system. Skipping.")
+
+        # Manual selection
+        self.append_output("[INFO] Unable to set up bash automatically. Select bash.exe manually?")
+        try:
+            resp = messagebox.askyesno("Bash required", "Automatic setup failed.\nDo you want to select bash.exe manually?")
+        except Exception:
+            resp = False
+        if resp:
+            try:
+                p = filedialog.askopenfilename(title="Select bash.exe", filetypes=[("bash.exe", "bash.exe"), ("All files", "*.*")])
+            except Exception:
+                p = None
+            if p and Path(p).exists():
+                tool_paths["bash"] = p
+                self.settings["tool_paths"] = tool_paths
+                save_settings(self.settings)
+                return p
+
+        self.append_output("[ERROR] Could not set up bash automatically.")
+        self.append_output("        Install Git for Windows manually from https://git-scm.com/download/win")
+        self.append_output("        Or install via:")
+        self.append_output("        - winget: winget install -e --id Git.Git")
+        self.append_output("        - Scoop: scoop install git")
+        self.append_output("        - Chocolatey (admin): choco install git -y")
+        return None
+
     def _run_with_node_if_possible(self, repo_dir: Path, env: dict) -> bool:
         pkg = repo_dir / "package.json"
         if not pkg.exists():
@@ -1434,15 +1543,10 @@ class App(ctk.CTk):
         if target is None:
             return False
 
-        # Locate bash (Git Bash or WSL bash or any bash)
-        bash = shutil.which("bash")
+        # Ensure bash is available (auto-install if possible)
+        bash = self.ensure_bash_available()
         if not bash:
-            # Common Git Bash location
-            cand = Path("C:/Program Files/Git/bin/bash.exe")
-            if cand.exists():
-                bash = str(cand)
-        if not bash:
-            self.append_output("[WARN] Bash script detected but 'bash' not found. Install Git for Windows or enable WSL.")
+            self.append_output("[WARN] Bash script detected but bash is not available.")
             return False
 
         self.append_output(f"[INFO] Detected bash script: {target.name}. Running via bash...")
