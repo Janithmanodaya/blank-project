@@ -29,6 +29,8 @@ if not "%SHADOW_DIR_NORM:~-1%"=="\" set "SHADOW_DIR_NORM=%SHADOW_DIR_NORM%\"
 
 if /I not "%APP_DIR_NORM%"=="%SHADOW_DIR_NORM%" (
     echo [INFO] Preparing isolated workspace at "%SHADOW_DIR%"
+    echo [INFO] Source: "%APP_DIR%"
+    echo [INFO] Target: "%SHADOW_DIR%"
     rem Recreate destination
     if exist "%SHADOW_DIR%" rmdir /S /Q "%SHADOW_DIR%"
     mkdir "%SHADOW_DIR%" >nul 2>&1
@@ -39,8 +41,9 @@ if /I not "%APP_DIR_NORM%"=="%SHADOW_DIR_NORM%" (
         rem Use ROBOCOPY to mirror files, excluding venv, git and temp artefacts
         rem /MIR mirrors directory tree; /XD excludes dirs; /XF excludes files
         robocopy "%APP_DIR%" "%SHADOW_DIR%" /MIR /R:2 /W:2 /NFL /NDL /NJH /NJS /XD venv .git __pycache__ /XF app_error.log >nul
-        if errorlevel 8 (
-            echo [WARN] Robocopy reported issues (code !errorlevel!). Attempting to continue.
+        set "RC=%ERRORLEVEL%"
+        if %RC% GEQ 8 (
+            echo [WARN] Robocopy reported issues (code %RC%). Attempting to continue.
         )
     ) else (
         rem Fallback to XCOPY (no exact mirror). Copy everything except known folders.
@@ -52,28 +55,23 @@ if /I not "%APP_DIR_NORM%"=="%SHADOW_DIR_NORM%" (
         if exist "%SHADOW_DIR%\app_error.log" del /F /Q "%SHADOW_DIR%\app_error.log"
     )
 
-    rem Verify start.bat exists in shadow
-    if not exist "%SHADOW_DIR%\start.bat" (
-        copy /Y "%APP_DIR%start.bat" "%SHADOW_DIR%\" >nul
-    )
-    if not exist "%SHADOW_DIR%\start.bat" (
-        echo [ERROR] Shadow launch failed: "%SHADOW_DIR%\start.bat" not found.
-        echo [WARN] Running in-place instead of isolated workspace.
+    rem Ensure critical files exist
+    if not exist "%SHADOW_DIR%\app.py" (
+        echo [ERROR] Shadow copy seems incomplete (missing app.py). Running in-place.
     ) else (
-        echo [INFO] Relaunching from isolated workspace (same window)...
-        rem Mark that we've switched to the shadow to avoid any accidental re-shadowing
+        echo [INFO] Switching to isolated workspace (no new window)...
         set "RUN_FROM_SHADOW=1"
-        rem Change directory and re-enter start.bat in the same console to avoid flash/close issues
-        pushd "%SHADOW_DIR%"
-        call "%SHADOW_DIR%\start.bat"
-        set EXITCODE=%ERRORLEVEL%
+        set "APP_DIR=%SHADOW_DIR%\"
         popd
-        endlocal & exit /b %EXITCODE%
+        pushd "%SHADOW_DIR%"
+        goto ContinueSetup
     )
+)
 )
 
 echo [INFO] Starting setup...
 
+:ContinueSetup
 rem Step 1: Check if Python is available
 where python >nul 2>&1
 if %errorlevel% neq 0 (
