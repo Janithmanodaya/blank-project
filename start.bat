@@ -61,15 +61,14 @@ if /I not "%APP_DIR_NORM%"=="%SHADOW_DIR_NORM%" (
         echo [WARN] Running in-place instead of isolated workspace.
     ) else (
         echo [INFO] Relaunching from isolated workspace (same window)...
+        rem Mark that we've switched to the shadow to avoid any accidental re-shadowing
         set "RUN_FROM_SHADOW=1"
         rem Change directory and re-enter start.bat in the same console to avoid flash/close issues
-        popd
-        endlocal
         pushd "%SHADOW_DIR%"
         call "%SHADOW_DIR%\start.bat"
         set EXITCODE=%ERRORLEVEL%
         popd
-        exit /b %EXITCODE%
+        endlocal & exit /b %EXITCODE%
     )
 )
 
