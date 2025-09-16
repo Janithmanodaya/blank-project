@@ -213,32 +213,7 @@ def restore_latest_session_backup() -> bool:
     except Exception:
         return False
 
-async def log(self, level: str, module: str, msg: str, **fields):
-    record = {
-        "ts": dt_fmt(),
-        "level": level.upper(),
-        "module": module,
-        "msg": msg,
-        **fields,
-    }
-    text = json.dumps(record, ensure_ascii=False)
-    async with self._lock:
-        self._deque.append(record)
-        with self.file_path.open("a", encoding="utf-8") as f:
-            f.write(text + "\n")
 
-async def info(self, module: str, msg: str, **fields):
-    await self.log("INFO", module, msg, **fields)
-
-async def error(self, module: str, msg: str, **fields):
-    await self.log("ERROR", module, msg, **fields)
-
-async def warn(self, module: str, msg: str, **fields):
-    await self.log("WARN", module, msg, **fields)
-
-def recent(self, limit: int = 200) -> List[Dict[str, Any]]:
-    items = list(self._deque)[-limit:]
-    return items
 
 
 class JsonLogger:
