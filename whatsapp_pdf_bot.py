@@ -208,7 +208,14 @@ def restore_latest_session_backup() -> bool:
         latest = items[0]
         if BROWSER_PROFILE_DIR.exists():
             shutil.rmtree(BROWSER_PROFILE_DIR, ignore_errors=True)
-           def __init__(self, file_path: Path, max_in_memory: int = 2000):
+        shutil.copytree(latest, BROWSER_PROFILE_DIR)
+        return True
+    except Exception:
+        return False
+
+
+class JsonLogger:
+    def __init__(self, file_path: Path, max_in_memory: int = 2000):
         self.file_path = file_path
         self._deque = deque(maxlen=max_in_memory)
         self._lock = asyncio.Lock()
