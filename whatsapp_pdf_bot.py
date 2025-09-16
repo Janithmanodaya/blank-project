@@ -58,7 +58,7 @@ from typing import Any, Dict, List, Optional, Tuple
 try:
     import requests  # lightweight, for Gemini REST
 except Exception:
-    requests = _codeNonewn</e
+    requests = None
 
 
 # Third-party libraries
@@ -233,6 +233,12 @@ class Settings:
     retention_days: int = DEFAULT_RETENTION_DAYS
     landscape_for_landscape_images: bool = True
     max_concurrency: int = 2
+    # Auto-reply via Gemini
+    enable_gemini_reply: bool = False
+    gemini_api_key: str = ""
+    gemini_model: str = "gemini-1.5-flash"
+    # Auto-scan for unread chats
+    auto_scan_unread_secs: int = 10
 
     @staticmethod
     def from_json(d: Dict[str, Any]) -> "Settings":
@@ -827,11 +833,84 @@ class WhatsAppBot:
     - Persistent context
     - QR capture
     - Incoming image messages detection via MutationObserver
-    - Fallback unread scanner to detect messages if observer misses
     - Download images by interacting with UI
     - Send PDF files to admin chat
-    - Auto-reply to text messages (Gemini)
     """
+
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self.playwright = None
+        self.ctx: Optional[BrowserContext] = None
+        self.page: Optional[Page] = None
+        self._lock = asyncio.Lock()
+        self._ready = asyncio.Event()
+        self._stop = asyncio.Event()
+
+        # incoming queue from MutationObserver
+        self.incoming_queue: "asyncio.Queue[Dict[str, Any]]" = asyncio.Queue()
+
+    async def start(self):
+        await LOGGER.info("wa", "starting playwright")
+
+        # Attempt session restore if profile dir looks empty/small and backups exist
+        try:
+            size = dir_size_bytes(BROWSER_PROFILE_DIR)
+            if siz <  1024 * 50:  # less than ~50KB likely empty
+                restored = restore_latest_session_backup()
+                if restored:
+                    await LOGGER.info("wa", "restored latest session backup")
+        except Exception as e:
+            await LOGGER.warn("wa", "session restore check failed", error=str(e))
+
+        self.playwright = await async_playwright().start()
+        chromium = self.playwright.chromium
+        self.ctx = await chromium.launch_persistent_context(
+            user_data_dir=str(BROWSER_PROFILE_DIR),
+            headless=False,
+            accept_downloads=True,
+            viewport={"width": 1280, "height": 900},
+            args=["--disable-blink-features=AutomationControlled"],
+
+        pages = self.ctx.pages
+        if pages:
+            self.page = pages[0]
+        else:
+            self.page = await self.ctx.new_page()
+
+        self.page.on("response", self._on_response)
+        self.page.on("download", self._on_download)
+
+        # Make navigation timeouts generous for slow connections
+        try:
+            self.page.set_default_navigation_timeout(120000)  # 120s
+            self.page.set_default_timeout(120000)  # 120s for operations
+        except Exception:
+            pass
+
+        # Try to navigate but don't fail startup on timeout
+        try:
+            await self.page.goto("https://web.whatsapp.com/", timeout=120000, wait_until="domcontentloaded")
+        except Exception as e:
+            # Continue startup even if initial navigation times out; page may still load eventually
+            await LOGGER.warn("wa", "initial goto timed out/failed; continuing", error=str(e))
+
+        await asyncio.sleep(3)
+        try:
+            await self._install_observer_scripts()
+        except Exception as e:
+            # Observer script also gets re-attempted via setInterval inside the page
+            await LOGGER.warn("wa", "install observer failed; will retry via page timer", error=str(e))
+
+        self._ready.set()
+        await LOGGER.info("wa", "playwright ready")
+
+        # Periodic QR capture
+        asyncio.create_task(self._qr_updater())
+
+        # Start unread/observer fallback scanner
+        asyncio.create_task(self._auto_scan_loo_codep(new)</)
+())
+
     async def _auto_scan_loop(self):
         """
         Periodically scan chats to surface new messages to the DOM and trigger the page-side scanner.
@@ -935,80 +1014,6 @@ class WhatsAppBot:
         except Exception as e:
             await LOGGER.warn("wa", "gemini reply failed", error=str(e))
 
-    def __init__(self, settings: Settings):
-        self.settings = settings
-        self.playwright = None
-        self.ctx: Optional[BrowserContext] = None
-        self.page: Optional[Page] = None
-        self._lock = asyncio.Lock()
-        self._ready = asyncio.Event()
-        self._stop = asyncio.Event()
-
-        # incoming queue from MutationObserver
-        self.incoming_queue: "asyncio.Queue[Dict[str, Any]]" = asyncio.Queue()
-
-    async def start(self):
-        await LOGGER.info("wa", "starting playwright")
-
-        # Attempt session restore if profile dir looks empty/small and backups exist
-        try:
-            size = dir_size_bytes(BROWSER_PROFILE_DIR)
-            if siz <  1024 * 50:  # less than ~50KB likely empty
-                restored = restore_latest_session_backup()
-                if restored:
-                    await LOGGER.info("wa", "restored latest session backup")
-        except Exception as e:
-            await LOGGER.warn("wa", "session restore check failed", error=str(e))
-
-        self.playwright = await async_playwright().start()
-        chromium = self.playwright.chromium
-        self.ctx = await chromium.launch_persistent_context(
-            user_data_dir=str(BROWSER_PROFILE_DIR),
-            headless=False,
-            accept_downloads=True,
-            viewport={"width": 1280, "height": 900},
-            args=["--disable-blink-features=AutomationControlled"],
-
-        pages = self.ctx.pages
-        if pages:
-            self.page = pages[0]
-        else:
-            self.page = await self.ctx.new_page()
-
-        self.page.on("response", self._on_response)
-        self.page.on("download", self._on_download)
-
-        # Make navigation timeouts generous for slow connections
-        try:
-            self.page.set_default_navigation_timeout(120000)  # 120s
-            self.page.set_default_timeout(120000)  # 120s for operations
-        except Exception:
-            pass
-
-        # Try to navigate but don't fail startup on timeout
-        try:
-            await self.page.goto("https://web.whatsapp.com/", timeout=120000, wait_until="domcontentloaded")
-        except Exception as e:
-            # Continue startup even if initial navigation times out; page may still load eventually
-            await LOGGER.warn("wa", "initial goto timed out/failed; continuing", error=str(e))
-
-        await asyncio.sleep(3)
-        try:
-            await self._install_observer_scripts()
-        except Exception as e:
-            # Observer script also gets re-attempted via setInterval inside the page
-            await LOGGER.warn("wa", "install observer failed; will retry via page timer", error=str(e))
-
-        self._ready.set()
-        await LOGGER.info("wa", "playwright ready")
-
-        # Periodic QR capture
-        asyncio.create_task(self._qr_updater())
-
-        # Start unread/observer fallback scanner
-        asyncio.create_task(self._auto_scan_loo_codep(new)</)
-())
-
     async def stop(self):
         self._stop.set()
         if self.ctx:
@@ -1046,14 +1051,14 @@ class WhatsAppBot:
 
     async def _install_observer_scripts(self):
         """
-        Inject a MutationObserver to detect new messages with images, then send to Python via exposed binding.
+        Inject a MutationObserver and periodic scanner to detect new messages (media and text),
+        then send to Python via exposed binding. Deduplicates by message-id on the page side.
         """
         if not self.page:
             return
 
         async def on_new_media(source, payload):
-            # Called from the page when a new message node with images is detected
-            await LOGGER.info("wa", "observer detected media", payload=payload)
+            await LOGGER.info("wa", "observer event", payload=payload)
             await self.incoming_queue.put(payload)
 
         await self.page.expose_binding("pyOnNewMedia", on_new_media)
@@ -1062,6 +1067,7 @@ class WhatsAppBot:
 (() => {
   if (window.__wabot_observer_installed) return;
   window.__wabot_observer_installed = true;
+  window.__wabot_seen = window.__wabot_seen || new Set();
 
   function getChatTitle() {
     const el = document.querySelector('[data-testid="conversation-info-header"]') || document.querySelector('header[role="banner"]');
@@ -1074,52 +1080,76 @@ class WhatsAppBot:
     try {
       const msgId = el.getAttribute('data-id') || '';
       const pre = el.getAttribute('data-pre-plain-text') || '';
+      const textEl = el.querySelector('[data-testid="msg-text"]') || el.querySelector('.selectable-text.copyable-text');
+      const text = textEl ? (textEl.innerText || textEl.textContent || "").trim() : "";
       const mediaThumbs = Array.from(el.querySelectorAll('img, video')).map(x => x.getAttribute('src') || x.getAttribute('poster') || '');
-      return { id: msgId, preplain: pre, mediaThumbs };
+      const cls = (el.className || "");
+      const isIncoming = /message-in/.test(cls);
+      const isOutgoing = /message-out/.test(cls);
+      return { id: msgId, preplain: pre, mediaThumbs, text, isIncoming, isOutgoing };
     } catch (e) {
       return null;
     }
   }
 
-  function installObserver() {
-    const container = document.querySelector('[data-testid="conversation-panel-messages"]') || document.querySelector('[role="application"]');
-    if (!container) {
-      setTimeout(installObserver, 2000);
-      return;
+  function emitIfNew(msg) {
+    if (!msg || !msg.id) return;
+    if (window.__wabot_seen.has(msg.id)) return;
+    window.__wabot_seen.add(msg.id);
+    const payload = {
+      msgId: msg.id,
+      preplain: msg.preplain,
+      mediaThumbs: msg.mediaThumbs || [],
+      text: msg.text || "",
+      isIncoming: !!msg.isIncoming,
+      isOutgoing: !!msg.isOutgoing,
+      chatTitle: getChatTitle()
+    };
+    try {
+      window.pyOnNewMedia(payload);
+    } catch (e) {
+      console.log("pyOnNewMedia error", e);
     }
+  }
+
+  function scanAll() {
+    const nodes = document.querySelectorAll('[data-id]');
+    nodes.forEach((el) => {
+      const msg = parseMessage(el);
+      if (!msg) return;
+      // Only emit for incoming messages
+      if (msg.isIncoming) {
+        emitIfNew(msg);
+      }
+    });
+  }
+
+  function installObserver() {
+    const container =
+      document.querySelector('[data-testid="conversation-panel-messages"]') ||
+      document.querySelector('[role="application"]') ||
+      document.body;
     const obs = new MutationObserver((mutations) => {
       for (const m of mutations) {
         for (const n of m.addedNodes) {
           if (!(n instanceof HTMLElement)) continue;
-          // Each message bubble often has data-id attribute
           const items = n.querySelectorAll ? n.querySelectorAll('[data-id]') : [];
-          items.forEach((it) => {
-            const msg = parseMessage(it);
-            if (!msg) return;
-            // Consider it media if it has an &lt;img&gt; or &lt;video&gt; thumb
-            if (msg.mediaThumbs && msg.mediaThumbs.length > 0) {
-              const payload = { msgId: msg.id, preplain: msg.preplain, mediaThumbs: msg.mediaThumbs, chatTitle: getChatTitle() };
-              try {
-                window.pyOnNewMedia(payload);
-              } catch (e) {
-                console.log("pyOnNewMedia error", e);
-              }
-            }
-          });
+          items.forEach((it) => emitIfNew(parseMessage(it)));
         }
       }
     });
     obs.observe(container, { childList: true, subtree: true });
   }
 
-  // Also run periodically for fallback
+  // Periodic rescans as fallback (in case MutationObserver misses)
   setInterval(() => {
-    try {
-      installObserver();
-    } catch (e) {}
-  }, 5000);
+    try { scanAll(); } catch (e) {}
+  }, 4000);
 
+  // Kickoff
   installObserver();
+  // Initial sweep
+  setTimeout(scanAll, 2000);
 })();
 """
         await self.page.add_init_script(js)
@@ -1328,7 +1358,7 @@ class WhatsAppBot:
     async def process_incoming_loop(self, db: DB, ingest: IngestionManager):
         """
         Main loop to process incoming messages notified by the MutationObserver.
-        Downloads media and records metadata.
+        Downloads media and records metadata. Also handles text auto-replies via Gemini.
         """
         await self.wait_ready()
         await LOGGER.info("wa", "incoming loop started")
@@ -1340,60 +1370,69 @@ class WhatsAppBot:
             if not payload:
                 continue
             msg_id = payload.get("msgId") or ""
+            if not msg_id or msg_id in self._seen_msg_ids:
+                continue
+            self._seen_msg_ids.add(msg_id)
+
             preplain = payload.get("preplain") or ""
             chat_title = payload.get("chatTitle") or ""
+            text_body = (payload.get("text") or "").strip()
+            is_incoming = bool(payload.get("isIncoming"))
+
             ts, display_name = self.parse_preplain(preplain)
             if ts is None:
                 ts = now_ts()
             sender = self.parse_sender_from_msg_id(msg_id)
             if sender == "unknown":
-                # fallback to display name
                 sender = display_name or "unknown"
 
-            # Prepare dest dir
-            set_dir_name = f"{dt.datetime.fromtimestamp(ts).strftime('%Y%m%d')}_{msg_id}"
-            dest_dir = RAW_DIR / str(sender) / set_dir_name
-            tmp_dir = TMP_DIR / f"dl_{uuid.uuid4().hex}"
-            tmp_dir.mkdir(parents=True, exist_ok=True)
+            # If there's media, attempt download and ingestion
+            media_thumbs = payload.get("mediaThumbs") or []
+            if media_thumbs:
+                set_dir_name = f"{dt.datetime.fromtimestamp(ts).strftime('%Y%m%d')}_{msg_id}"
+                dest_dir = RAW_DIR / str(sender) / set_dir_name
+                tmp_dir = TMP_DIR / f"dl_{uuid.uuid4().hex}"
+                tmp_dir.mkdir(parents=True, exist_ok=True)
 
-            # Download images
-            paths = await self.download_images_for_message(msg_id, tmp_dir)
-            if not paths:
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-                await LOGGER.warn("wa", "no images downloaded", msg_id=msg_id)
-                continue
+                paths = await self.download_images_for_message(msg_id, tmp_dir)
+                if paths:
+                    # Atomically move tmp dir to dest
+                    dest_dir.parent.mkdir(parents=True, exist_ok=True)
+                    if not dest_dir.exists():
+                        tmp_dir.rename(dest_dir)
+                    else:
+                        for p in sorted(tmp_dir.glob("*")):
+                            shutil.move(str(p), dest_dir / p.name)
+                        shutil.rmtree(tmp_dir, ignore_errors=True)
 
-            # Atomically move tmp dir to dest
-            dest_dir.parent.mkdir(parents=True, exist_ok=True)
-            if not dest_dir.exists():
-                tmp_dir.rename(dest_dir)
-            else:
-                # move files into dest
-                for p in sorted(tmp_dir.glob("*")):
-                    shutil.move(str(p), dest_dir / p.name)
-                shutil.rmtree(tmp_dir, ignore_errors=True)
+                    # Collect metadata and store
+                    meta = {"sender": sender, "chat_title": chat_title, "msg_id": msg_id, "timestamp": ts, "images": []}
+                    for idx, p in enumerate(sorted(dest_dir.glob("*"))):
+                        try:
+                            with Image.open(p) as im:
+                                w, h = im.size
+                            mime = "image/jpeg" if p.suffix.lower() in [".jpg", ".jpeg"] else "image/png"
+                            await db.add_media(msg_id, idx + 1, str(p), w, h, mime, p.name)
+                            meta["images"].append(
+                                {"idx": idx + 1, "path": str(p), "width": w, "height": h, "mime": mime, "original_filename": p.name}
+                            )
+                        except Exception:
+                            continue
+                    (dest_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+                    await db.upsert_message(msg_id, sender, chat_title, ts, has_media=True)
+                    await db.mark_message_processed(msg_id)
 
-            # Collect metadata and store
-            meta = {"sender": sender, "chat_title": chat_title, "msg_id": msg_id, "timestamp": ts, "images": []}
-            for idx, p in enumerate(sorted(dest_dir.glob("*"))):
-                try:
-                    with Image.open(p) as im:
-                        w, h = im.size
-                    mime = "image/jpeg" if p.suffix.lower() in [".jpg", ".jpeg"] else "image/png"
-                    await db.add_media(msg_id, idx + 1, str(p), w, h, mime, p.name)
-                    meta["images"].append(
-                        {"idx": idx + 1, "path": str(p), "width": w, "height": h, "mime": mime, "original_filename": p.name}
-                    )
-                except Exception:
-                    continue
-            (dest_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
-            await db.upsert_message(msg_id, sender, chat_title, ts, has_media=True)
-            await db.mark_message_processed(msg_id)
+                    # Ingest and possibly finalize sets
+                    msg = IncomingMessage(msg_id=msg_id, sender=sender, chat_title=chat_title, ts=ts)
+                    await ingest.ingest_message(msg)
+                    await ingest.finalize_expired_sets()
+                else:
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+                    await LOGGER.warn("wa", "no images downloaded", msg_id=msg_id)
 
-            # Ingest and possibly finalize sets
-            msg = IncomingMessage(msg_id=msg_id, sender=sender, chat_title=chat_title, ts=ts)
-            await ingest.ingest_message(msg)
-            await ingest.finalize_expired_sets()
+            # Auto-reply for text messages (only incoming)
+            if is_incoming and text_body:
+                await self._maybe_auto_reply(text_body, chat_title)
 
     async def send_pdf_to_admin(self, pdf_path: Path) -> bool:
         """
@@ -1537,19 +1576,40 @@ async def periodic_maintenance(db: DB, settings: Settings, stop_event: asyncio.E
         try:
             now = now_ts()
             # Backups daily (DB + PDFs)
-            if now - last_backup > 24 * 360M%S")
+            if now - last_backup > 24 * 3600:
+                ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
                 dest = BACKUP_DIR / f"backup_{ts}"
                 dest.mkdir(parents=True, exist_ok=True)
                 # Copy DB and PDFs
-                shutil.copy2(DB_FILE, dest / "db.sqlite3")
+                try:
+                    shutil.copy2(DB_FILE, dest / "db.sqlite3")
+                except Exception:
+                    pass
                 # PDFs
                 pdf_dest = dest / "pdf"
-                if PDF_DIR.exists():
-                    shutil.copytree(PDF_DIR, pdf_dest, dirs_exist_ok=True)
-                last_backup = now_ts()
+                try:
+                    if PDF_DIR.exists():
+                        shutil.copytree(PDF_DIR, pdf_dest, dirs_exist_ok=True)
+                except Exception:
+                    pass
+                last_backup = now
                 await LOGGER.info("maint", "backup created", path=str(dest))
+
+            # Session backup every 12 hours if profile looks valid
+            if now - last_session_backup > 12 * 3600:
+                try:
+                    size = dir_size_bytes(BROWSER_PROFILE_DIR)
+                    if size > 1024 * 1024:  # >1MB indicates a valid session/profile
+                        bdir = create_session_backup()
+                        if bdir:
+                            last_session_backup = now
+                            pruned = prune_session_backups(max_keep=5)
+                            await LOGGER.info("maint", "session backup created", path=str(bdir), pruned=pruned)
+                except Exception as e:
+                    await LOGGER.warn("maint", "session backup error", error=str(e))
+
             # Retention cleanup for raw images
-            cutoff = now_ts() - settings.retention_days * 86400
+            cutoff = now - settings.retention_days * 86400
             deleted = await db.cleanup_old_raw(cutoff)
             if deleted:
                 await LOGGER.info("maint", "raw cleanup complete", deleted=deleted)
@@ -1665,10 +1725,6 @@ async function saveSettings() {
     retention_days: parseInt(document.getElementById("retention_days").value || "30"),
     landscape_for_landscape_images: document.getElementById("landscape").checked,
     max_concurrency: parseInt(document.getElementById("max_concurrency").value || "2"),
-    enable_gemini_reply: document.getElementById("enable_gemini_reply").checked,
-    gemini_api_key: document.getElementById("gemini_api_key").value,
-    gemini_model: document.getElementById("gemini_model").value,
-    auto_scan_unread_secs: parseInt(document.getElementById("auto_scan_unread_secs").value || "10"),
   };
   await fetch("/settings", {method: "POST", headers: {"Content-Type":"application/json", ...hdrs()}, body: JSON.stringify(payload)});
   alert("Saved.");
@@ -1710,16 +1766,6 @@ window.onload = refresh;
       <div class="row">
         <label><input id="allow_upscale" type="checkbox"/> Allow upscaling above 100%</label>
         <label><input id="landscape" type="checkbox" checked/> Landscape pages if mostly landscape images</label>
-      </div>
-      <h3>Auto-reply (Gemini)</h3>
-      <div class="row">
-        <label><input id="enable_gemini_reply" type="checkbox"/> Enable Gemini auto-replies</label>
-        <label>Gemini API key <input id="gemini_api_key" type="password" placeholder="AIza..."/></label>
-        <label>Model <input id="gemini_model" type="text" value="gemini-1.5-flash"/></label>
-      </div>
-      <h3>Message detection</h3>
-      <div class="row">
-        <label>Auto-scan unread (secs) <input id="auto_scan_unread_secs" type="number" min="4" max="60" value="10"/></label>
       </div>
       <button class="btn" onclick="saveSettings()">Save Settings</button>
     </div>
