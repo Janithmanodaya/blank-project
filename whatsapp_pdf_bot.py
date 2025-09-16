@@ -92,7 +92,7 @@ SESSION_BACKUP_DIR = STORAGE_DIR / "session_backups"
 LOG_FILE = STORAGE_DIR / "app.log"
 DB_FILE = STORAGE_DIR / "db.sqlite3"
 QR_FILE = STORAGE_DIR / "qr.png"
-SETTINGS_FILE = STORAGE_DIR / "settings.j_codesonewn</"
+SETTINGS_FILE = STORAGE_DIR / "settings.json"
 
 
 # PDF defaults
@@ -185,12 +185,78 @@ def create_session_backup(label: Optional[str] = None) -> Optional[Path]:
     try:
         if not BROWSER_PROFILE_DIR.exists():
             return None
-        ts = dt.datetime.now().strftime("%Y%m%d_%H%MN logger with in-memory ring buffer for WebUI
+        ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        name = f"session_{ts}" + (f"_{label}" if label else "")
+        dest = SESSION_BACKUP_DIR / name
+        SESSION_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        if dest.exists():
+            shutil.rmtree(dest, ignore_errors=True)
+        shutil.copytree(BROWSER_PROFILE_DIR, dest)
+        return dest
+    except Exception:
+        return None
+
+
+def restore_latest_session_backup() -> bool:
+    """
+    Restore the most recent session backup into the persistent browser profile dir.
+    """
+    try:
+        items = list_session_backups()
+        if not items:
+            return False
+        latest = items[0]
+        if BROWSER_PROFILE_DIR.exists():
+            shutil.rmtree(BROWSER_PROFILE_DIR, ignore_errors=True)
+        shutil.copytree(latest, BROWSER_PROFILE_DIR)
+        return True
+    except Exception:
+        return False
+
+async def log(self, level: str, module: str, msg: str, **fields):
+    record = {
+        "ts": dt_fmt(),
+        "level": level.upper(),
+        "module": module,
+        "msg": msg,
+        **fields,
+    }
+    text = json.dumps(record, ensure_ascii=False)
+    async with self._lock:
+        self._deque.append(record)
+        with self.file_path.open("a", encoding="utf-8") as f:
+            f.write(text + "\n")
+
+async def info(self, module: str, msg: str, **fields):
+    await self.log("INFO", module, msg, **fields)
+
+async def error(self, module: str, msg: str, **fields):
+    await self.log("ERROR", module, msg, **fields)
+
+async def warn(self, module: str, msg: str, **fields):
+    await self.log("WARN", module, msg, **fields)
+
+def recent(self, limit: int = 200) -> List[Dict[str, Any]]:
+    items = list(self._deque)[-limit:]
+    return items
+
+
 class JsonLogger:
-    def __init__(self, file_path: Path, max_in_memory: int = 2000):
-        self.file_path = file_path
-        self._deque = deque(maxlen=max_in_memory)
+    def __init__(self, file_path: Path, maxlen: int = 2000):
+        self.file_path = Path(file_path)
+        self._deque = deque(maxlen=maxlen)
         self._lock = asyncio.Lock()
+        # Load existing logs if file exists
+        if self.file_path.exists():
+            try:
+                with self.file_path.open("r", encoding="utf-8") as f:
+                    for line in f:
+                        try:
+                            self._deque.append(json.loads(line))
+                        except Exception:
+                            continue
+            except Exception:
+                pass
 
     async def log(self, level: str, module: str, msg: str, **fields):
         record = {
@@ -848,6 +914,8 @@ class WhatsAppBot:
 
         # incoming queue from MutationObserver
         self.incoming_queue: "asyncio.Queue[Dict[str, Any]]" = asyncio.Queue()
+        # seen message ids to de-duplicate processing
+        self._seen_msg_ids = set()
 
     async def start(self):
         await LOGGER.info("wa", "starting playwright")
@@ -855,7 +923,7 @@ class WhatsAppBot:
         # Attempt session restore if profile dir looks empty/small and backups exist
         try:
             size = dir_size_bytes(BROWSER_PROFILE_DIR)
-            if siz <  1024 * 50:  # less than ~50KB likely empty
+            if size < 1024 * 50:  # less than ~50KB likely empty
                 restored = restore_latest_session_backup()
                 if restored:
                     await LOGGER.info("wa", "restored latest session backup")
@@ -870,6 +938,7 @@ class WhatsAppBot:
             accept_downloads=True,
             viewport={"width": 1280, "height": 900},
             args=["--disable-blink-features=AutomationControlled"],
+        )
 
         pages = self.ctx.pages
         if pages:
@@ -908,8 +977,7 @@ class WhatsAppBot:
         asyncio.create_task(self._qr_updater())
 
         # Start unread/observer fallback scanner
-        asyncio.create_task(self._auto_scan_loo_codep(new)</)
-())
+        asyncio.create_task(self._auto_scan_loop())
 
     async def _auto_scan_loop(self):
         """
