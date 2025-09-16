@@ -280,6 +280,9 @@ class Settings:
     gemini_model: str = "gemini-1.5-flash"
     # Auto-scan for unread chats
     auto_scan_unread_secs: int = 10
+    # Browser behavior
+    run_headless: bool = False
+    auto_adjust_viewport: bool = True
 
     @staticmethod
     def from_json(d: Dict[str, Any]) -> "Settings":
@@ -909,10 +912,16 @@ class WhatsAppBot:
         chromium = self.playwright.chromium
         self.ctx = await chromium.launch_persistent_context(
             user_data_dir=str(BROWSER_PROFILE_DIR),
-            headless=False,
+            headless=bool(self.settings.run_headless),
             accept_downloads=True,
             viewport={"width": 1280, "height": 900},
-            args=["--disable-blink-features=AutomationControlled"],
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-background-timer-throttling",
+                "--disable-renderer-backgrounding",
+                "--disable-backgrounding-occluded-windows",
+                "--disable-features=CalculateNativeWinOcclusion",
+            ],
         )
 
         pages = self.ctx.pages
@@ -953,11 +962,14 @@ class WhatsAppBot:
 
         # Start unread/observer fallback scanner
         asyncio.create_task(self._auto_scan_loop())
+        # Start viewport adjust loop
+        asyncio.create_task(self._viewport_adjust_loop())
 
     async def _auto_scan_loop(self):
         """
         Periodically scan chats to surface new messages to the DOM and trigger the page-side scanner.
         This mitigates cases where the observer misses events.
+        Designed to keep working even when the window is minimized or backgrounded.
         """
         while not self._stop.is_set():
             try:
@@ -973,21 +985,43 @@ class WhatsAppBot:
                 # Click a few chats in the list to load their recent messages
                 chat_items = self.page.locator('[data-testid="cell-frame-container"]')
                 count = await chat_items.count()
-                max_to_check = min(count, 3)
+                max_to_check = min(count, 5)
                 for i in range(max_to_check):
                     try:
                         await chat_items.nth(i).click()
-                        await asyncio.sleep(0.8)
+                        await asyncio.sleep(0.5)
                         try:
                             await self.page.evaluate("window.__wabot_scanAll && window.__wabot_scanAll()")
                         except Exception:
                             pass
                     except Exception:
                         continue
-                # sleep per settings
-                await asyncio.sleep(max(3, int(self.settings.auto_scan_unread_secs or 10)))
+                # sleep per settings (shorter in background)
+                await asyncio.sleep(max(2, int(self.settings.auto_scan_unread_secs or 10)))
             except Exception:
                 await asyncio.sleep(5)
+
+    async def _viewport_adjust_loop(self):
+        """
+        Periodically match the Playwright viewport to the page's inner window size.
+        Helps when the browser is resized or on different displays.
+        """
+        if not self.settings.auto_adjust_viewport:
+            return
+        while not self._stop.is_set():
+            try:
+                if not self.page:
+                    await asyncio.sleep(2)
+                    continue
+                size = await self.page.evaluate("({w: window.innerWidth, h: window.innerHeight})")
+                if isinstance(size, dict) and size.get("w") and size.get("h"):
+                    try:
+                        await self.page.set_viewport_size({"width": int(size["w"]), "height": int(size["h"])})
+                    except Exception:
+                        pass
+                await asyncio.sleep(10)
+            except Exception:
+                await asyncio.sleep(10)
 
     async def _send_text_reply(self, text: str) -> bool:
         """
@@ -1475,7 +1509,16 @@ class WhatsAppBot:
 
             # Auto-reply for text messages (only incoming)
             if is_incoming and text_body:
-                await self._maybe_auto_reply(text_body, chat_title)
+                # Ensure we are in the correct chat before replying
+                opened = False
+                try:
+                    if chat_title:
+                        opened = await self.open_chat_by_query(chat_title)
+                    if not opened and sender and sender != "unknown":
+                        opened = await self.open_chat_by_query(sender)
+                except Exception:
+                    opened = False
+                await self._maybe_auto_reply(text_body, chat_title or sender or "")
 
     async def send_pdf_to_admin(self, pdf_path: Path) -> bool:
         """
@@ -1674,6 +1717,8 @@ class SettingsModel(BaseModel):
     enable_gemini_reply: Optional[bool] = None
     gemini_api_key: Optional[str] = None
     gemini_model: Optional[str] = None
+    run_headless: Optional[bool] = None
+    auto_adjust_viewport: Optional[bool] = None
 
 # Simple HTML dashboard template (inline)
 DASHBOARD_HTML = """
@@ -1912,6 +1957,11 @@ async def on_startup():
     await LOGGER.info("app", "starting", version=VERSION)
     await STATE.db.init()
     STATE.settings = await STATE.db.get_settings()
+    # Ensure WA bot uses the up-to-date settings object
+    if STATE.wa:
+        STATE.wa.settings = STATE.settings
+    else:
+        STATE.wa = WhatsAppBot(STATE.settings)
     # rebind managers to new settings
     STATE.ingest = IngestionManager(STATE.db, STATE.settings)
     STATE.composer = PDFComposer(STATE.settings)
