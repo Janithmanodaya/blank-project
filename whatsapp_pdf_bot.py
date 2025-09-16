@@ -54,6 +54,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+# Optional HTTP for Gemini API
+try:
+    import requests  # lightweight, for Gemini REST
+except Exception:
+    requests = _codeNonewn</e
+
+
 # Third-party libraries
 try:
     from fastapi import FastAPI, Request, Response, Depends, HTTPException, status
@@ -820,9 +827,113 @@ class WhatsAppBot:
     - Persistent context
     - QR capture
     - Incoming image messages detection via MutationObserver
+    - Fallback unread scanner to detect messages if observer misses
     - Download images by interacting with UI
     - Send PDF files to admin chat
+    - Auto-reply to text messages (Gemini)
     """
+    async def _auto_scan_loop(self):
+        """
+        Periodically scan chats to surface new messages to the DOM and trigger the page-side scanner.
+        This mitigates cases where the observer misses events.
+        """
+        while not self._stop.is_set():
+            try:
+                if not self.page:
+                    await asyncio.sleep(1.0)
+                    continue
+                # Trigger in-chat rescan
+                try:
+                    await self.page.evaluate("window.__wabot_scanAll && window.__wabot_scanAll()")
+                except Exception:
+                    pass
+
+                # Click a few chats in the list to load their recent messages
+                chat_items = self.page.locator('[data-testid="cell-frame-container"]')
+                count = await chat_items.count()
+                max_to_check = min(count, 3)
+                for i in range(max_to_check):
+                    try:
+                        await chat_items.nth(i).click()
+                        await asyncio.sleep(0.8)
+                        try:
+                            await self.page.evaluate("window.__wabot_scanAll && window.__wabot_scanAll()")
+                        except Exception:
+                            pass
+                    except Exception:
+                        continue
+                # sleep per settings
+                await asyncio.sleep(max(3, int(self.settings.auto_scan_unread_secs or 10)))
+            except Exception:
+                await asyncio.sleep(5)
+
+    async def _send_text_reply(self, text: str) -> bool:
+        """
+        Type a reply in the current chat composer and send.
+        """
+        if not self.page:
+            return False
+        try:
+            inputs = self.page.locator('div[contenteditable="true"][role="textbox"]')
+            n = await inputs.count()
+            if n == 0:
+                return False
+            # Prefer the last input (composer) rather than search
+            composer = inputs.nth(n - 1)
+            await composer.click()
+            await composer.fill(text)
+            await asyncio.sleep(0.2)
+            # Press Enter to send
+            await self.page.keyboard.press("Enter")
+            await asyncio.sleep(0.5)
+            return True
+        except Exception as e:
+            await LOGGER.warn("wa", "send_text_reply failed", error=str(e))
+            return False
+
+    async def _maybe_auto_reply(self, text_body: str, chat_title: str):
+        """
+        If enabled, use Gemini to generate a reply and send it.
+        """
+        if not self.settings.enable_gemini_reply:
+            return
+        api_key = (self.settings.gemini_api_key or "").strip()
+        if not api_key or requests is None:
+            await LOGGER.warn("wa", "gemini not configured or requests missing")
+            return
+        model = (self.settings.gemini_model or "gemini-1.5-flash").strip()
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+            payload = {
+                "contents": [
+                    {
+                        "parts": [
+                            {"text": f"You are a helpful WhatsApp assistant. Reply concisely to the following message:\n\n{chat_title}: {text_body}"}
+                        ]
+                    }
+                ]
+            }
+            resp = requests.post(url, json=payload, timeout=20)
+            if resp.status_code != 200:
+                await LOGGER.warn("wa", "gemini api non-200", status=resp.status_code, body=resp.text[:200])
+                return
+            data = resp.json()
+            # Extract first text part
+            reply = ""
+            try:
+                candidates = data.get("candidates") or []
+                if candidates:
+                    parts = candidates[0].get("content", {}).get("parts", [])
+                    if parts:
+                        reply = parts[0].get("text", "").strip()
+            except Exception:
+                reply = ""
+            if not reply:
+                return
+            ok = await self._send_text_reply(reply)
+            await LOGGER.info("wa", "auto-replied", ok=ok)
+        except Exception as e:
+            await LOGGER.warn("wa", "gemini reply failed", error=str(e))
 
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -893,6 +1004,10 @@ class WhatsAppBot:
 
         # Periodic QR capture
         asyncio.create_task(self._qr_updater())
+
+        # Start unread/observer fallback scanner
+        asyncio.create_task(self._auto_scan_loo_codep(new)</)
+())
 
     async def stop(self):
         self._stop.set()
@@ -1550,6 +1665,10 @@ async function saveSettings() {
     retention_days: parseInt(document.getElementById("retention_days").value || "30"),
     landscape_for_landscape_images: document.getElementById("landscape").checked,
     max_concurrency: parseInt(document.getElementById("max_concurrency").value || "2"),
+    enable_gemini_reply: document.getElementById("enable_gemini_reply").checked,
+    gemini_api_key: document.getElementById("gemini_api_key").value,
+    gemini_model: document.getElementById("gemini_model").value,
+    auto_scan_unread_secs: parseInt(document.getElementById("auto_scan_unread_secs").value || "10"),
   };
   await fetch("/settings", {method: "POST", headers: {"Content-Type":"application/json", ...hdrs()}, body: JSON.stringify(payload)});
   alert("Saved.");
@@ -1591,6 +1710,16 @@ window.onload = refresh;
       <div class="row">
         <label><input id="allow_upscale" type="checkbox"/> Allow upscaling above 100%</label>
         <label><input id="landscape" type="checkbox" checked/> Landscape pages if mostly landscape images</label>
+      </div>
+      <h3>Auto-reply (Gemini)</h3>
+      <div class="row">
+        <label><input id="enable_gemini_reply" type="checkbox"/> Enable Gemini auto-replies</label>
+        <label>Gemini API key <input id="gemini_api_key" type="password" placeholder="AIza..."/></label>
+        <label>Model <input id="gemini_model" type="text" value="gemini-1.5-flash"/></label>
+      </div>
+      <h3>Message detection</h3>
+      <div class="row">
+        <label>Auto-scan unread (secs) <input id="auto_scan_unread_secs" type="number" min="4" max="60" value="10"/></label>
       </div>
       <button class="btn" onclick="saveSettings()">Save Settings</button>
     </div>
