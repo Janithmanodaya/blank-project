@@ -75,6 +75,12 @@ except ImportError as e:
     print("Then run: playwright install chromium")
     raise
 
+# Optional Green API client
+try:
+    from whatsapp_api_client_python import API as GreenAPI
+except Exception:
+    GreenAPI = None
+
 APP_NAME = "WhatsApp Image-to-PDF Bot"
 VERSION = "0.1.0"
 
@@ -213,32 +219,7 @@ def restore_latest_session_backup() -> bool:
     except Exception:
         return False
 
-async def log(self, level: str, module: str, msg: str, **fields):
-    record = {
-        "ts": dt_fmt(),
-        "level": level.upper(),
-        "module": module,
-        "msg": msg,
-        **fields,
-    }
-    text = json.dumps(record, ensure_ascii=False)
-    async with self._lock:
-        self._deque.append(record)
-        with self.file_path.open("a", encoding="utf-8") as f:
-            f.write(text + "\n")
 
-async def info(self, module: str, msg: str, **fields):
-    await self.log("INFO", module, msg, **fields)
-
-async def error(self, module: str, msg: str, **fields):
-    await self.log("ERROR", module, msg, **fields)
-
-async def warn(self, module: str, msg: str, **fields):
-    await self.log("WARN", module, msg, **fields)
-
-def recent(self, limit: int = 200) -> List[Dict[str, Any]]:
-    items = list(self._deque)[-limit:]
-    return items
 
 
 class JsonLogger:
@@ -305,6 +286,13 @@ class Settings:
     gemini_model: str = "gemini-1.5-flash"
     # Auto-scan for unread chats
     auto_scan_unread_secs: int = 10
+    # Browser behavior
+    run_headless: bool = False
+    auto_adjust_viewport: bool = True
+    # Green API (whatsapp-api-client-python)
+    use_green_api: bool = False
+    green_id_instance: str = ""
+    green_api_token_instance: str = ""
 
     @staticmethod
     def from_json(d: Dict[str, Any]) -> "Settings":
@@ -892,7 +880,6 @@ class DeliveryManager:
             self.breaker_open_until = now_ts() + BREAKER_COOLDOWN_SEC
         await LOGGER.warn("delivery", "send failure", consecutive_failures=self.consecutive_failures, error=error)
 
-
 class WhatsAppBot:
     """
     Playwright automation for WhatsApp Web
@@ -934,10 +921,16 @@ class WhatsAppBot:
         chromium = self.playwright.chromium
         self.ctx = await chromium.launch_persistent_context(
             user_data_dir=str(BROWSER_PROFILE_DIR),
-            headless=False,
+            headless=bool(self.settings.run_headless),
             accept_downloads=True,
             viewport={"width": 1280, "height": 900},
-            args=["--disable-blink-features=AutomationControlled"],
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-background-timer-throttling",
+                "--disable-renderer-backgrounding",
+                "--disable-backgrounding-occluded-windows",
+                "--disable-features=CalculateNativeWinOcclusion",
+            ],
         )
 
         pages = self.ctx.pages
@@ -978,17 +971,37 @@ class WhatsAppBot:
 
         # Start unread/observer fallback scanner
         asyncio.create_task(self._auto_scan_loop())
+        # Start viewport adjust loop
+        asyncio.create_task(self._viewport_adjust_loop())
+        # Start stats/heartbeat loop
+        asyncio.create_task(self._stats_loop())
 
     async def _auto_scan_loop(self):
         """
         Periodically scan chats to surface new messages to the DOM and trigger the page-side scanner.
         This mitigates cases where the observer misses events.
+        Designed to keep working even when the window is minimized or backgrounded.
         """
         while not self._stop.is_set():
             try:
                 if not self.page:
                     await asyncio.sleep(1.0)
                     continue
+
+                # Ensure observer is installed
+                try:
+                    installed = await self.page.evaluate("window.__wabot_observer_installed === true")
+                    if not installed:
+                        await LOGGER.warn("wa", "observer not installed; reinstalling")
+                        await self._install_observer_scripts()
+                        await asyncio.sleep(0.5)
+                except Exception:
+                    # Try reinstall on any eval error
+                    try:
+                        await self._install_observer_scripts()
+                    except Exception:
+                        pass
+
                 # Trigger in-chat rescan
                 try:
                     await self.page.evaluate("window.__wabot_scanAll && window.__wabot_scanAll()")
@@ -998,20 +1011,65 @@ class WhatsAppBot:
                 # Click a few chats in the list to load their recent messages
                 chat_items = self.page.locator('[data-testid="cell-frame-container"]')
                 count = await chat_items.count()
-                max_to_check = min(count, 3)
+                max_to_check = min(count, 6)
                 for i in range(max_to_check):
                     try:
                         await chat_items.nth(i).click()
-                        await asyncio.sleep(0.8)
+                        await asyncio.sleep(0.5)
                         try:
                             await self.page.evaluate("window.__wabot_scanAll && window.__wabot_scanAll()")
                         except Exception:
                             pass
                     except Exception:
                         continue
-                # sleep per settings
-                await asyncio.sleep(max(3, int(self.settings.auto_scan_unread_secs or 10)))
+                # sleep per settings (shorter in background)
+                await asyncio.sleep(max(2, int(self.settings.auto_scan_unread_secs or 10)))
             except Exception:
+                await asyncio.sleep(5)
+
+    async def _viewport_adjust_loop(self):
+        """
+        Periodically match the Playwright viewport to the page's inner window size.
+        Helps when the browser is resized or on different displays.
+        """
+        if not self.settings.auto_adjust_viewport:
+            return
+        while not self._stop.is_set():
+            try:
+                if not self.page:
+                    await asyncio.sleep(2)
+                    continue
+                size = await self.page.evaluate("({w: window.innerWidth, h: window.innerHeight})")
+                if isinstance(size, dict) and size.get("w") and size.get("h"):
+                    try:
+                        await self.page.set_viewport_size({"width": int(size["w"]), "height": int(size["h"])})
+                    except Exception:
+                        pass
+                await asyncio.sleep(10)
+            except Exception:
+                await asyncio.sleep(10)
+
+    async def _stats_loop(self):
+        """
+        Heartbeat: log observer status and scan counters, and attempt repair if missing.
+        """
+        while not self._stop.is_set():
+            try:
+                if self.page:
+                    data = await self.page.evaluate("""
+                        ({
+                          installed: !!window.__wabot_observer_installed,
+                          lastScan: window.__wabot_lastScanCount || 0,
+                          hasScanAll: !!window.__wabot_scanAll
+                        })
+                    """)
+                    await LOGGER.info("wa", "observer_heartbeat", **(data or {}))
+                    if not data or not data.get("installed"):
+                        await LOGGER.warn("wa", "observer missing on heartbeat; reinstall attempt")
+                        await self._install_observer_scripts()
+                await asyncio.sleep(5)
+            except Exception as e:
+                await LOGGER.warn("wa", "observer_heartbeat_error", error=str(e))
                 await asyncio.sleep(5)
 
     async def _send_text_reply(self, text: str) -> bool:
@@ -1121,48 +1179,118 @@ class WhatsAppBot:
         """
         Inject a MutationObserver and periodic scanner to detect new messages (media and text),
         then send to Python via exposed binding. Deduplicates by message-id on the page side.
+        Installs at the BrowserContext level to survive reloads/navigation.
         """
-        if not self.page:
+        if not self.ctx:
             return
 
         async def on_new_media(source, payload):
             await LOGGER.info("wa", "observer event", payload=payload)
             await self.incoming_queue.put(payload)
 
-        await self.page.expose_binding("pyOnNewMedia", on_new_media)
+        try:
+            # Bind at context level so any page can call it
+            await self.ctx.expose_binding("pyOnNewMedia", on_new_media)
+        except Exception:
+            # If already exposed, ignore
+            pass
 
         js = """
 (() => {
   if (window.__wabot_observer_installed) return;
   window.__wabot_observer_installed = true;
   window.__wabot_seen = window.__wabot_seen || new Set();
+  window.__wabot_lastScanCount = 0;
 
   function getChatTitle() {
-    const el = document.querySelector('[data-testid="conversation-info-header"]') || document.querySelector('header[role="banner"]');
+    const el =
+      document.querySelector('[data-testid="conversation-info-header"]') ||
+      document.querySelector('header[role="banner"]') ||
+      document.querySelector('[data-testid="conversation-info-header-chat-title"]') ||
+      document.querySelector('[aria-label="Conversation header"]');
     if (!el) return "";
     const title = el.textContent || "";
-    return title.trim();
+    return (title || "").trim();
   }
 
-  function parseMessage(el) {
+  function messageNodes() {
+    // Broaden the search to accommodate WhatsApp Web DOM changes
+    return Array.from(document.querySelectorAll(
+      '[data-id], [data-testid="msg-container"], div.message-in, div.message-out, [data-message-id]'
+    ));
+  }
+
+  function getMsgId(el, idx) {
+    let id =
+      el.getAttribute('data-id') ||
+      el.getAttribute('data-message-id') ||
+      (el.closest && el.closest('[data-id]') && el.closest('[data-id]').getAttribute('data-id')) ||
+      '';
+    if (!id) {
+      // fallback synthetic id
+      id = 'synthetic_' + Date.now() + '_' + idx;
+    }
+    return id;
+  }
+
+  function isIncoming(el) {
+    const cls = (el.className || '');
+    if (/message-in/.test(cls)) return true;
+    if (/message-out/.test(cls)) return false;
+    // Try data-testid hints
+    const cont = el.closest && el.closest('[data-testid="msg-container"]');
+    if (cont) {
+      const ccls = cont.className || '';
+      if (/message-in/.test(ccls)) return true;
+      if (/message-out/.test(ccls)) return false;
+    }
+    // Heuristic: presence of 'incoming' attribute variants
+    return !!el.querySelector('[data-testid="msg-in"]');
+  }
+
+  function extractText(el) {
+    // Try standard content nodes
+    const candidates = el.querySelectorAll('[data-testid="msg-text"], .selectable-text.copyable-text, [dir="auto"]');
+    let text = '';
+    candidates.forEach(n => {
+      const t = (n.innerText || n.textContent || '').trim();
+      if (t) {
+        text += (text ? '\\n' : '') + t;
+      }
+    });
+    return text.trim();
+  }
+
+  function extractPrePlain(el) {
+    return el.getAttribute('data-pre-plain-text') || '';
+  }
+
+  function extractMedia(el) {
+    const arr = [];
+    el.querySelectorAll('img, video').forEach(x => {
+      const src = x.getAttribute('src') || x.getAttribute('poster') || '';
+      if (src) arr.push(src);
+    });
+    return arr;
+  }
+
+  function parseMessage(el, idx) {
     try {
-      const msgId = el.getAttribute('data-id') || '';
-      const pre = el.getAttribute('data-pre-plain-text') || '';
-      const textEl = el.querySelector('[data-testid="msg-text"]') || el.querySelector('.selectable-text.copyable-text');
-      const text = textEl ? (textEl.innerText || textEl.textContent || "").trim() : "";
-      const mediaThumbs = Array.from(el.querySelectorAll('img, video')).map(x => x.getAttribute('src') || x.getAttribute('poster') || '');
-      const cls = (el.className || "");
-      const isIncoming = /message-in/.test(cls);
-      const isOutgoing = /message-out/.test(cls);
-      return { id: msgId, preplain: pre, mediaThumbs, text, isIncoming, isOutgoing };
+      const id = getMsgId(el, idx);
+      const pre = extractPrePlain(el);
+      const text = extractText(el);
+      const mediaThumbs = extractMedia(el);
+      const inc = isIncoming(el);
+      const out = !inc;
+      return { id, preplain: pre, mediaThumbs, text, isIncoming: inc, isOutgoing: out };
     } catch (e) {
       return null;
     }
   }
 
   function emitIfNew(msg) {
-    if (!msg || !msg.id) return;
-    if (window.__wabot_seen.has(msg.id)) return;
+    if (!msg || !msg.id) return false;
+    if (window.__wabot_seen.has(msg.id)) return false;
     window.__wabot_seen.add(msg.id);
     const payload = {
       msgId: msg.id,
@@ -1175,54 +1303,74 @@ class WhatsAppBot:
     };
     try {
       window.pyOnNewMedia(payload);
+      return true;
     } catch (e) {
       console.log("pyOnNewMedia error", e);
+      return false;
     }
   }
 
   function scanAll() {
-    const nodes = document.querySelectorAll('[data-id]');
-    nodes.forEach((el) => {
-      const msg = parseMessage(el);
+    const nodes = messageNodes();
+    let emitted = 0;
+    nodes.forEach((el, i) => {
+      const msg = parseMessage(el, i);
       if (!msg) return;
-      // Only emit for incoming messages
       if (msg.isIncoming) {
-        emitIfNew(msg);
+        if (emitIfNew(msg)) emitted++;
       }
     });
+    window.__wabot_lastScanCount = emitted;
+    return emitted;
   }
 
   function installObserver() {
     const container =
       document.querySelector('[data-testid="conversation-panel-messages"]') ||
+      document.querySelector('[aria-label="Message list"]') ||
       document.querySelector('[role="application"]') ||
       document.body;
     const obs = new MutationObserver((mutations) => {
       for (const m of mutations) {
         for (const n of m.addedNodes) {
           if (!(n instanceof HTMLElement)) continue;
-          const items = n.querySelectorAll ? n.querySelectorAll('[data-id]') : [];
-          items.forEach((it) => emitIfNew(parseMessage(it)));
+          const items = n.querySelectorAll ? n.querySelectorAll('[data-id], [data-testid="msg-container"], [data-message-id]') : [];
+          items.forEach((it, i) => { if (emitIfNew(parseMessage(it, i))) window.__wabot_lastScanCount++; });
+          // Also check the node itself
+          if (n.matches && (n.matches('[data-id], [data-testid="msg-container"], [data-message-id]'))) {
+            if (emitIfNew(parseMessage(n, 0))) window.__wabot_lastScanCount++;
+          }
         }
       }
     });
     obs.observe(container, { childList: true, subtree: true });
   }
 
+  // Expose scan to window for Python to call
+  window.__wabot_scanAll = scanAll;
+
   // Periodic rescans as fallback (in case MutationObserver misses)
   setInterval(() => {
     try { scanAll(); } catch (e) {}
-  }, 4000);
+  }, 3000);
 
   // Kickoff
   installObserver();
   // Initial sweep
-  setTimeout(scanAll, 2000);
+  setTimeout(scanAll, 1500);
 })();
 """
-        await self.page.add_init_script(js)
-        # also run on current page
-        await self.page.evaluate(js)
+        # Install for all pages in the context
+        try:
+            await self.ctx.add_init_script(js)
+        except Exception:
+            pass
+        # also run on current page if present
+        try:
+            if self.page:
+                await self.page.evaluate(js)
+        except Exception:
+            pass
 
     async def _on_response(self, response):
         # Could be used to intercept media routes if needed
@@ -1500,7 +1648,16 @@ class WhatsAppBot:
 
             # Auto-reply for text messages (only incoming)
             if is_incoming and text_body:
-                await self._maybe_auto_reply(text_body, chat_title)
+                # Ensure we are in the correct chat before replying
+                opened = False
+                try:
+                    if chat_title:
+                        opened = await self.open_chat_by_query(chat_title)
+                    if not opened and sender and sender != "unknown":
+                        opened = await self.open_chat_by_query(sender)
+                except Exception:
+                    opened = False
+                await self._maybe_auto_reply(text_body, chat_title or sender or "")
 
     async def send_pdf_to_admin(self, pdf_path: Path) -> bool:
         """
@@ -1696,7 +1853,11 @@ class SettingsModel(BaseModel):
     retention_days: Optional[int] = None
     landscape_for_landscape_images: Optional[bool] = None
     max_concurrency: Optional[int] = None
-
+    enable_gemini_reply: Optional[bool] = None
+    gemini_api_key: Optional[str] = None
+    gemini_model: Optional[str] = None
+    run_headless: Optional[bool] = None
+    auto_adjust_viewport: Optional[bool] = None
 
 # Simple HTML dashboard template (inline)
 DASHBOARD_HTML = """
@@ -1742,6 +1903,32 @@ async function refresh() {
     document.getElementById("qrimg").src = "/qr?t=" + Date.now();
   } else {
     document.getElementById("qrwrap").style.display = "none";
+  }
+
+  // Load and populate settings
+  const settings = await fetch("/settings", {headers: hdrs()}).then(r => r.json()).catch(_ => null);
+  if (settings) {
+    if (document.getElementById("ui_token").value === "") document.getElementById("ui_token").value = settings.ui_token || "";
+    document.getElementById("admin_contact").value = settings.admin_contact || "";
+    document.getElementById("group_window_sec").value = settings.group_window_sec ?? 45;
+    document.getElementById("dpi").value = settings.dpi ?? 300;
+    document.getElementById("allow_upscale").checked = !!settings.allow_upscale;
+    document.getElementById("retention_days").value = settings.retention_days ?? 30;
+    document.getElementById("landscape").checked = !!settings.landscape_for_landscape_images;
+    document.getElementById("max_concurrency").value = settings.max_concurrency ?? 2;
+
+    document.getElementById("enable_gemini_reply").checked = !!settings.enable_gemini_reply;
+    document.getElementById("gemini_model").value = settings.gemini_model || "gemini-1.5-flash";
+    if (settings.gemini_api_key_masked) {
+      document.getElementById("gemini_api_key").placeholder = settings.gemini_api_key_masked;
+    }
+
+    document.getElementById("run_headless").checked = !!settings.run_headless;
+    document.getElementById("auto_adjust_viewport").checked = !!settings.auto_adjust_viewport;
+
+    document.getElementById("use_green_api").checked = !!settings.use_green_api;
+    document.getElementById("green_id_instance").value = settings.green_id_instance || "";
+    document.getElementById("green_api_token_instance").value = settings.green_api_token_instance || "";
   }
 
   const jobs = await fetch("/jobs", {headers: hdrs()}).then(r => r.json()).catch(_ => []);
@@ -1793,6 +1980,17 @@ async function saveSettings() {
     retention_days: parseInt(document.getElementById("retention_days").value || "30"),
     landscape_for_landscape_images: document.getElementById("landscape").checked,
     max_concurrency: parseInt(document.getElementById("max_concurrency").value || "2"),
+
+    enable_gemini_reply: document.getElementById("enable_gemini_reply").checked,
+    gemini_api_key: document.getElementById("gemini_api_key").value,
+    gemini_model: document.getElementById("gemini_model").value || "gemini-1.5-flash",
+
+    run_headless: document.getElementById("run_headless").checked,
+    auto_adjust_viewport: document.getElementById("auto_adjust_viewport").checked,
+
+    use_green_api: document.getElementById("use_green_api").checked,
+    green_id_instance: document.getElementById("green_id_instance").value,
+    green_api_token_instance: document.getElementById("green_api_token_instance").value,
   };
   await fetch("/settings", {method: "POST", headers: {"Content-Type":"application/json", ...hdrs()}, body: JSON.stringify(payload)});
   alert("Saved.");
@@ -1834,6 +2032,27 @@ window.onload = refresh;
       <div class="row">
         <label><input id="allow_upscale" type="checkbox"/> Allow upscaling above 100%</label>
         <label><input id="landscape" type="checkbox" checked/> Landscape pages if mostly landscape images</label>
+      </div>
+      <h2>Gemini Auto-Reply</h2>
+      <div class="row">
+        <label><input id="enable_gemini_reply" type="checkbox"/> Enable auto-reply with Gemini</label>
+      </div>
+      <div class="row">
+        <label>Gemini API Key <input id="gemini_api_key" type="password" placeholder="Not set"/></label>
+        <label>Gemini Model <input id="gemini_model" type="text" value="gemini-1.5-flash" placeholder="gemini-1.5-flash"/></label>
+      </div>
+      <h2>Browser</h2>
+      <div class="row">
+        <label><input id="run_headless" type="checkbox"/> Run headless</label>
+        <label><input id="auto_adjust_viewport" type="checkbox" checked/> Auto-adjust viewport</label>
+      </div>
+      <h2>Green API (whatsapp-api-client-python)</h2>
+      <div class="row">
+        <label><input id="use_green_api" type="checkbox"/> Use Green API for receiving/sending</label>
+      </div>
+      <div class="row">
+        <label>Green ID Instance <input id="green_id_instance" type="text" placeholder="1100..."/></label>
+        <label>Green API Token <input id="green_api_token_instance" type="password" placeholder="xxxxxxxxxxxx"/></label>
       </div>
       <button class="btn" onclick="saveSettings()">Save Settings</button>
     </div>
@@ -1878,6 +2097,134 @@ class AppState:
         self.maint_task: Optional[asyncio.Task] = None
         self.worker_task: Optional[asyncio.Task] = None
         self.wa_incoming_task: Optional[asyncio.Task] = None
+        # Green API
+        self.green: Optional["GreenBot"] = None
+        self.green_task: Optional[asyncio.Task] = None
+
+
+class GreenBot:
+    def __init__(self, settings: Settings, db: DB, ingest: IngestionManager):
+        self.settings = settings
+        self.db = db
+        self.ingest = ingest
+        self._stop = asyncio.Event()
+        self._thread = None
+        self._client = None
+
+    def _ensure_client(self):
+        if GreenAPI is None:
+            return None
+        if not self._client:
+            try:
+                self._client = GreenAPI.GreenAPI(self.settings.green_id_instance, self.settings.green_api_token_instance)
+            except Exception:
+                self._client = None
+        return self._client
+
+    def _on_event(self, typewebhook, body):
+        try:
+            asyncio.run(self._handle_event(typewebhook, body))
+        except Exception:
+            pass
+
+    async def _handle_event(self, typewebhook: str, body: Dict[str, Any]):
+        await LOGGER.info("green", "event", type=typewebhook)
+        try:
+            if typewebhook != "incomingMessageReceived":
+                return
+            sender_data = body.get("senderData") or {}
+            message_data = body.get("messageData") or {}
+            chat_title = sender_data.get("senderName") or ""
+            sender = (sender_data.get("sender") or "").replace("@c.us", "").replace("@s.whatsapp.net", "")
+            ts = int(sender_data.get("timestamp", now_ts()))
+            text = ""
+            tmd = message_data.get("textMessageData") or {}
+            if tmd:
+                text = (tmd.get("textMessage") or "").strip()
+            if not text:
+                return
+            await self.db.upsert_message(f"green_{uuid.uuid4().hex}", sender, chat_title, ts, has_media=False)
+            # Gemini auto-reply
+            if self.settings.enable_gemini_reply:
+                reply = await self._gemini_reply(text, chat_title)
+                if reply:
+                    self._send_text(sender, reply)
+                    await LOGGER.info("green", "auto-replied", ok=True)
+        except Exception as e:
+            await LOGGER.warn("green", "handle_event_error", error=str(e))
+
+    async def _gemini_reply(self, text_body: str, chat_title: str) -> str:
+        api_key = (self.settings.gemini_api_key or "").strip()
+        if not api_key or requests is None:
+            return ""
+        model = (self.settings.gemini_model or "gemini-1.5-flash").strip()
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+            payload = {
+                "contents": [
+                    {
+                        "parts": [
+                            {"text": f"You are a helpful WhatsApp assistant. Reply concisely to the following message:\n\n{chat_title}: {text_body}"}
+                        ]
+                    }
+                ]
+            }
+            resp = requests.post(url, json=payload, timeout=20)
+            if resp.status_code != 200:
+                await LOGGER.warn("green", "gemini api non-200", status=resp.status_code, body=resp.text[:200])
+                return ""
+            data = resp.json()
+            candidates = data.get("candidates") or []
+            if candidates:
+                parts = candidates[0].get("content", {}).get("parts", []) or []
+                if parts:
+                    return (parts[0].get("text") or "").strip()
+        except Exception as e:
+            await LOGGER.warn("green", "gemini reply failed", error=str(e))
+        return ""
+
+    def _send_text(self, phone_no: str, text: str):
+        try:
+            client = self._ensure_client()
+            if not client:
+                return False
+            # Library provides sending API:
+            # sending.sendMessage(phoneNumber, message)
+            client.sending.sendMessage(f"{phone_no}@c.us", text)
+            return True
+        except Exception:
+            return False
+
+    def _thread_target(self):
+        try:
+            client = self._ensure_client()
+            if not client:
+                return
+            client.webhooks.startReceivingNotifications(self._on_event)
+        except Exception:
+            pass
+
+    async def run(self):
+        await LOGGER.info("green", "starting")
+        loop_running = self._thread is not None
+        if not loop_running:
+            import threading
+            self._thread = threading.Thread(target=self._thread_target, daemon=True)
+            self._thread.start()
+        while not self._stop.is_set():
+            await asyncio.sleep(1.0)
+
+    async def stop(self):
+        self._stop.set()
+        try:
+            if self._client:
+                try:
+                    self._client.webhooks.stopReceivingNotifications()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        await LOGGER.info("green", "stopped")
 
 
 STATE = AppState()
@@ -1903,6 +2250,11 @@ async def on_startup():
     await LOGGER.info("app", "starting", version=VERSION)
     await STATE.db.init()
     STATE.settings = await STATE.db.get_settings()
+    # Ensure WA bot uses the up-to-date settings object
+    if STATE.wa:
+        STATE.wa.settings = STATE.settings
+    else:
+        STATE.wa = WhatsAppBot(STATE.settings)
     # rebind managers to new settings
     STATE.ingest = IngestionManager(STATE.db, STATE.settings)
     STATE.composer = PDFComposer(STATE.settings)
@@ -1986,6 +2338,15 @@ async def settings_ep(model: SettingsModel, dep=Depends(auth_dep)):
     await LOGGER.info("app", "settings updated", changed=changed)
     return JSONResponse({"ok": True, "changed": changed})
 
+@app.get("/settings")
+async def settings_get(dep=Depends(auth_dep)):
+    d = STATE.settings.to_json()
+    # Do not expose API key back to clients; provide masked hint
+    if d.get("gemini_api_key"):
+        d["gemini_api_key_masked"] = "•••••• (set)"
+        d["gemini_api_key"] = ""
+    return JSONResponse(d)
+
 
 @app.get("/download/pdf")
 async def download_pdf(path: str, dep=Depends(auth_dep)):
@@ -2009,6 +2370,88 @@ async def list_sets(dep=Depends(auth_dep)):
     sets = await STATE.db.list_sets()
     return JSONResponse(sets)
 
+@app.post("/scan")
+async def scan_now(dep=Depends(auth_dep)):
+    """
+    Trigger a manual scan in the active WhatsApp page (if available).
+    Returns number of newly emitted messages from the page-side scan.
+    """
+    try:
+        if not STATE.wa or not STATE.wa.page:
+            return JSONResponse({"ok": False, "error": "No page"}, status_code=503)
+        count = await STATE.wa.page.evaluate("window.__wabot_scanAll ? window.__wabot_scanAll() : -1")
+        return JSONResponse({"ok": True, "emitted": int(count or 0)})
+    except Exception as e:
+        await LOGGER.warn("app", "scan_now failed", error=str(e))
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+@app.get("/debug/dom")
+async def debug_dom(limit: int = 50000, dep=Depends(auth_dep)):
+    """
+    Return a snapshot of key DOM portions so we can adjust selectors if needed.
+    """
+    try:
+        if not STATE.wa or not STATE.wa.page:
+            raise RuntimeError("No page")
+        script = """
+            (function(){
+              function q(sel){try{const el=document.querySelector(sel);return el?el.outerHTML.slice(0, LIMIT):"";}catch(e){return ""}}
+              const data = {
+                title: document.title,
+                url: location.href,
+                msgPanel: q('[data-testid="conversation-panel-messages"]'),
+                appRole: q('[role="application"]'),
+                listFirst: q('[data-testid="cell-frame-container"]'),
+                anyMsg: (function(){ try {
+                  const el = document.querySelector('[data-id], [data-testid="msg-container"], [data-message-id]');
+                  return el? el.outerHTML.slice(0, LIMIT): "";
+                } catch(e){ return "" }})(),
+                installed: !!window.__wabot_observer_installed,
+                hasScanAll: !!window.__wabot_scanAll,
+                lastScan: window.__wabot_lastScanCount || 0
+              };
+              return data;
+            })()
+        """.replace("LIMIT", str(int(limit)))
+        data = await STATE.wa.page.evaluate(script)
+        return JSONResponse({"ok": True, "data": data})
+    except Exception as e:
+        await LOGGER.warn("app", "debug_dom failed", error=str(e))
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+@app.post("/debug/reinstall")
+async def debug_reinstall(dep=Depends(auth_dep)):
+    """
+    Force reinstall of the page-side observer and scanner.
+    """
+    try:
+        await STATE.wa._install_observer_scripts()
+        return JSONResponse({"ok": True})
+    except Exception as e:
+        await LOGGER.warn("app", "debug_reinstall failed", error=str(e))
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+async def list_sets(dep=Depends(auth_dep)):
+    sets = await STATE.db.list_sets()
+    return JSONResponse(sets)
+
+@app.post("/scan")
+async def scan_now(dep=Depends(auth_dep)):
+    """
+    Trigger a manual scan in the active WhatsApp page (if available).
+    Returns number of newly emitted messages from the page-side scan.
+    """
+    try:
+        if not STATE.wa or not STATE.wa.page:
+            return JSONResponse({"ok": False, "error": "No page"}, status_code=503)
+
+        count = await STATE.wa.page.evaluate(
+            "window.__wabot_scanAll ? window.__wabot_scanAll() : 0"
+        )
+        return JSONResponse({"ok": True, "count": count})
+
+    except Exception as e:
+        # Catch and return error
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 @app.post("/reprocess")
 async def reprocess_set(set_id: str, dep=Depends(auth_dep)):
