@@ -81,10 +81,12 @@ QUAR_DIR = STORAGE_DIR / "quarantine"
 TMP_DIR = STORAGE_DIR / "tmp"
 BROWSER_PROFILE_DIR = STORAGE_DIR / "browser_profile"
 BACKUP_DIR = STORAGE_DIR / "backups"
+SESSION_BACKUP_DIR = STORAGE_DIR / "session_backups"
 LOG_FILE = STORAGE_DIR / "app.log"
 DB_FILE = STORAGE_DIR / "db.sqlite3"
 QR_FILE = STORAGE_DIR / "qr.png"
-SETTINGS_FILE = STORAGE_DIR / "settings.json"
+SETTINGS_FILE = STORAGE_DIR / "settings.j_codesonewn</"
+
 
 # PDF defaults
 DEFAULT_DPI = 300
@@ -129,11 +131,54 @@ def dt_fmt(ts: Optional[int] = None) -> str:
 
 
 def ensure_dirs():
-    for d in [STORAGE_DIR, RAW_DIR, PDF_DIR, PROCESSED_DIR, QUAR_DIR, TMP_DIR, BROWSER_PROFILE_DIR, BACKUP_DIR]:
+    for d in [STORAGE_DIR, RAW_DIR, PDF_DIR, PROCESSED_DIR, QUAR_DIR, TMP_DIR, BROWSER_PROFILE_DIR, BACKUP_DIR, SESSION_BACKUP_DIR]:
         d.mkdir(parents=True, exist_ok=True)
 
 
-# Structured JSON logger with in-memory ring buffer for WebUI
+def dir_size_bytes(path: Path) -> int:
+    total = 0
+    if not path.exists():
+        return 0
+    for root, dirs, files in os.walk(path):
+        for f in files:
+            try:
+                total += (Path(root) / f).stat().st_size
+            except Exception:
+                continue
+    return total
+
+
+def list_session_backups() -> List[Path]:
+    if not SESSION_BACKUP_DIR.exists():
+        return []
+    items = [p for p in SESSION_BACKUP_DIR.glob("session_*") if p.is_dir()]
+    items.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return items
+
+
+def prune_session_backups(max_keep: int = 5) -> int:
+    """
+    Keep only newest max_keep session backups.
+    """
+    items = list_session_backups()
+    removed = 0
+    for p in items[max_keep:]:
+        try:
+            shutil.rmtree(p, ignore_errors=True)
+            removed += 1
+        except Exception:
+            continue
+    return removed
+
+
+def create_session_backup(label: Optional[str] = None) -> Optional[Path]:
+    """
+    Copy the persistent browser profile to a timestamped backup folder.
+    """
+    try:
+        if not BROWSER_PROFILE_DIR.exists():
+            return None
+        ts = dt.datetime.now().strftime("%Y%m%d_%H%MN logger with in-memory ring buffer for WebUI
 class JsonLogger:
     def __init__(self, file_path: Path, max_in_memory: int = 2000):
         self.file_path = file_path
@@ -793,6 +838,17 @@ class WhatsAppBot:
 
     async def start(self):
         await LOGGER.info("wa", "starting playwright")
+
+        # Attempt session restore if profile dir looks empty/small and backups exist
+        try:
+            size = dir_size_bytes(BROWSER_PROFILE_DIR)
+            if siz <  1024 * 50:  # less than ~50KB likely empty
+                restored = restore_latest_session_backup()
+                if restored:
+                    await LOGGER.info("wa", "restored latest session backup")
+        except Exception as e:
+            await LOGGER.warn("wa", "session restore check failed", error=str(e))
+
         self.playwright = await async_playwright().start()
         chromium = self.playwright.chromium
         self.ctx = await chromium.launch_persistent_context(
@@ -801,7 +857,7 @@ class WhatsAppBot:
             accept_downloads=True,
             viewport={"width": 1280, "height": 900},
             args=["--disable-blink-features=AutomationControlled"],
-        )
+
         pages = self.ctx.pages
         if pages:
             self.page = pages[0]
@@ -1361,11 +1417,12 @@ class Worker:
 async def periodic_maintenance(db: DB, settings: Settings, stop_event: asyncio.Event):
     await LOGGER.info("maint", "maintenance loop start")
     last_backup = 0
+    last_session_backup = 0
     while not stop_event.is_set():
         try:
-            # Backups daily
-            if now_ts() - last_backup > 24 * 3600:
-                ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+            now = now_ts()
+            # Backups daily (DB + PDFs)
+            if now - last_backup > 24 * 360M%S")
                 dest = BACKUP_DIR / f"backup_{ts}"
                 dest.mkdir(parents=True, exist_ok=True)
                 # Copy DB and PDFs
