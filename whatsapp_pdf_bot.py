@@ -1884,7 +1884,7 @@ class SettingsModel(BaseModel):
     # Green API
     use_green_api: Optional[bool] = None
     green_id_instance: Optional[str] = None
-    green_api_token_instance: Optional[str] = _codeNonewn</e
+    green_api_token_instance: Optional[str] = None
 
 # Simple HTML dashboard template (inline)
 DASHBOARD_HTML = """
@@ -2355,7 +2355,7 @@ async def logs_ep(limit: int = 200, dep=Depends(auth_dep)):
 @app.post("/settings")
 async def settings_ep(model: SettingsModel, dep=Depends(auth_dep)):
     s = STATE.settings
-    changed = {}
+    changed: Dict[str, Any] = {}
     secret_fields = {"gemini_api_key", "green_api_token_instance"}
     for field in model.model_fields_set:
         v = getattr(model, field)
@@ -2365,7 +2365,15 @@ async def settings_ep(model: SettingsModel, dep=Depends(auth_dep)):
         if field in secret_fields and isinstance(v, str) and v.strip() == "":
             continue
         setattr(s, field, v)
-xplicit)
+        changed[field] = ("••••••" if field in secret_fields else v)
+
+    # Persist
+    await STATE.db.set_settings(s)
+    await LOGGER.info("app", "settings updated", changed=changed)
+
+    # Apply runtime effects
+    try:
+        # Propagate to WA bot and managers (objects already hold reference, but be explicit)
         if STATE.wa:
             STATE.wa.settings = s
         if STATE.composer:
@@ -2382,7 +2390,27 @@ xplicit)
                 if not STATE.green_task or STATE.green_task.done():
                     STATE.green = GreenBot(s, STATE.db, STATE.ingest)
                     STATE.green_task = asyncio.create_task(STATE.green.run())
-                    await LOGGERged})
+                    await LOGGER.info("green", "started (settings)")
+            else:
+                # Stop if running
+                if STATE.green:
+                    try:
+                        await STATE.green.stop()
+                    except Exception:
+                        pass
+                    STATE.green = None
+                if STATE.green_task:
+                    try:
+                        STATE.green_task.cancel()
+                    except Exception:
+                        pass
+                    STATE.green_task = None
+                if s.use_green_api and GreenAPI is None:
+                    await LOGGER.warn("green", "use_green_api enabled but library missing")
+    except Exception as e:
+        await LOGGER.warn("app", "settings apply error", error=str(e))
+
+    return JSONResponse({"ok": True, "changed": changed})
 
 @app.get("/settings")
 async def settings_get(dep=Depends(auth_dep)):
