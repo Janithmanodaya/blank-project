@@ -1130,48 +1130,118 @@ class WhatsAppBot:
         """
         Inject a MutationObserver and periodic scanner to detect new messages (media and text),
         then send to Python via exposed binding. Deduplicates by message-id on the page side.
+        Installs at the BrowserContext level to survive reloads/navigation.
         """
-        if not self.page:
+        if not self.ctx:
             return
 
         async def on_new_media(source, payload):
             await LOGGER.info("wa", "observer event", payload=payload)
             await self.incoming_queue.put(payload)
 
-        await self.page.expose_binding("pyOnNewMedia", on_new_media)
+        try:
+            # Bind at context level so any page can call it
+            await self.ctx.expose_binding("pyOnNewMedia", on_new_media)
+        except Exception:
+            # If already exposed, ignore
+            pass
 
         js = """
 (() => {
   if (window.__wabot_observer_installed) return;
   window.__wabot_observer_installed = true;
   window.__wabot_seen = window.__wabot_seen || new Set();
+  window.__wabot_lastScanCount = 0;
 
   function getChatTitle() {
-    const el = document.querySelector('[data-testid="conversation-info-header"]') || document.querySelector('header[role="banner"]');
+    const el =
+      document.querySelector('[data-testid="conversation-info-header"]') ||
+      document.querySelector('header[role="banner"]') ||
+      document.querySelector('[data-testid="conversation-info-header-chat-title"]') ||
+      document.querySelector('[aria-label="Conversation header"]');
     if (!el) return "";
     const title = el.textContent || "";
-    return title.trim();
+    return (title || "").trim();
   }
 
-  function parseMessage(el) {
+  function messageNodes() {
+    // Broaden the search to accommodate WhatsApp Web DOM changes
+    return Array.from(document.querySelectorAll(
+      '[data-id], [data-testid="msg-container"], div.message-in, div.message-out, [data-message-id]'
+    ));
+  }
+
+  function getMsgId(el, idx) {
+    let id =
+      el.getAttribute('data-id') ||
+      el.getAttribute('data-message-id') ||
+      (el.closest && el.closest('[data-id]') && el.closest('[data-id]').getAttribute('data-id')) ||
+      '';
+    if (!id) {
+      // fallback synthetic id
+      id = 'synthetic_' + Date.now() + '_' + idx;
+    }
+    return id;
+  }
+
+  function isIncoming(el) {
+    const cls = (el.className || '');
+    if (/message-in/.test(cls)) return true;
+    if (/message-out/.test(cls)) return false;
+    // Try data-testid hints
+    const cont = el.closest && el.closest('[data-testid="msg-container"]');
+    if (cont) {
+      const ccls = cont.className || '';
+      if (/message-in/.test(ccls)) return true;
+      if (/message-out/.test(ccls)) return false;
+    }
+    // Heuristic: presence of 'incoming' attribute variants
+    return !!el.querySelector('[data-testid="msg-in"]');
+  }
+
+  function extractText(el) {
+    // Try standard content nodes
+    const candidates = el.querySelectorAll('[data-testid="msg-text"], .selectable-text.copyable-text, [dir="auto"]');
+    let text = '';
+    candidates.forEach(n => {
+      const t = (n.innerText || n.textContent || '').trim();
+      if (t) {
+        text += (text ? '\\n' : '') + t;
+      }
+    });
+    return text.trim();
+  }
+
+  function extractPrePlain(el) {
+    return el.getAttribute('data-pre-plain-text') || '';
+  }
+
+  function extractMedia(el) {
+    const arr = [];
+    el.querySelectorAll('img, video').forEach(x => {
+      const src = x.getAttribute('src') || x.getAttribute('poster') || '';
+      if (src) arr.push(src);
+    });
+    return arr;
+  }
+
+  function parseMessage(el, idx) {
     try {
-      const msgId = el.getAttribute('data-id') || '';
-      const pre = el.getAttribute('data-pre-plain-text') || '';
-      const textEl = el.querySelector('[data-testid="msg-text"]') || el.querySelector('.selectable-text.copyable-text');
-      const text = textEl ? (textEl.innerText || textEl.textContent || "").trim() : "";
-      const mediaThumbs = Array.from(el.querySelectorAll('img, video')).map(x => x.getAttribute('src') || x.getAttribute('poster') || '');
-      const cls = (el.className || "");
-      const isIncoming = /message-in/.test(cls);
-      const isOutgoing = /message-out/.test(cls);
-      return { id: msgId, preplain: pre, mediaThumbs, text, isIncoming, isOutgoing };
+      const id = getMsgId(el, idx);
+      const pre = extractPrePlain(el);
+      const text = extractText(el);
+      const mediaThumbs = extractMedia(el);
+      const inc = isIncoming(el);
+      const out = !inc;
+      return { id, preplain: pre, mediaThumbs, text, isIncoming: inc, isOutgoing: out };
     } catch (e) {
       return null;
     }
   }
 
   function emitIfNew(msg) {
-    if (!msg || !msg.id) return;
-    if (window.__wabot_seen.has(msg.id)) return;
+    if (!msg || !msg.id) return false;
+    if (window.__wabot_seen.has(msg.id)) return false;
     window.__wabot_seen.add(msg.id);
     const payload = {
       msgId: msg.id,
@@ -1184,54 +1254,74 @@ class WhatsAppBot:
     };
     try {
       window.pyOnNewMedia(payload);
+      return true;
     } catch (e) {
       console.log("pyOnNewMedia error", e);
+      return false;
     }
   }
 
   function scanAll() {
-    const nodes = document.querySelectorAll('[data-id]');
-    nodes.forEach((el) => {
-      const msg = parseMessage(el);
+    const nodes = messageNodes();
+    let emitted = 0;
+    nodes.forEach((el, i) => {
+      const msg = parseMessage(el, i);
       if (!msg) return;
-      // Only emit for incoming messages
       if (msg.isIncoming) {
-        emitIfNew(msg);
+        if (emitIfNew(msg)) emitted++;
       }
     });
+    window.__wabot_lastScanCount = emitted;
+    return emitted;
   }
 
   function installObserver() {
     const container =
       document.querySelector('[data-testid="conversation-panel-messages"]') ||
+      document.querySelector('[aria-label="Message list"]') ||
       document.querySelector('[role="application"]') ||
       document.body;
     const obs = new MutationObserver((mutations) => {
       for (const m of mutations) {
         for (const n of m.addedNodes) {
           if (!(n instanceof HTMLElement)) continue;
-          const items = n.querySelectorAll ? n.querySelectorAll('[data-id]') : [];
-          items.forEach((it) => emitIfNew(parseMessage(it)));
+          const items = n.querySelectorAll ? n.querySelectorAll('[data-id], [data-testid="msg-container"], [data-message-id]') : [];
+          items.forEach((it, i) => { if (emitIfNew(parseMessage(it, i))) window.__wabot_lastScanCount++; });
+          // Also check the node itself
+          if (n.matches && (n.matches('[data-id], [data-testid="msg-container"], [data-message-id]'))) {
+            if (emitIfNew(parseMessage(n, 0))) window.__wabot_lastScanCount++;
+          }
         }
       }
     });
     obs.observe(container, { childList: true, subtree: true });
   }
 
+  // Expose scan to window for Python to call
+  window.__wabot_scanAll = scanAll;
+
   // Periodic rescans as fallback (in case MutationObserver misses)
   setInterval(() => {
     try { scanAll(); } catch (e) {}
-  }, 4000);
+  }, 3000);
 
   // Kickoff
   installObserver();
   // Initial sweep
-  setTimeout(scanAll, 2000);
+  setTimeout(scanAll, 1500);
 })();
 """
-        await self.page.add_init_script(js)
-        # also run on current page
-        await self.page.evaluate(js)
+        # Install for all pages in the context
+        try:
+            await self.ctx.add_init_script(js)
+        except Exception:
+            pass
+        # also run on current page if present
+        try:
+            if self.page:
+                await self.page.evaluate(js)
+        except Exception:
+            pass
 
     async def _on_response(self, response):
         # Could be used to intercept media routes if needed
@@ -2076,6 +2166,21 @@ async def send_pdf(path: str, dep=Depends(auth_dep)):
 async def list_sets(dep=Depends(auth_dep)):
     sets = await STATE.db.list_sets()
     return JSONResponse(sets)
+
+@app.post("/scan")
+async def scan_now(dep=Depends(auth_dep)):
+    """
+    Trigger a manual scan in the active WhatsApp page (if available).
+    Returns number of newly emitted messages from the page-side scan.
+    """
+    try:
+        if not STATE.wa or not STATE.wa.page:
+            return JSONResponse({"ok": False, "error": "No page"}, status_code=503)
+        count = await STATE.wa.page.evaluate("window.__wabot_scanAll ? window.__wabot_scanAll() : -1")
+        return JSONResponse({"ok": True, "emitted": int(count or 0)})
+    except Exception as e:
+        await LOGGER.warn("app", "scan_now failed", error=str(e))
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 
 @app.post("/reprocess")
