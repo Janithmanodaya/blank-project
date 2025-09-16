@@ -1881,6 +1881,10 @@ class SettingsModel(BaseModel):
     gemini_model: Optional[str] = None
     run_headless: Optional[bool] = None
     auto_adjust_viewport: Optional[bool] = None
+    # Green API
+    use_green_api: Optional[bool] = None
+    green_id_instance: Optional[str] = None
+    green_api_token_instance: Optional[str] = _codeNonewn</e
 
 # Simple HTML dashboard template (inline)
 DASHBOARD_HTML = """
@@ -2352,22 +2356,44 @@ async def logs_ep(limit: int = 200, dep=Depends(auth_dep)):
 async def settings_ep(model: SettingsModel, dep=Depends(auth_dep)):
     s = STATE.settings
     changed = {}
+    secret_fields = {"gemini_api_key", "green_api_token_instance"}
     for field in model.model_fields_set:
         v = getattr(model, field)
-        if v is not None:
-            setattr(s, field, v)
-            changed[field] = v
-    await STATE.db.set_settings(s)
-    await LOGGER.info("app", "settings updated", changed=changed)
-    return JSONResponse({"ok": True, "changed": changed})
+        if v is None:
+            continue
+        # For secrets: ignore empty string to avoid wiping existing keys unintentionally
+        if field in secret_fields and isinstance(v, str) and v.strip() == "":
+            continue
+        setattr(s, field, v)
+xplicit)
+        if STATE.wa:
+            STATE.wa.settings = s
+        if STATE.composer:
+            STATE.composer.settings = s
+        if STATE.delivery:
+            STATE.delivery.settings = s
+        if STATE.ingest:
+            STATE.ingest.settings = s
+
+        # Handle Green API toggle/start/stop dynamically
+        if "use_green_api" in changed or "green_id_instance" in changed or "green_api_token_instance" in changed:
+            if s.use_green_api and GreenAPI is not None:
+                # Start if not running
+                if not STATE.green_task or STATE.green_task.done():
+                    STATE.green = GreenBot(s, STATE.db, STATE.ingest)
+                    STATE.green_task = asyncio.create_task(STATE.green.run())
+                    await LOGGERged})
 
 @app.get("/settings")
 async def settings_get(dep=Depends(auth_dep)):
     d = STATE.settings.to_json()
-    # Do not expose API key back to clients; provide masked hint
+    # Do not expose API keys back to clients; provide masked hints
     if d.get("gemini_api_key"):
         d["gemini_api_key_masked"] = "•••••• (set)"
         d["gemini_api_key"] = ""
+    if d.get("green_api_token_instance"):
+        d["green_api_token_instance_masked"] = "•••••• (set)"
+        d["green_api_token_instance"] = ""
     return JSONResponse(d)
 
 
