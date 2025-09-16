@@ -2135,7 +2135,96 @@ class GreenBot:
             sender_data = body.get("senderData") or {}
             message_data = body.get("messageData") or {}
             chat_title = sender_data.get("senderName") or ""
-            sender = (sender_data.get("sender") or "").replace
+            sender = (sender_data.get("sender") or "").replace("@c.us", "").replace("@s.whatsapp.net", "")
+            ts = int(sender_data.get("timestamp", now_ts()))
+            text = ""
+            tmd = message_data.get("textMessageData") or {}
+            if tmd:
+                text = (tmd.get("textMessage") or "").strip()
+            if not text:
+                return
+            await self.db.upsert_message(f"green_{uuid.uuid4().hex}", sender, chat_title, ts, has_media=False)
+            # Gemini auto-reply
+            if self.settings.enable_gemini_reply:
+                reply = await self._gemini_reply(text, chat_title)
+                if reply:
+                    self._send_text(sender, reply)
+                    await LOGGER.info("green", "auto-replied", ok=True)
+        except Exception as e:
+            await LOGGER.warn("green", "handle_event_error", error=str(e))
+
+    async def _gemini_reply(self, text_body: str, chat_title: str) -> str:
+        api_key = (self.settings.gemini_api_key or "").strip()
+        if not api_key or requests is None:
+            return ""
+        model = (self.settings.gemini_model or "gemini-1.5-flash").strip()
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+            payload = {
+                "contents": [
+                    {
+                        "parts": [
+                            {"text": f"You are a helpful WhatsApp assistant. Reply concisely to the following message:\n\n{chat_title}: {text_body}"}
+                        ]
+                    }
+                ]
+            }
+            resp = requests.post(url, json=payload, timeout=20)
+            if resp.status_code != 200:
+                await LOGGER.warn("green", "gemini api non-200", status=resp.status_code, body=resp.text[:200])
+                return ""
+            data = resp.json()
+            candidates = data.get("candidates") or []
+            if candidates:
+                parts = candidates[0].get("content", {}).get("parts", []) or []
+                if parts:
+                    return (parts[0].get("text") or "").strip()
+        except Exception as e:
+            await LOGGER.warn("green", "gemini reply failed", error=str(e))
+        return ""
+
+    def _send_text(self, phone_no: str, text: str):
+        try:
+            client = self._ensure_client()
+            if not client:
+                return False
+            # Library provides sending API:
+            # sending.sendMessage(phoneNumber, message)
+            client.sending.sendMessage(f"{phone_no}@c.us", text)
+            return True
+        except Exception:
+            return False
+
+    def _thread_target(self):
+        try:
+            client = self._ensure_client()
+            if not client:
+                return
+            client.webhooks.startReceivingNotifications(self._on_event)
+        except Exception:
+            pass
+
+    async def run(self):
+        await LOGGER.info("green", "starting")
+        loop_running = self._thread is not None
+        if not loop_running:
+            import threading
+            self._thread = threading.Thread(target=self._thread_target, daemon=True)
+            self._thread.start()
+        while not self._stop.is_set():
+            await asyncio.sleep(1.0)
+
+    async def stop(self):
+        self._stop.set()
+        try:
+            if self._client:
+                try:
+                    self._client.webhooks.stopReceivingNotifications()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        await LOGGER.info("green", "stopped")
 
 
 STATE = AppState()
