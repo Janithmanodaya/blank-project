@@ -75,6 +75,12 @@ except ImportError as e:
     print("Then run: playwright install chromium")
     raise
 
+# Optional Green API client
+try:
+    from whatsapp_api_client_python import API as GreenAPI
+except Exception:
+    GreenAPI = None
+
 APP_NAME = "WhatsApp Image-to-PDF Bot"
 VERSION = "0.1.0"
 
@@ -283,6 +289,10 @@ class Settings:
     # Browser behavior
     run_headless: bool = False
     auto_adjust_viewport: bool = True
+    # Green API (whatsapp-api-client-python)
+    use_green_api: bool = False
+    green_id_instance: str = ""
+    green_api_token_instance: str = ""
 
     @staticmethod
     def from_json(d: Dict[str, Any]) -> "Settings":
@@ -854,9 +864,9 @@ class DeliveryManager:
         if self.settings.admin_contact.strip() == "":
             return False
         now = now_ts()
-        if self.breaker_open_until and now < self.breaker_open_until:
+        if self.breaker_open_until and no << self.breaker_open_until:
             return False
-        if now - self.last_send_ts < SEND_RATE_LIMIT_SEC:
+        if now - self.last_send_t << SEND_RATE_LIMIT_SEC:
             return False
         return True
 
@@ -868,8 +878,7 @@ class DeliveryManager:
         self.consecutive_failures += 1
         if self.consecutive_failures >= MAX_SEND_FAILS_FOR_BREAKER:
             self.breaker_open_until = now_ts() + BREAKER_COOLDOWN_SEC
-        await LOGGER.warn("delivery", "send failure", consecutive_failures=self.consecutive_failures, error=error)
-
+        await LOGGER.warn("delivery", "send failure", consecutive_failures=self.consecutive_failures, error=er_code
 
 class WhatsAppBot:
     """
@@ -1896,13 +1905,10 @@ async function refresh() {
     document.getElementById("qrwrap").style.display = "none";
   }
 
-  // Load settings to populate fields
+  // Load and populate settings
   const settings = await fetch("/settings", {headers: hdrs()}).then(r => r.json()).catch(_ => null);
   if (settings) {
-    // Only set UI token input if empty to avoid overwriting entered token
-    if ((document.getElementById("ui_token").value || "") === "") {
-      document.getElementById("ui_token").value = settings.ui_token || "";
-    }
+    if (document.getElementById("ui_token").value === "") document.getElementById("ui_token").value = settings.ui_token || "";
     document.getElementById("admin_contact").value = settings.admin_contact || "";
     document.getElementById("group_window_sec").value = settings.group_window_sec ?? 45;
     document.getElementById("dpi").value = settings.dpi ?? 300;
@@ -1910,11 +1916,19 @@ async function refresh() {
     document.getElementById("retention_days").value = settings.retention_days ?? 30;
     document.getElementById("landscape").checked = !!settings.landscape_for_landscape_images;
     document.getElementById("max_concurrency").value = settings.max_concurrency ?? 2;
+
     document.getElementById("enable_gemini_reply").checked = !!settings.enable_gemini_reply;
     document.getElementById("gemini_model").value = settings.gemini_model || "gemini-1.5-flash";
     if (settings.gemini_api_key_masked) {
       document.getElementById("gemini_api_key").placeholder = settings.gemini_api_key_masked;
     }
+
+    document.getElementById("run_headless").checked = !!settings.run_headless;
+    document.getElementById("auto_adjust_viewport").checked = !!settings.auto_adjust_viewport;
+
+    document.getElementById("use_green_api").checked = !!settings.use_green_api;
+    document.getElementById("green_id_instance").value = settings.green_id_instance || "";
+    document.getElementById("green_api_token_instance").value = settings.green_api_token_instance || "";
   }
 
   const jobs = await fetch("/jobs", {headers: hdrs()}).then(r => r.json()).catch(_ => []);
@@ -1966,9 +1980,17 @@ async function saveSettings() {
     retention_days: parseInt(document.getElementById("retention_days").value || "30"),
     landscape_for_landscape_images: document.getElementById("landscape").checked,
     max_concurrency: parseInt(document.getElementById("max_concurrency").value || "2"),
+
     enable_gemini_reply: document.getElementById("enable_gemini_reply").checked,
     gemini_api_key: document.getElementById("gemini_api_key").value,
     gemini_model: document.getElementById("gemini_model").value || "gemini-1.5-flash",
+
+    run_headless: document.getElementById("run_headless").checked,
+    auto_adjust_viewport: document.getElementById("auto_adjust_viewport").checked,
+
+    use_green_api: document.getElementById("use_green_api").checked,
+    green_id_instance: document.getElementById("green_id_instance").value,
+    green_api_token_instance: document.getElementById("green_api_token_instance").value,
   };
   await fetch("/settings", {method: "POST", headers: {"Content-Type":"application/json", ...hdrs()}, body: JSON.stringify(payload)});
   alert("Saved.");
@@ -2019,6 +2041,19 @@ window.onload = refresh;
         <label>Gemini API Key <input id="gemini_api_key" type="password" placeholder="Not set"/></label>
         <label>Gemini Model <input id="gemini_model" type="text" value="gemini-1.5-flash" placeholder="gemini-1.5-flash"/></label>
       </div>
+      <h2>Browser</h2>
+      <div class="row">
+        <label><input id="run_headless" type="checkbox"/> Run headless</label>
+        <label><input id="auto_adjust_viewport" type="checkbox" checked/> Auto-adjust viewport</label>
+      </div>
+      <h2>Green API (whatsapp-api-client-python)</h2>
+      <div class="row">
+        <label><input id="use_green_api" type="checkbox"/> Use Green API for receiving/sending</label>
+      </div>
+      <div class="row">
+        <label>Green ID Instance <input id="green_id_instance" type="text" placeholder="1100..."/></label>
+        <label>Green API Token <input id="green_api_token_instance" type="password" placeholder="xxxxxxxxxxxx"/></label>
+      </div>
       <button class="btn" onclick="saveSettings()">Save Settings</button>
     </div>
   </div>
@@ -2062,6 +2097,45 @@ class AppState:
         self.maint_task: Optional[asyncio.Task] = None
         self.worker_task: Optional[asyncio.Task] = None
         self.wa_incoming_task: Optional[asyncio.Task] = None
+        # Green API
+        self.green: Optional["GreenBot"] = None
+        self.green_task: Optional[asyncio.Task] = None
+
+
+class GreenBot:
+    def __init__(self, settings: Settings, db: DB, ingest: IngestionManager):
+        self.settings = settings
+        self.db = db
+        self.ingest = ingest
+        self._stop = asyncio.Event()
+        self._thread = None
+        self._client = None
+
+    def _ensure_client(self):
+        if GreenAPI is None:
+            return None
+        if not self._client:
+            try:
+                self._client = GreenAPI.GreenAPI(self.settings.green_id_instance, self.settings.green_api_token_instance)
+            except Exception:
+                self._client = None
+        return self._client
+
+    def _on_event(self, typewebhook, body):
+        try:
+            asyncio.run(self._handle_event(typewebhook, body))
+        except Exception:
+            pass
+
+    async def _handle_event(self, typewebhook: str, body: Dict[str, Any]):
+        await LOGGER.info("green", "event", type=typewebhook)
+        try:
+            if typewebhook != "incomingMessageReceived":
+                return
+            sender_data = body.get("senderData") or {}
+            message_data = body.get("messageData") or {}
+            chat_title = sender_data.get("senderName") or ""
+            sender = (sender_data.get("sender") or "").replace
 
 
 STATE = AppState()
