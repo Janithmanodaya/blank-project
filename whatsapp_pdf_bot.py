@@ -964,6 +964,8 @@ class WhatsAppBot:
         asyncio.create_task(self._auto_scan_loop())
         # Start viewport adjust loop
         asyncio.create_task(self._viewport_adjust_loop())
+        # Start stats/heartbeat loop
+        asyncio.create_task(self._stats_loo_codep(new)</)
 
     async def _auto_scan_loop(self):
         """
@@ -976,6 +978,21 @@ class WhatsAppBot:
                 if not self.page:
                     await asyncio.sleep(1.0)
                     continue
+
+                # Ensure observer is installed
+                try:
+                    installed = await self.page.evaluate("window.__wabot_observer_installed === true")
+                    if not installed:
+                        await LOGGER.warn("wa", "observer not installed; reinstalling")
+                        await self._install_observer_scripts()
+                        await asyncio.sleep(0.5)
+                except Exception:
+                    # Try reinstall on any eval error
+                    try:
+                        await self._install_observer_scripts()
+                    except Exception:
+                        pass
+
                 # Trigger in-chat rescan
                 try:
                     await self.page.evaluate("window.__wabot_scanAll && window.__wabot_scanAll()")
@@ -985,7 +1002,7 @@ class WhatsAppBot:
                 # Click a few chats in the list to load their recent messages
                 chat_items = self.page.locator('[data-testid="cell-frame-container"]')
                 count = await chat_items.count()
-                max_to_check = min(count, 5)
+                max_to_check = min(count, 6)
                 for i in range(max_to_check):
                     try:
                         await chat_items.nth(i).click()
@@ -1022,6 +1039,29 @@ class WhatsAppBot:
                 await asyncio.sleep(10)
             except Exception:
                 await asyncio.sleep(10)
+
+    async def _stats_loop(self):
+        """
+        Heartbeat: log observer status and scan counters, and attempt repair if missing.
+        """
+        while not self._stop.is_set():
+            try:
+                if self.page:
+                    data = await self.page.evaluate("""
+                        ({
+                          installed: !!window.__wabot_observer_installed,
+                          lastScan: window.__wabot_lastScanCount || 0,
+                          hasScanAll: !!window.__wabot_scanAll
+                        })
+                    """)
+                    await LOGGER.info("wa", "observer_heartbeat", **(data or {}))
+                    if not data or not data.get("installed"):
+                        await LOGGER.warn("wa", "observer missing on heartbeat; reinstall attempt")
+                        await self._install_observer_scripts()
+                await asyncio.sleep(5)
+            except Exception as e:
+                await LOGGER.warn("wa", "observer_heartbeat_error", error=str(e))
+                await asyncio.sleep(5)
 
     async def _send_text_reply(self, text: str) -> bool:
         """
@@ -2181,6 +2221,66 @@ async def scan_now(dep=Depends(auth_dep)):
     except Exception as e:
         await LOGGER.warn("app", "scan_now failed", error=str(e))
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+@app.get("/debug/dom")
+async def debug_dom(limit: int = 50000, dep=Depends(auth_dep)):
+    """
+    Return a snapshot of key DOM portions so we can adjust selectors if needed.
+    """
+    try:
+        if not STATE.wa or not STATE.wa.page:
+            raise RuntimeError("No page")
+        script = """
+            (function(){
+              function q(sel){try{const el=document.querySelector(sel);return el?el.outerHTML.slice(0, LIMIT):"";}catch(e){return ""}}
+              const data = {
+                title: document.title,
+                url: location.href,
+                msgPanel: q('[data-testid="conversation-panel-messages"]'),
+                appRole: q('[role="application"]'),
+                listFirst: q('[data-testid="cell-frame-container"]'),
+                anyMsg: (function(){ try {
+                  const el = document.querySelector('[data-id], [data-testid="msg-container"], [data-message-id]');
+                  return el? el.outerHTML.slice(0, LIMIT): "";
+                } catch(e){ return "" }})(),
+                installed: !!window.__wabot_observer_installed,
+                hasScanAll: !!window.__wabot_scanAll,
+                lastScan: window.__wabot_lastScanCount || 0
+              };
+              return data;
+            })()
+        """.replace("LIMIT", str(int(limit)))
+        data = await STATE.wa.page.evaluate(script)
+        return JSONResponse({"ok": True, "data": data})
+    except Exception as e:
+        await LOGGER.warn("app", "debug_dom failed", error=str(e))
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+@app.post("/debug/reinstall")
+async def debug_reinstall(dep=Depends(auth_dep)):
+    """
+    Force reinstall of the page-side observer and scanner.
+    """
+    try:
+        await STATE.wa._install_observer_scripts()
+        return JSONResponse({"ok": True})
+    except Exception as e:
+        await LOGGER.warn("app", "debug_reinstall failed", error=str(e))
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+async def list_sets(dep=Depends(auth_dep)):
+    sets = await STATE.db.list_sets()
+    return JSONResponse(sets)
+
+@app.post("/scan")
+async def scan_now(dep=Depends(auth_dep)):
+    """
+    Trigger a manual scan in the active WhatsApp page (if available).
+    Returns number of newly emitted messages from the page-side scan.
+    """
+    try:
+        if not STATE.wa or not STATE.wa.page:
+            return JSONResponse({"ok": False, "error": "No page"}, status_code=503)
+        count = await STATE.wa.page.evaluate("window.__wabot_scanAll ?)
 
 
 @app.post("/reprocess")
