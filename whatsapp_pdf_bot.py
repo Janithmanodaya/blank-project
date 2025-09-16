@@ -1671,7 +1671,9 @@ class SettingsModel(BaseModel):
     retention_days: Optional[int] = None
     landscape_for_landscape_images: Optional[bool] = None
     max_concurrency: Optional[int] = None
-
+    enable_gemini_reply: Optional[bool] = None
+    gemini_api_key: Optional[str] = None
+    gemini_model: Optional[str] = None
 
 # Simple HTML dashboard template (inline)
 DASHBOARD_HTML = """
@@ -1717,6 +1719,27 @@ async function refresh() {
     document.getElementById("qrimg").src = "/qr?t=" + Date.now();
   } else {
     document.getElementById("qrwrap").style.display = "none";
+  }
+
+  // Load settings to populate fields
+  const settings = await fetch("/settings", {headers: hdrs()}).then(r => r.json()).catch(_ => null);
+  if (settings) {
+    // Only set UI token input if empty to avoid overwriting entered token
+    if ((document.getElementById("ui_token").value || "") === "") {
+      document.getElementById("ui_token").value = settings.ui_token || "";
+    }
+    document.getElementById("admin_contact").value = settings.admin_contact || "";
+    document.getElementById("group_window_sec").value = settings.group_window_sec ?? 45;
+    document.getElementById("dpi").value = settings.dpi ?? 300;
+    document.getElementById("allow_upscale").checked = !!settings.allow_upscale;
+    document.getElementById("retention_days").value = settings.retention_days ?? 30;
+    document.getElementById("landscape").checked = !!settings.landscape_for_landscape_images;
+    document.getElementById("max_concurrency").value = settings.max_concurrency ?? 2;
+    document.getElementById("enable_gemini_reply").checked = !!settings.enable_gemini_reply;
+    document.getElementById("gemini_model").value = settings.gemini_model || "gemini-1.5-flash";
+    if (settings.gemini_api_key_masked) {
+      document.getElementById("gemini_api_key").placeholder = settings.gemini_api_key_masked;
+    }
   }
 
   const jobs = await fetch("/jobs", {headers: hdrs()}).then(r => r.json()).catch(_ => []);
@@ -1768,6 +1791,9 @@ async function saveSettings() {
     retention_days: parseInt(document.getElementById("retention_days").value || "30"),
     landscape_for_landscape_images: document.getElementById("landscape").checked,
     max_concurrency: parseInt(document.getElementById("max_concurrency").value || "2"),
+    enable_gemini_reply: document.getElementById("enable_gemini_reply").checked,
+    gemini_api_key: document.getElementById("gemini_api_key").value,
+    gemini_model: document.getElementById("gemini_model").value || "gemini-1.5-flash",
   };
   await fetch("/settings", {method: "POST", headers: {"Content-Type":"application/json", ...hdrs()}, body: JSON.stringify(payload)});
   alert("Saved.");
@@ -1809,6 +1835,14 @@ window.onload = refresh;
       <div class="row">
         <label><input id="allow_upscale" type="checkbox"/> Allow upscaling above 100%</label>
         <label><input id="landscape" type="checkbox" checked/> Landscape pages if mostly landscape images</label>
+      </div>
+      <h2>Gemini Auto-Reply</h2>
+      <div class="row">
+        <label><input id="enable_gemini_reply" type="checkbox"/> Enable auto-reply with Gemini</label>
+      </div>
+      <div class="row">
+        <label>Gemini API Key <input id="gemini_api_key" type="password" placeholder="Not set"/></label>
+        <label>Gemini Model <input id="gemini_model" type="text" value="gemini-1.5-flash" placeholder="gemini-1.5-flash"/></label>
       </div>
       <button class="btn" onclick="saveSettings()">Save Settings</button>
     </div>
@@ -1960,6 +1994,15 @@ async def settings_ep(model: SettingsModel, dep=Depends(auth_dep)):
     await STATE.db.set_settings(s)
     await LOGGER.info("app", "settings updated", changed=changed)
     return JSONResponse({"ok": True, "changed": changed})
+
+@app.get("/settings")
+async def settings_get(dep=Depends(auth_dep)):
+    d = STATE.settings.to_json()
+    # Do not expose API key back to clients; provide masked hint
+    if d.get("gemini_api_key"):
+        d["gemini_api_key_masked"] = "•••••• (set)"
+        d["gemini_api_key"] = ""
+    return JSONResponse(d)
 
 
 @app.get("/download/pdf")
