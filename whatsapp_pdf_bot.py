@@ -1201,6 +1201,7 @@ class WhatsAppBot:
   window.__wabot_observer_installed = true;
   window.__wabot_seen = window.__wabot_seen || new Set();
   window.__wabot_lastScanCount = 0;
+  window.__wabot_start_ms = Date.now();
 
   function getChatTitle() {
     const el =
@@ -1233,7 +1234,15 @@ class WhatsAppBot:
     return id;
   }
 
+  function extractPrePlain(el) {
+    return el.getAttribute('data-pre-plain-text') || '';
+  }
+
   function isIncoming(el) {
+    // Prefer reliable heuristic based on pre-plain marker "You:"
+    const pre = extractPrePlain(el);
+    if (pre && /\\]\\s*You:/i.test(pre)) return false;
+
     const cls = (el.className || '');
     if (/message-in/.test(cls)) return true;
     if (/message-out/.test(cls)) return false;
@@ -1245,7 +1254,10 @@ class WhatsAppBot:
       if (/message-out/.test(ccls)) return false;
     }
     // Heuristic: presence of 'incoming' attribute variants
-    return !!el.querySelector('[data-testid="msg-in"]');
+    if (el.querySelector('[data-testid="msg-in"]')) return true;
+    if (el.querySelector('[data-testid="msg-out"]')) return false;
+    // Default to incoming = false if unsure
+    return false;
   }
 
   function extractText(el) {
@@ -1261,10 +1273,6 @@ class WhatsAppBot:
     return text.trim();
   }
 
-  function extractPrePlain(el) {
-    return el.getAttribute('data-pre-plain-text') || '';
-  }
-
   function extractMedia(el) {
     const arr = [];
     el.querySelectorAll('img, video').forEach(x => {
@@ -1277,12 +1285,12 @@ class WhatsAppBot:
   function parseMessage(el, idx) {
     try {
       const id = getMsgId(el, idx);
-      const pre = extractPrePlain(el);
+      const preplain = extractPrePlain(el);
       const text = extractText(el);
       const mediaThumbs = extractMedia(el);
       const inc = isIncoming(el);
       const out = !inc;
-      return { id, preplain: pre, mediaThumbs, text, isIncoming: inc, isOutgoing: out };
+      return { id, preplain, mediaThumbs, text, isIncoming: inc, isOutgoing: out };
     } catch (e) {
       return null;
     }
@@ -1291,6 +1299,12 @@ class WhatsAppBot:
   function emitIfNew(msg) {
     if (!msg || !msg.id) return false;
     if (window.__wabot_seen.has(msg.id)) return false;
+    // Only emit incoming messages
+    if (!msg.isIncoming) {
+      // Still mark as seen to avoid later duplicate emissions during scans
+      window.__wabot_seen.add(msg.id);
+      return false;
+    }
     window.__wabot_seen.add(msg.id);
     const payload = {
       msgId: msg.id,
@@ -1316,12 +1330,22 @@ class WhatsAppBot:
     nodes.forEach((el, i) => {
       const msg = parseMessage(el, i);
       if (!msg) return;
-      if (msg.isIncoming) {
-        if (emitIfNew(msg)) emitted++;
-      }
+      if (emitIfNew(msg)) emitted++;
     });
     window.__wabot_lastScanCount = emitted;
     return emitted;
+  }
+
+  function seedSeenFromDom() {
+    // Mark existing messages present at startup as seen without emitting
+    try {
+      messageNodes().forEach((el, i) => {
+        const msg = parseMessage(el, i);
+        if (msg && msg.id && !window.__wabot_seen.has(msg.id)) {
+          window.__wabot_seen.add(msg.id);
+        }
+      });
+    } catch (e) {}
   }
 
   function installObserver() {
@@ -1355,9 +1379,8 @@ class WhatsAppBot:
   }, 3000);
 
   // Kickoff
+  seedSeenFromDom(); // prevent old messages from emitting on startup
   installObserver();
-  // Initial sweep
-  setTimeout(scanAll, 1500);
 })();
 """
         # Install for all pages in the context
