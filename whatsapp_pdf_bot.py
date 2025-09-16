@@ -811,9 +811,27 @@ class WhatsAppBot:
         self.page.on("response", self._on_response)
         self.page.on("download", self._on_download)
 
-        await self.page.goto("https://web.whatsapp.com/")
-        await asyncio.sleep(2)
-        await self._install_observer_scripts()
+        # Make navigation timeouts generous for slow connections
+        try:
+            self.page.set_default_navigation_timeout(120000)  # 120s
+            self.page.set_default_timeout(120000)  # 120s for operations
+        except Exception:
+            pass
+
+        # Try to navigate but don't fail startup on timeout
+        try:
+            await self.page.goto("https://web.whatsapp.com/", timeout=120000, wait_until="domcontentloaded")
+        except Exception as e:
+            # Continue startup even if initial navigation times out; page may still load eventually
+            await LOGGER.warn("wa", "initial goto timed out/failed; continuing", error=str(e))
+
+        await asyncio.sleep(3)
+        try:
+            await self._install_observer_scripts()
+        except Exception as e:
+            # Observer script also gets re-attempted via setInterval inside the page
+            await LOGGER.warn("wa", "install observer failed; will retry via page timer", error=str(e))
+
         self._ready.set()
         await LOGGER.info("wa", "playwright ready")
 
