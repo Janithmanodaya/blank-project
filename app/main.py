@@ -3,9 +3,9 @@ import json
 import logging
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import httpx
 from fastapi import Depends, FastAPI, Request
@@ -24,7 +24,7 @@ except Exception:
     GeminiResponder = None  # type: ignore
 
 APP_TITLE = "GreenAPI Image→PDF Relay"
-VERSION = "0.2.0"
+VERSION = "0.3.2"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,6 +49,11 @@ app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 storage = Storage(base=Path("storage"))
 composer = PDFComposer(storage=storage)
 
+# Batching state per chat for media -> PDF
+BATCH_WINDOW_SECONDS = int(os.getenv("BATCH_WINDOW_SECONDS", "60"))
+pending_batches: Dict[str, Dict[str, Any]] = {}
+pending_lock = asyncio.Lock()
+
 # Background queue and worker are defined in app.tasks to avoid circular imports
 
 
@@ -66,6 +71,9 @@ async def on_startup():
     worker_count = int(os.getenv("WORKERS", "2"))
     for i in range(worker_count):
         workers.append(asyncio.create_task(worker_loop(i)))
+
+    # Launch Green API notification poller (for setups without webhooks)
+    workers.append(asyncio.create_task(notification_poller()))
 
     # Attach web router after components are ready (import here to avoid circular import)
     from .webui import router as web_router  # local import
@@ -99,7 +107,7 @@ async def worker_loop(worker_id: int):
                 downloaded_files = []
                 for m in media_items:
                     try:
-                        file_path = await storage.download_media(http_client, m, job)
+                        file_path = await storage.download_media(http_client, m["payload"], job)
                         db.update_media_local_path(m["id"], str(file_path))
                         downloaded_files.append(file_path)
                     except Exception as e:
@@ -113,14 +121,16 @@ async def worker_loop(worker_id: int):
                 # Upload and send
                 upload = await client.upload_file(pdf_result.pdf_path)
                 db.update_job_upload(job_id, upload)
+                # Choose destination chat: ADMIN_CHAT_ID if set, otherwise original sender
+                dest_chat = os.getenv("ADMIN_CHAT_ID", "") or (job.get("sender") or "")
                 send_resp = await client.send_file_by_url(
-                    chat_id=os.getenv("ADMIN_CHAT_ID", ""),
-                    url_file=upload["urlFile"],
+                    chat_id=dest_chat,
+                    url_file=upload.get("urlFile", ""),
                     filename=pdf_result.pdf_path.name,
                     caption=f"PDF from {job['sender']} message {job['msg_id']}",
                 )
                 db.update_job_status(job_id, "SENT")
-                db.append_job_log(job_id, {"upload": upload, "send": send_resp})
+                db.append_job_log(job_id, {"upload": upload, "send": send_resp, "dest_chat": dest_chat})
 
                 json_log("job_sent", worker_id=worker_id, job_id=job_id)
             except asyncio.CancelledError:
@@ -150,6 +160,40 @@ def _extract_text_from_payload(payload: Dict[str, Any]) -> Optional[str]:
     if "imageMessageData" in md:
         return md.get("imageMessageData", {}).get("caption")
     return None
+
+
+def _extract_event_time(payload: Dict[str, Any]) -> Optional[datetime]:
+    """
+    Try to get the message event time as UTC datetime.
+    Looks for common Green API fields: 'timestamp' (epoch seconds).
+    """
+    candidates: List[Optional[Union[int, float, str]]] = []
+    # top-level
+    candidates.append(payload.get("timestamp"))
+    # typical locations
+    md = payload.get("messageData") or {}
+    candidates.append(md.get("timestamp"))
+    # sometimes stored under 'sendTime' or similar
+    candidates.append(payload.get("sendTime"))
+    candidates.append(md.get("sendTime"))
+    # process
+    for c in candidates:
+        if c is None:
+            continue
+        try:
+            # parse numeric epoch seconds
+            if isinstance(c, (int, float)) or (isinstance(c, str) and c.isdigit()):
+                sec = float(c)
+                # treat values that look like ms
+                if sec > 1e12:
+                    sec = sec / 1000.0
+                return datetime.fromtimestamp(sec, tz=timezone.utc)
+        except Exception:
+            continue
+    return None
+
+
+WINDOW_SECONDS = 180  # 3 minutes
 
 
 async def maybe_auto_reply(payload: Dict[str, Any], db: Database):
@@ -182,14 +226,28 @@ async def maybe_auto_reply(payload: Dict[str, Any], db: Database):
         json_log("auto_reply_failed", error=str(e))
 
 
-@app.post("/webhook")
-async def webhook(request: Request, db: Database = Depends(get_db)):
+async def _enqueue_batch_later(sender: str, db: Database):
     try:
-        payload = await request.json()
-    except Exception:
-        raw = await request.body()
-        return JSONResponse({"ok": False, "error": "invalid_json", "raw": raw.decode("utf-8", "ignore")}, status_code=400)
+        await asyncio.sleep(BATCH_WINDOW_SECONDS)
+        async with pending_lock:
+            b = pending_batches.get(sender)
+            if not b:
+                return
+            job_id = b["job_id"]
+            # Move to queue only if still pending
+            db.update_job_status(job_id, "PENDING")
+            await job_queue.put(job_id)
+            json_log("batch_enqueued", sender=sender, job_id=job_id)
+            # Remove batch
+            pending_batches.pop(sender, None)
+    except asyncio.CancelledError:
+        # Batch was cancelled due to new batch or shutdown
+        raise
+    except Exception as e:
+        json_log("batch_enqueue_error", sender=sender, error=str(e))
 
+
+async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict[str, Any]:
     # Persist raw payload
     ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
     storage.save_incoming_payload(payload, f"{ts}.json")
@@ -198,13 +256,29 @@ async def webhook(request: Request, db: Database = Depends(get_db)):
     webhook_type = payload.get("typeWebhook")
     if not webhook_type:
         json_log("webhook_ignored", reason="missing_typeWebhook")
-        return JSONResponse({"ok": True, "ignored": True})
+        return {"ok": True, "ignored": True}
 
     # Extract sender, message id, media list heuristically
     instance_id = payload.get("instanceData", {}).get("idInstance") or os.getenv("GREEN_API_INSTANCE_ID", "")
     sender = payload.get("senderData", {}).get("chatId") or payload.get("senderData", {}).get("sender") or "unknown"
     msg_id = payload.get("idMessage") or payload.get("messageData", {}).get("idMessage") or payload.get("receiptId") or ts
     message_data = payload.get("messageData") or {}
+
+    # Time window filter (3 minutes)
+    now = datetime.now(tz=timezone.utc)
+    evt_time = _extract_event_time(payload) or now
+    age = (now - evt_time).total_seconds()
+    if age > WINDOW_SECONDS:
+        json_log("message_skipped_outside_window", sender=sender, msg_id=str(msg_id), age_seconds=int(age))
+        return {"ok": True, "skipped": "outside_window", "age_seconds": int(age)}
+
+    # Idempotency: skip if we've already handled this message id
+    if db.has_processed(str(msg_id)):
+        json_log("duplicate_message_skipped", msg_id=str(msg_id), sender=sender)
+        return {"ok": True, "duplicate": True, "msg_id": str(msg_id)}
+
+    # Mark as processed early to avoid races on re-delivery
+    db.mark_processed(str(msg_id))
 
     media_list: List[Dict[str, Any]] = []
     try:
@@ -218,24 +292,80 @@ async def webhook(request: Request, db: Database = Depends(get_db)):
     except Exception:
         pass
 
-    # Create job
-    job_id = db.create_job(sender=sender, msg_id=str(msg_id), payload=payload, instance_id=str(instance_id))
-    for m in media_list:
-        db.add_media(job_id, m)
-
-    # Enqueue if media present
+    # Media batching logic: if images present, accumulate per sender for BATCH_WINDOW_SECONDS
     if media_list:
-        await job_queue.put(job_id)
-        db.update_job_status(job_id, "PENDING")
-        json_log("job_enqueued", job_id=job_id, msg_id=msg_id, sender=sender, medias=len(media_list))
+        async with pending_lock:
+            batch = pending_batches.get(sender)
+            if batch:
+                # Append to existing batch job
+                job_id = batch["job_id"]
+                for m in media_list:
+                    db.add_media(job_id, m)
+                json_log("batch_appended", sender=sender, job_id=job_id, added=len(media_list))
+                result_job_id = job_id
+            else:
+                # Create new job and start timer
+                job_id = db.create_job(sender=sender, msg_id=str(msg_id), payload=payload, instance_id=str(instance_id))
+                for m in media_list:
+                    db.add_media(job_id, m)
+                db.update_job_status(job_id, "NEW")
+                task = asyncio.create_task(_enqueue_batch_later(sender, db))
+                pending_batches[sender] = {"job_id": job_id, "started_at": now.isoformat(), "task": task}
+                json_log("batch_started", sender=sender, job_id=job_id, window_seconds=BATCH_WINDOW_SECONDS, medias=len(media_list))
+                result_job_id = job_id
     else:
+        # Create a job just to track non-media message; complete immediately
+        job_id = db.create_job(sender=sender, msg_id=str(msg_id), payload=payload, instance_id=str(instance_id))
         db.update_job_status(job_id, "COMPLETED")
         json_log("no_media_payload_stored", job_id=job_id)
+        result_job_id = job_id
 
     # Try auto reply (non-blocking)
     asyncio.create_task(maybe_auto_reply(payload, db))
 
-    return JSONResponse({"ok": True, "job_id": job_id})
+    return {"ok": True, "job_id": result_job_id}
+
+
+async def notification_poller():
+    """
+    Polls Green API ReceiveNotification for incoming messages and routes them
+    through the same handler as the /webhook.
+    """
+    db = Database()
+    client = GreenAPIClient.from_env()
+    while True:
+        try:
+            data = await client.receive_notification()
+            if not data:
+                await asyncio.sleep(0.5)
+                continue
+            receipt_id = data.get("receiptId")
+            body = data.get("body") or data
+            res = await handle_incoming_payload(body, db)
+            json_log("receive_notification_handled", **{"ok": res.get("ok", False), "job_id": res.get("job_id")})
+            if receipt_id is not None:
+                try:
+                    await client.delete_notification(int(receipt_id))
+                except Exception as e:
+                    json_log("delete_notification_error", error=str(e), receipt_id=receipt_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            json_log("receive_notification_error", error=str(e))
+            await asyncio.sleep(2.0)
+
+
+@app.post("/webhook")
+async def webhook(request: Request, db: Database = Depends(get_db)):
+    try:
+        payload = await request.json()
+    except Exception:
+        raw = await request.body()
+        return JSONResponse({"ok": False, "error": "invalid_json", "raw": raw.decode("utf-8", "ignore")}, status_code=400)
+
+    res = await handle_incoming_payload(payload, db)
+    status = 200 if res.get("ok") else 400
+    return JSONResponse(res, status_code=status)
 
 
 @app.get("/")

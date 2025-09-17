@@ -25,8 +25,16 @@ class GreenAPIClient:
     def _url(self, path: str) -> str:
         return f"{self.base_url}/waInstance{self.id_instance}/{path}/{self.api_token}"
 
+    def _url_delete_notification_delete(self, receipt_id: int) -> str:
+        # Official: DELETE /waInstance{id}/DeleteNotification/{token}/{receiptId}
+        return f"{self.base_url}/waInstance{self.id_instance}/DeleteNotification/{self.api_token}/{receipt_id}"
+
+    def _url_delete_notification_post(self) -> str:
+        # Official: POST /waInstance{id}/DeleteNotification/{token} with {"receiptId": ...}
+        return f"{self.base_url}/waInstance{self.id_instance}/DeleteNotification/{self.api_token}"
+
     async def upload_file(self, file_path: Path) -> Dict[str, Any]:
-        # Recommended flow: uploadFile -> returns urlFile
+        # Recommended flow: uploadFile -> returns urlFile and sometimes idFile
         url = self._url("uploadFile")
         async with httpx.AsyncClient(timeout=60) as client:
             with file_path.open("rb") as f:
@@ -49,6 +57,23 @@ class GreenAPIClient:
             resp.raise_for_status()
             return resp.json()
 
+    async def send_file_by_id(self, chat_id: str, file_id: str, filename: str, caption: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Alternative to send by URL: some deployments prefer sending by previously uploaded file id.
+        """
+        url = self._url("sendFileById")
+        payload = {
+            "chatId": chat_id,
+            "idMessage": file_id,  # some docs use 'idFile' or 'fileId', Green API expects idMessage for upload id
+            "fileName": filename,
+        }
+        if caption:
+            payload["caption"] = caption
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(url, json=payload)
+            resp.raise_for_status()
+            return resp.json()
+
     async def send_message(self, chat_id: str, message: str) -> Dict[str, Any]:
         """
         Send a text message to a chat.
@@ -59,3 +84,43 @@ class GreenAPIClient:
             resp = await client.post(url, json=payload)
             resp.raise_for_status()
             return resp.json()
+
+    async def receive_notification(self) -> Optional[Dict[str, Any]]:
+        """
+        Polls Green API ReceiveNotification endpoint for the next incoming notification.
+        Returns the JSON or None if there is no notification available.
+        """
+        url = self._url("ReceiveNotification")
+        async with httpx.AsyncClient(timeout=65) as client:
+            # Green API may use long polling; GET with long timeout
+            resp = await client.get(url)
+            if resp.status_code == 200 and resp.content:
+                data = resp.json()
+                # When no notification, API may return null
+                return data
+            if resp.status_code == 204:
+                return None
+            # On unexpected status, raise to caller
+            resp.raise_for_status()
+            return None
+
+    async def delete_notification(self, receipt_id: int) -> None:
+        """
+        Acknowledge and remove a notification so it is not delivered again.
+        Order as per docs:
+          1) DELETE /.../DeleteNotification/{token}/{receiptId}
+          2) POST   /.../DeleteNotification/{token} with JSON {"receiptId": ...}
+        """
+        async with httpx.AsyncClient(timeout=30) as client:
+            # Variant 1: DELETE with token before receiptId
+            url_delete = self._url_delete_notification_delete(receipt_id)
+            resp = await client.delete(url_delete)
+            if resp.status_code in (200, 204):
+                return
+            # Variant 2: POST with JSON body
+            url_post = self._url_delete_notification_post()
+            resp2 = await client.post(url_post, json={"receiptId": receipt_id})
+            if resp2.status_code in (200, 204):
+                return
+            # If both failed, raise last error
+            resp2.raise_for_status()

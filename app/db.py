@@ -60,6 +60,14 @@ class Database:
                 )
                 """
             )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS processed_messages (
+                    msg_id TEXT PRIMARY KEY,
+                    created_at TEXT
+                )
+                """
+            )
             con.commit()
 
     @contextmanager
@@ -152,6 +160,30 @@ class Database:
             )
             con.commit()
 
+    def get_job_logs(self, job_id: int) -> List[Dict[str, Any]]:
+        with self._conn() as con:
+            cur = con.cursor()
+            rows = cur.execute(
+                "SELECT id, job_id, entry_json, created_at FROM job_logs WHERE job_id=? ORDER BY id ASC",
+                (job_id,),
+            ).fetchall()
+            res = []
+            for r in rows:
+                res.append({"id": r[0], "job_id": r[1], "entry": json.loads(r[2]) if r[2] else None, "created_at": r[3]})
+            return res
+
+    def get_recent_logs(self, limit: int = 100) -> List[Dict[str, Any]]:
+        with self._conn() as con:
+            cur = con.cursor()
+            rows = cur.execute(
+                "SELECT id, job_id, entry_json, created_at FROM job_logs ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            res = []
+            for r in rows:
+                res.append({"id": r[0], "job_id": r[1], "entry": json.loads(r[2]) if r[2] else None, "created_at": r[3]})
+            return res
+
     def get_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:
         with self._conn() as con:
             cur = con.cursor()
@@ -164,6 +196,24 @@ class Database:
         with self._conn() as con:
             cur = con.cursor()
             cur.execute("INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+            con.commit()
+
+    # Idempotency helpers -------------------------------------------------
+
+    def has_processed(self, msg_id: str) -> bool:
+        with self._conn() as con:
+            cur = con.cursor()
+            row = cur.execute("SELECT 1 FROM processed_messages WHERE msg_id=?", (msg_id,)).fetchone()
+            return bool(row)
+
+    def mark_processed(self, msg_id: str):
+        from datetime import datetime
+        with self._conn() as con:
+            cur = con.cursor()
+            cur.execute(
+                "INSERT OR IGNORE INTO processed_messages (msg_id, created_at) VALUES (?, ?)",
+                (msg_id, datetime.utcnow().isoformat() + "Z"),
+            )
             con.commit()
 
 
