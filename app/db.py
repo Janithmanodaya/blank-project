@@ -52,6 +52,14 @@ class Database:
                 )
                 """
             )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+                """
+            )
             con.commit()
 
     @contextmanager
@@ -142,6 +150,20 @@ class Database:
                 "INSERT INTO job_logs (job_id, entry_json, created_at) VALUES (?, ?, ?)",
                 (job_id, json.dumps(entry), datetime.utcnow().isoformat() + "Z"),
             )
+            con.commit()
+
+    def get_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        with self._conn() as con:
+            cur = con.cursor()
+            row = cur.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+            if not row:
+                return default
+            return row[0]
+
+    def set_setting(self, key: str, value: str):
+        with self._conn() as con:
+            cur = con.cursor()
+            cur.execute("INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
             con.commit()
 
 

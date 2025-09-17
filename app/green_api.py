@@ -1,4 +1,3 @@
-import base64
 import os
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -42,6 +41,17 @@ class GreenAPIClient:
         }
         if caption:
             payload["caption"] = caption
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(url, json=payload)
+            resp.raise_for_status()
+            return resp.json()
+
+    async def send_message(self, chat_id: str, message: str) -> Dict[str, Any]:
+        """
+        Send a text message to a chat.
+        """
+        url = self._url("sendMessage")
+        payload = {"chatId": chat_id, "message": message}
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(url, json=payload)
             resp.raise_for_status()

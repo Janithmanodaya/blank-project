@@ -2,15 +2,14 @@ import asyncio
 import json
 import logging
 import os
-import signal
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Request, Response
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi import Depends, FastAPI, Request
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from .db import Database, get_db
@@ -19,8 +18,13 @@ from .pdf_packer import PDFComposer, PDFComposeResult
 from .storage import Storage
 from .webui import router as web_router
 
+try:
+    from .gemini import GeminiResponder  # optional; only used if enabled
+except Exception:
+    GeminiResponder = None  # type: ignore
+
 APP_TITLE = "GreenAPI Image→PDF Relay"
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,13 +36,6 @@ logging.basicConfig(
 def json_log(event: str, **kwargs):
     payload = {"ts": datetime.utcnow().isoformat() + "Z", "event": event, **kwargs}
     logging.info(json.dumps(payload))
-
-
-def get_env(name: str, default: Optional[str] = None, required: bool = False) -> str:
-    val = os.getenv(name, default)
-    if required and not val:
-        raise RuntimeError(f"Missing required env var: {name}")
-    return val or ""
 
 
 app = FastAPI(title=APP_TITLE, version=VERSION)
@@ -101,7 +98,7 @@ async def worker_loop(worker_id: int):
                 # Download media
                 media_items = db.get_media_for_job(job_id)
                 downloaded_files = []
-                for idx, m in enumerate(media_items, start=1):
+                for m in media_items:
                     try:
                         file_path = await storage.download_media(http_client, m, job)
                         db.update_media_local_path(m["id"], str(file_path))
@@ -142,6 +139,50 @@ async def worker_loop(worker_id: int):
                     job_queue.task_done()
 
 
+def _extract_text_from_payload(payload: Dict[str, Any]) -> Optional[str]:
+    md = payload.get("messageData") or {}
+    if not md:
+        return None
+    # Green-API text messages carry typeMessage == "textMessage"
+    if md.get("typeMessage") == "textMessage":
+        tmd = md.get("textMessageData") or {}
+        return tmd.get("textMessage") or None
+    # Some media messages may include caption; optionally reply on caption too
+    if "imageMessageData" in md:
+        return md.get("imageMessageData", {}).get("caption")
+    return None
+
+
+async def maybe_auto_reply(payload: Dict[str, Any], db: Database):
+    # settings gate
+    enabled = (db.get_setting("auto_reply_enabled", "0") or "0") == "1"
+    if not enabled:
+        return
+    chat_id = payload.get("senderData", {}).get("chatId")
+    if not chat_id:
+        return
+    text = _extract_text_from_payload(payload)
+    if not text:
+        return
+
+    system_prompt = db.get_setting("auto_reply_system_prompt", "") or os.getenv(
+        "GEMINI_SYSTEM_PROMPT", "You are a concise helpful WhatsApp assistant."
+    )
+
+    if GeminiResponder is None:
+        json_log("auto_reply_error", reason="gemini_module_missing")
+        return
+
+    try:
+        responder = GeminiResponder()
+        reply = responder.generate(text, system_prompt)
+        client = GreenAPIClient.from_env()
+        await client.send_message(chat_id=chat_id, message=reply)
+        json_log("auto_reply_sent", chat_id=chat_id)
+    except Exception as e:
+        json_log("auto_reply_failed", error=str(e))
+
+
 @app.post("/webhook")
 async def webhook(request: Request, db: Database = Depends(get_db)):
     try:
@@ -155,40 +196,28 @@ async def webhook(request: Request, db: Database = Depends(get_db)):
     storage.save_incoming_payload(payload, f"{ts}.json")
 
     # Validate minimal structure (Green-API incomingMessageReceived)
-    # Note: Keep permissive; store what we can.
-    instance_id = payload.get("instanceData", {}).get("idInstance") or os.getenv("GREEN_API_INSTANCE_ID", "")
     webhook_type = payload.get("typeWebhook")
     if not webhook_type:
         json_log("webhook_ignored", reason="missing_typeWebhook")
         return JSONResponse({"ok": True, "ignored": True})
 
     # Extract sender, message id, media list heuristically
-    sender = None
-    msg_id = None
+    instance_id = payload.get("instanceData", {}).get("idInstance") or os.getenv("GREEN_API_INSTANCE_ID", "")
+    sender = payload.get("senderData", {}).get("chatId") or payload.get("senderData", {}).get("sender") or "unknown"
+    msg_id = payload.get("idMessage") or payload.get("messageData", {}).get("idMessage") or payload.get("receiptId") or ts
+    message_data = payload.get("messageData") or {}
+
     media_list: List[Dict[str, Any]] = []
-
     try:
-        sender = payload.get("senderData", {}).get("chatId") or payload.get("senderData", {}).get("sender") or ""
-        msg_id = payload.get("idMessage") or payload.get("messageData", {}).get("idMessage") or payload.get("receiptId")
-        message_data = payload.get("messageData") or {}
-
-        # For image messages, Green-API provides "typeMessage": "imageMessage" etc.
         type_message = message_data.get("typeMessage")
         if type_message in {"imageMessage", "videoMessage", "documentMessage"}:
-            # Green-API often includes "downloadUrl" or "fileMessageData"
             img = message_data.get("imageMessageData") or message_data.get("fileMessageData") or message_data.get("documentMessageData") or {}
             if img:
                 media_list.append(img)
-        # Also handle list of medias if exists
         if "medias" in message_data and isinstance(message_data["medias"], list):
             media_list.extend(message_data["medias"])
     except Exception:
         pass
-
-    if not sender:
-        sender = "unknown"
-    if not msg_id:
-        msg_id = ts
 
     # Create job
     job_id = db.create_job(sender=sender, msg_id=str(msg_id), payload=payload, instance_id=str(instance_id))
@@ -203,6 +232,9 @@ async def webhook(request: Request, db: Database = Depends(get_db)):
     else:
         db.update_job_status(job_id, "COMPLETED")
         json_log("no_media_payload_stored", job_id=job_id)
+
+    # Try auto reply (non-blocking)
+    asyncio.create_task(maybe_auto_reply(payload, db))
 
     return JSONResponse({"ok": True, "job_id": job_id})
 
