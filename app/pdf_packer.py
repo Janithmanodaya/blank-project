@@ -34,6 +34,9 @@ class PDFComposer:
         self.A4_W = int(8.27 * dpi)  # ~2480
         self.A4_H = int(11.69 * dpi)  # ~3508
 
+    def _mm_to_px(self, mm: float) -> int:
+        return int(round(mm / 25.4 * self.dpi))
+
     def _classify(self, w: int, h: int) -> str:
         a4w, a4h = self.A4_W, self.A4_H
         def meets(pct: float) -> bool:
@@ -75,12 +78,12 @@ class PDFComposer:
 
         i = 0
         while i < len(infos):
-            cells, used = self._pack_page(infos[i:], margin)
+            cells, used, allow_upscale = self._pack_page(infos[i:], margin)
             # draw page with cells
             page_meta = {"items": []}
             for info, (x, y, w, h) in cells:
-                # scale to fit cell, preserve aspect, no upscale
-                scale = min(w / info.width, h / info.height, 1.0)
+                # scale to fit cell, preserve aspect
+                scale = min(w / info.width, h / info.height) if allow_upscale else min(w / info.width, h / info.height, 1.0)
                 rw, rh = int(info.width * scale), int(info.height * scale)
                 # center within cell
                 ox = x + (w - rw) // 2
@@ -92,6 +95,10 @@ class PDFComposer:
                     "placed": [ox, oy, rw, rh],
                     "cls": info.cls,
                 })
+            # draw 0.5 cm border around the A4 page
+            border_inset = self._mm_to_px(5.0)
+            c.setLineWidth(1)
+            c.rect(border_inset, border_inset, self.A4_W - 2 * border_inset, self.A4_H - 2 * border_inset, stroke=1, fill=0)
             packing_decisions.append(page_meta)
             c.showPage()
             i += used
@@ -147,25 +154,52 @@ class PDFComposer:
         # fallback single
         return [(first, (x0, y0, W, H))]
 
-    def _pack_page(self, remaining: List[ImageInfo], margin: int) -> Tuple[List[Tuple[ImageInfo, Tuple[int,int,int,int]]], int]:
+    def _pack_page(self, remaining: List[ImageInfo], margin: int) -> Tuple[List[Tuple[ImageInfo, Tuple[int,int,int,int]]], int, bool]:
         """
         Choose how many images to place on the current page to maximize filled area.
-        Returns (cells, used_count).
-        Strategy:
-        - Try layouts with 1, 2, 3, 4 slots (full page, 1x2 or 2x1, 2x2).
-        - For each layout, simulate placing next N images and compute used area based on aspect-fit.
-        - Pick the layout with highest filled ratio. Avoid upscaling.
+        Returns (cells, used_count, allow_upscale).
+        Also includes special-case: if next images are all below half-A4 (A5) size,
+        put 8 images on the page (4x2 grid) and allow upscaling to fill page.
         """
         W, H = self.A4_W - 2 * margin, self.A4_H - 2 * margin
         x0, y0 = margin, margin
 
+        # Check special 8-up rule: if all of the next up to 8 images are below half A4
+        def is_below_half(info: ImageInfo) -> bool:
+            return info.width < self.A4_W/2 and info.height < self.A4_H/2
+
+        up_to_8 = remaining[:min(8, len(remaining))]
+        if up_to_8 and all(is_below_half(img) for img in up_to_8):
+            # layout 4 columns x 2 rows with 0.5 cm gaps between images
+            gap = self._mm_to_px(5.0)
+            cols, rows = 4, 2
+            total_gap_w = gap * (cols - 1)
+            total_gap_h = gap * (rows - 1)
+            cell_w = (W - total_gap_w) // cols
+            cell_h = (H - total_gap_h) // rows
+            cells = []
+            k = 0
+            for r in range(rows):
+                for c in range(cols):
+                    if k >= len(up_to_8):
+                        break
+                    sx = x0 + c * (cell_w + gap)
+                    sy = y0 + (rows - 1 - r) * (cell_h + gap)
+                    cells.append((remaining[k], (sx, sy, cell_w, cell_h)))
+                    k += 1
+            return cells, k, True  # allow upscaling to fill
+
         def simulate(layout: str, k: int):
             if layout == "1":
                 slots = [(x0, y0, W, H)]
-            elif layout == "2v":  # two vertical stacked
-                slots = [(x0, y0 + H//2, W, H//2), (x0, y0, W, H//2)]
-            elif layout == "2h":  # two side by side
-                slots = [(x0, y0, W//2, H), (x0 + W//2, y0, W//2, H)]
+            elif layout == "2v":  # two vertical stacked with 0.5cm gap
+                gap = self._mm_to_px(5.0)
+                half_h = (H - gap) // 2
+                slots = [(x0, y0 + half_h + gap, W, half_h), (x0, y0, W, half_h)]
+            elif layout == "2h":  # two side by side with 0.5cm gap
+                gap = self._mm_to_px(5.0)
+                half_w = (W - gap) // 2
+                slots = [(x0, y0, half_w, H), (x0 + half_w + gap, y0, half_w, H)]
             elif layout == "2x2":
                 slots = [
                     (x0, y0 + H//2, W//2, H//2),
@@ -211,5 +245,5 @@ class PDFComposer:
         candidates.sort(key=lambda x: (x[0], x[2]), reverse=True)
         best_ratio, best_items, used = candidates[0]
 
-        # Convert slots to cells with full slot sizes; actual draw scales inside preserve AR
-        return best_items, used
+        # Default: no upscaling unless 8-up special case
+        return best_items, used, False
