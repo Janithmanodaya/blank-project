@@ -25,6 +25,14 @@ class GreenAPIClient:
     def _url(self, path: str) -> str:
         return f"{self.base_url}/waInstance{self.id_instance}/{path}/{self.api_token}"
 
+    def _url_delete_notification_delete(self, receipt_id: int) -> str:
+        # Official: DELETE /waInstance{id}/DeleteNotification/{token}/{receiptId}
+        return f"{self.base_url}/waInstance{self.id_instance}/DeleteNotification/{self.api_token}/{receipt_id}"
+
+    def _url_delete_notification_post(self) -> str:
+        # Official: POST /waInstance{id}/DeleteNotification/{token} with {"receiptId": ...}
+        return f"{self.base_url}/waInstance{self.id_instance}/DeleteNotification/{self.api_token}"
+
     async def upload_file(self, file_path: Path) -> Dict[str, Any]:
         # Recommended flow: uploadFile -> returns urlFile
         url = self._url("uploadFile")
@@ -82,24 +90,20 @@ class GreenAPIClient:
     async def delete_notification(self, receipt_id: int) -> None:
         """
         Acknowledge and remove a notification so it is not delivered again.
-        There are two API variants observed:
-          1) DELETE /DeleteNotification/{receiptId}/{token}
-          2) POST   /DeleteNotification/{token} with JSON {"receiptId": ...}
-        We'll try DELETE first, then fall back to POST on auth/method errors.
+        Order as per docs:
+          1) DELETE /.../DeleteNotification/{token}/{receiptId}
+          2) POST   /.../DeleteNotification/{token} with JSON {"receiptId": ...}
         """
         async with httpx.AsyncClient(timeout=30) as client:
-            # Variant 1: DELETE with receipt id in path
-            url_delete = self._url(f"DeleteNotification/{receipt_id}")
+            # Variant 1: DELETE with token before receiptId
+            url_delete = self._url_delete_notification_delete(receipt_id)
             resp = await client.delete(url_delete)
             if resp.status_code in (200, 204):
                 return
-            # Fallback on common failures
-            if resp.status_code in (400, 401, 404, 405):
-                # Variant 2: POST with JSON body
-                url_post = self._url("DeleteNotification")
-                resp2 = await client.post(url_post, json={"receiptId": receipt_id})
-                if resp2.status_code in (200, 204):
-                    return
-                resp2.raise_for_status()
-            # If other status, raise
-            resp.raise_for_status()
+            # Variant 2: POST with JSON body
+            url_post = self._url_delete_notification_post()
+            resp2 = await client.post(url_post, json={"receiptId": receipt_id})
+            if resp2.status_code in (200, 204):
+                return
+            # If both failed, raise last error
+            resp2.raise_for_status()
