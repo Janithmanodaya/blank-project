@@ -24,7 +24,7 @@ except Exception:
     GeminiResponder = None  # type: ignore
 
 APP_TITLE = "GreenAPI Image→PDF Relay"
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -66,6 +66,9 @@ async def on_startup():
     worker_count = int(os.getenv("WORKERS", "2"))
     for i in range(worker_count):
         workers.append(asyncio.create_task(worker_loop(i)))
+
+    # Launch Green API notification poller (for setups without webhooks)
+    workers.append(asyncio.create_task(notification_poller()))
 
     # Attach web router after components are ready (import here to avoid circular import)
     from .webui import router as web_router  # local import
@@ -182,14 +185,7 @@ async def maybe_auto_reply(payload: Dict[str, Any], db: Database):
         json_log("auto_reply_failed", error=str(e))
 
 
-@app.post("/webhook")
-async def webhook(request: Request, db: Database = Depends(get_db)):
-    try:
-        payload = await request.json()
-    except Exception:
-        raw = await request.body()
-        return JSONResponse({"ok": False, "error": "invalid_json", "raw": raw.decode("utf-8", "ignore")}, status_code=400)
-
+async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict[str, Any]:
     # Persist raw payload
     ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
     storage.save_incoming_payload(payload, f"{ts}.json")
@@ -198,7 +194,7 @@ async def webhook(request: Request, db: Database = Depends(get_db)):
     webhook_type = payload.get("typeWebhook")
     if not webhook_type:
         json_log("webhook_ignored", reason="missing_typeWebhook")
-        return JSONResponse({"ok": True, "ignored": True})
+        return {"ok": True, "ignored": True}
 
     # Extract sender, message id, media list heuristically
     instance_id = payload.get("instanceData", {}).get("idInstance") or os.getenv("GREEN_API_INSTANCE_ID", "")
@@ -235,7 +231,49 @@ async def webhook(request: Request, db: Database = Depends(get_db)):
     # Try auto reply (non-blocking)
     asyncio.create_task(maybe_auto_reply(payload, db))
 
-    return JSONResponse({"ok": True, "job_id": job_id})
+    return {"ok": True, "job_id": job_id}
+
+
+async def notification_poller():
+    """
+    Polls Green API ReceiveNotification for incoming messages and routes them
+    through the same handler as the /webhook.
+    """
+    db = Database()
+    client = GreenAPIClient.from_env()
+    while True:
+        try:
+            data = await client.receive_notification()
+            if not data:
+                await asyncio.sleep(0.5)
+                continue
+            receipt_id = data.get("receiptId")
+            body = data.get("body") or data
+            res = await handle_incoming_payload(body, db)
+            json_log("receive_notification_handled", **{"ok": res.get("ok", False), "job_id": res.get("job_id")})
+            if receipt_id is not None:
+                try:
+                    await client.delete_notification(int(receipt_id))
+                except Exception as e:
+                    json_log("delete_notification_error", error=str(e), receipt_id=receipt_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            json_log("receive_notification_error", error=str(e))
+            await asyncio.sleep(2.0)
+
+
+@app.post("/webhook")
+async def webhook(request: Request, db: Database = Depends(get_db)):
+    try:
+        payload = await request.json()
+    except Exception:
+        raw = await request.body()
+        return JSONResponse({"ok": False, "error": "invalid_json", "raw": raw.decode("utf-8", "ignore")}, status_code=400)
+
+    res = await handle_incoming_payload(payload, db)
+    status = 200 if res.get("ok") else 400
+    return JSONResponse(res, status_code=status)
 
 
 @app.get("/")
