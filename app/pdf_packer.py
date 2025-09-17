@@ -69,10 +69,23 @@ class PDFComposer:
         return "small"
 
     def _load_infos(self, files: List[Path]) -> List[ImageInfo]:
+        """
+        Load image metadata, skipping non-image files gracefully (e.g., PDFs or corrupt files).
+        """
         infos: List[ImageInfo] = []
         for p in files:
-            with Image.open(p) as im:
-                w, h = im.size
+            try:
+                # Quick extension filter to avoid obvious non-images
+                if p.suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff", ".bmp"}:
+                    # Try to open anyway in case extension is misleading
+                    with Image.open(p) as im:
+                        w, h = im.size
+                else:
+                    with Image.open(p) as im:
+                        w, h = im.size
+            except Exception:
+                # Skip files PIL cannot identify (e.g., PDFs or text)
+                continue
             infos.append(ImageInfo(path=p, width=w, height=h, area=w*h, cls=self._classify(w, h)))
         # deterministic: sort by area desc then name
         infos.sort(key=lambda x: (-x.area, str(x.path)))
@@ -122,12 +135,26 @@ class PDFComposer:
 
     def _is_larger_than_a5(self, w: int, h: int) -> bool:
         """
-        Return True if the image should be considered larger than A5:
-        max_dim >= A5_long * LARGER_MIN_LONG and min_dim >= A5_short * LARGER_MIN_SHORT
+        Return True if the image should be considered larger than A5.
+        Strategy:
+        - Primary: both dimensions are at least (1 - 5%) of A5's corresponding dimensions.
+        - Fallback: area is at least (1 + 10%) of A5 area (even if one dimension is a bit short).
         """
         img_short, img_long = sorted((w, h))
         a5_short, a5_long = self._a5_dims()
-        return (img_long >= a5_long * LARGER_MIN_LONG) and (img_short >= a5_short * LARGER_MIN_SHORT)
+
+        # Primary dimensional check with small margin (5%)
+        small_margin = 0.05
+        if (img_short >= a5_short * (1 - small_margin)) and (img_long >= a5_long * (1 - small_margin)):
+            return True
+
+        # Fallback by area
+        img_area = img_short * img_long
+        a5_area = a5_short * a5_long
+        if a5_area > 0 and (img_area >= a5_area * 1.10):
+            return True
+
+        return False
 
     def _pack_page_a5(self, remaining: List[ImageInfo], margin: int) -> Tuple[List[Tuple[ImageInfo, Tuple[int,int,int,int]]], int, bool, List[int]]:
         """
