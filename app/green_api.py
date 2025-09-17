@@ -4,6 +4,8 @@ from typing import Any, Dict, Optional
 
 import httpx
 
+from .db import Database
+
 
 class GreenAPIClient:
     def __init__(self, base_url: str, id_instance: str, api_token: str):
@@ -13,11 +15,12 @@ class GreenAPIClient:
 
     @classmethod
     def from_env(cls) -> "GreenAPIClient":
-        return cls(
-            base_url=os.getenv("GREEN_API_BASE_URL", "https://api.green-api.com"),
-            id_instance=os.getenv("GREEN_API_INSTANCE_ID", ""),
-            api_token=os.getenv("GREEN_API_API_TOKEN", ""),
-        )
+        # Prefer DB settings if available, fall back to environment variables
+        db = Database()
+        base_url = db.get_setting("GREEN_API_BASE_URL", None) or os.getenv("GREEN_API_BASE_URL", "https://api.green-api.com")
+        id_instance = db.get_setting("GREEN_API_INSTANCE_ID", None) or os.getenv("GREEN_API_INSTANCE_ID", "")
+        api_token = db.get_setting("GREEN_API_API_TOKEN", None) or os.getenv("GREEN_API_API_TOKEN", "")
+        return cls(base_url=base_url, id_instance=id_instance, api_token=api_token)
 
     def _url(self, path: str) -> str:
         return f"{self.base_url}/waInstance{self.id_instance}/{path}/{self.api_token}"

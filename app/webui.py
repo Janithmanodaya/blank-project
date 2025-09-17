@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Form
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, RedirectResponse
 
 from .db import Database, get_db
@@ -13,8 +13,12 @@ router = APIRouter()
 storage = Storage()
 
 
-def check_auth(token: Optional[str]):
-    expected = os.getenv("ADMIN_PASSWORD")
+def check_auth(token: Optional[str], db: Optional[Database] = None):
+    expected = None
+    if db:
+        expected = db.get_setting("ADMIN_PASSWORD", None)
+    if not expected:
+        expected = os.getenv("ADMIN_PASSWORD")
     if expected and token != expected:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -88,13 +92,15 @@ def html_page(body: str) -> HTMLResponse:
       th, td {{ border-bottom: 1px solid rgba(255,255,255,0.08); padding: 10px; font-size: 14px; }}
       th {{ text-align: left; color: #cfd3e4; }}
       .row {{ margin-bottom: 10px; }}
-      input[type="text"], textarea {{
+      input[type="text"], input[type="password"], textarea {{
         width: 100%; padding: 10px; border-radius: 10px;
         border: 1px solid rgba(255,255,255,0.12); background: #0e1020; color: #fff;
       }}
       textarea {{ min-height: 100px; resize: vertical; }}
       form .actions {{ margin-top: 10px; display: flex; gap: 10px; }}
       .hint {{ font-size: 12px; color: var(--muted); margin-top: 4px; }}
+      .grid-2 {{ display:grid; gap:12px; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }}
+      label {{ display:block; margin: 8px 0 6px; font-size: 13px; color:#cfd3e4; }}
     </style>
   </head>
   <body>
@@ -116,7 +122,7 @@ def html_page(body: str) -> HTMLResponse:
 
 @router.get("/ui")
 def ui(db: Database = Depends(get_db), token: Optional[str] = Query(default=None)):
-    check_auth(token)
+    check_auth(token, db)
     # lists
     with db._conn() as con:
         cur = con.cursor()
@@ -141,19 +147,72 @@ def ui(db: Database = Depends(get_db), token: Optional[str] = Query(default=None
     auto_enabled = (db.get_setting("auto_reply_enabled", "0") or "0") == "1"
     sys_prompt = db.get_setting("auto_reply_system_prompt", "") or ""
 
+    # current settings display helpers
+    def status_badge(val: Optional[str]) -> str:
+        return "<span class='badge ok'>Set</span>" if (val and len(val) > 0) else "<span class='badge'>Not set</span>"
+
+    gemini_set = status_badge(db.get_setting("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY")))
+    green_base = db.get_setting("GREEN_API_BASE_URL", os.getenv("GREEN_API_BASE_URL", "https://api.green-api.com")) or ""
+    green_id = db.get_setting("GREEN_API_INSTANCE_ID", os.getenv("GREEN_API_INSTANCE_ID", "")) or ""
+    green_token_set = status_badge(db.get_setting("GREEN_API_API_TOKEN", os.getenv("GREEN_API_API_TOKEN")))
+    admin_chat_id = db.get_setting("ADMIN_CHAT_ID", os.getenv("ADMIN_CHAT_ID", "")) or ""
+    workers_val = db.get_setting("WORKERS", os.getenv("WORKERS", "2")) or "2"
+    admin_pw_set = status_badge(db.get_setting("ADMIN_PASSWORD", os.getenv("ADMIN_PASSWORD")))
+
     settings_html = f"""
     <div class="card">
-      <h3>AI Auto Reply (Gemini)</h3>
-      <p class="muted">Automatically reply to incoming text messages using Google Gemini. Requires GEMINI_API_KEY in environment.</p>
-      <div class="row">
-        Status:
-        {"<span class='badge ok'>Enabled</span>" if auto_enabled else "<span class='badge'>Disabled</span>"}
-        <a class="button" href="/ui/auto-reply/toggle?token={token}">{'Disable' if auto_enabled else 'Enable'}</a>
-      </div>
+      <h3>Settings</h3>
       <form action="/ui/settings?token={token}" method="post">
-        <label for="system_prompt">System Prompt</label>
+        <label for="system_prompt">AI System Prompt</label>
         <textarea id="system_prompt" name="system_prompt" placeholder="You are a concise helpful WhatsApp assistant.">{sys_prompt}</textarea>
-        <div class="hint">Set the assistant behavior. Leave blank for a default helpful style.</div>
+        <div class="hint">Assistant behavior for auto replies.</div>
+
+        <div class="grid-2">
+          <div>
+            <label for="GEMINI_API_KEY">Gemini API Key {gemini_set}</label>
+            <input type="password" id="GEMINI_API_KEY" name="GEMINI_API_KEY" placeholder="Paste Gemini API key"/>
+            <div class="hint">Leave blank to keep current.</div>
+          </div>
+
+          <div>
+            <label for="ADMIN_PASSWORD">Admin Password {admin_pw_set}</label>
+            <input type="password" id="ADMIN_PASSWORD" name="ADMIN_PASSWORD" placeholder="Set UI password"/>
+            <div class="hint">Used for accessing this page (?token=...). Leave blank to keep current.</div>
+          </div>
+
+          <div>
+            <label for="GREEN_API_BASE_URL">Green API Base URL</label>
+            <input type="text" id="GREEN_API_BASE_URL" name="GREEN_API_BASE_URL" value="{green_base}" placeholder="https://api.green-api.com"/>
+          </div>
+
+          <div>
+            <label for="GREEN_API_INSTANCE_ID">Green API Instance ID</label>
+            <input type="text" id="GREEN_API_INSTANCE_ID" name="GREEN_API_INSTANCE_ID" value="{green_id}" placeholder="e.g., 110100"/>
+          </div>
+
+          <div>
+            <label for="GREEN_API_API_TOKEN">Green API Token {green_token_set}</label>
+            <input type="password" id="GREEN_API_API_TOKEN" name="GREEN_API_API_TOKEN" placeholder="Paste Green-API token"/>
+            <div class="hint">Leave blank to keep current.</div>
+          </div>
+
+          <div>
+            <label for="ADMIN_CHAT_ID">Admin Chat ID</label>
+            <input type="text" id="ADMIN_CHAT_ID" name="ADMIN_CHAT_ID" value="{admin_chat_id}" placeholder="1234567890@c.us"/>
+          </div>
+
+          <div>
+            <label for="WORKERS">Workers</label>
+            <input type="text" id="WORKERS" name="WORKERS" value="{workers_val}" placeholder="2"/>
+          </div>
+        </div>
+
+        <div class="row" style="margin-top:10px;">
+          Status:
+          {"<span class='badge ok'>Auto Reply Enabled</span>" if auto_enabled else "<span class='badge'>Auto Reply Disabled</span>"}
+          <a class="button" href="/ui/auto-reply/toggle?token={token}">{'Disable' if auto_enabled else 'Enable'}</a>
+        </div>
+
         <div class="actions">
           <button class="button" type="submit">Save Settings</button>
         </div>
@@ -183,8 +242,8 @@ def ui(db: Database = Depends(get_db), token: Optional[str] = Query(default=None
 
 
 @router.get("/ui/file/pdf/{name}")
-def get_pdf(name: str, token: Optional[str] = Query(default=None)):
-    check_auth(token)
+def get_pdf(name: str, db: Database = Depends(get_db), token: Optional[str] = Query(default=None)):
+    check_auth(token, db)
     p = storage.base / "pdf" / name
     if not p.exists():
         raise HTTPException(404)
@@ -193,7 +252,7 @@ def get_pdf(name: str, token: Optional[str] = Query(default=None)):
 
 @router.get("/ui/resend/{job_id}")
 async def resend(job_id: int, db: Database = Depends(get_db), token: Optional[str] = Query(default=None)):
-    check_auth(token)
+    check_auth(token, db)
     job = db.get_job(job_id)
     if not job:
         raise HTTPException(404, "job not found")
@@ -204,7 +263,7 @@ async def resend(job_id: int, db: Database = Depends(get_db), token: Optional[st
 
 @router.get("/ui/auto-reply/toggle")
 def toggle_auto_reply(db: Database = Depends(get_db), token: Optional[str] = Query(default=None)):
-    check_auth(token)
+    check_auth(token, db)
     cur = db.get_setting("auto_reply_enabled", "0") or "0"
     new_val = "0" if cur == "1" else "1"
     db.set_setting("auto_reply_enabled", new_val)
@@ -213,8 +272,33 @@ def toggle_auto_reply(db: Database = Depends(get_db), token: Optional[str] = Que
 
 @router.post("/ui/settings")
 async def save_settings(request: Request, db: Database = Depends(get_db), token: Optional[str] = Query(default=None)):
-    check_auth(token)
+    check_auth(token, db)
     form = await request.form()
-    system_prompt = (form.get("system_prompt") or "").strip()
-    db.set_setting("auto_reply_system_prompt", system_prompt)
+
+    # Text settings
+    sp = (form.get("system_prompt") or "").strip()
+    if sp != "":
+        db.set_setting("auto_reply_system_prompt", sp)
+
+    # Optional secrets/texts: only set if provided (non-empty) to avoid erasing existing
+    for key in [
+        "GEMINI_API_KEY",
+        "GREEN_API_API_TOKEN",
+        "ADMIN_PASSWORD",
+    ]:
+        val = (form.get(key) or "").strip()
+        if val:
+            db.set_setting(key, val)
+
+    # Non-secret values (allow update even empty to explicit clear? keep current behavior: update if provided)
+    for key in [
+        "GREEN_API_BASE_URL",
+        "GREEN_API_INSTANCE_ID",
+        "ADMIN_CHAT_ID",
+        "WORKERS",
+    ]:
+        val = form.get(key)
+        if val is not None:
+            db.set_setting(key, (val or "").strip())
+
     return RedirectResponse(url=f"/ui?token={token}", status_code=302)
