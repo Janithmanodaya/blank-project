@@ -31,9 +31,13 @@ class PDFComposer:
         self.dpi = dpi
         self.margin_mm = margin_mm
 
-        # A4 at 300 DPI
+        # A4 at 300 DPI (inches: 8.27 x 11.69)
         self.A4_W = int(8.27 * dpi)  # ~2480
         self.A4_H = int(11.69 * dpi)  # ~3508
+
+        # A5 size in pixels at given DPI (148 x 210 mm)
+        self.A5_W = self._mm_to_px(148.0)
+        self.A5_H = self._mm_to_px(210.0)
 
     def _mm_to_px(self, mm: float) -> int:
         return int(round(mm / 25.4 * self.dpi))
@@ -65,6 +69,65 @@ class PDFComposer:
         margin_from_mm = int(round(self.margin_mm / 25.4 * self.dpi))
         margin_from_pct = int(round(0.03 * self.A4_W))
         return min(max(margin_from_mm, 0), max(margin_from_pct, 0)) or margin_from_mm
+
+    # --- A5-specific logic ---
+    def _a5_dims(self) -> Tuple[int, int]:
+        """Return (short_side_px, long_side_px) for A5 at current DPI."""
+        short = min(self.A5_W, self.A5_H)
+        long = max(self.A5_W, self.A5_H)
+        return short, long
+
+    def _is_a5_roughly(self, w: int, h: int, tol: float = 0.15) -> bool:
+        """
+        Return True if the image dimensions are roughly equal to A5.
+        Compares short and long sides independently with a tolerance (default ±15%).
+        """
+        img_short, img_long = sorted((w, h))
+        a5_short, a5_long = self._a5_dims()
+        return (
+            (1 - tol) * a5_short <= img_short <= (1 + tol) * a5_short and
+            (1 - tol) * a5_long  <= img_long  <= (1 + tol) * a5_long
+        )
+
+    def _is_larger_than_a5(self, w: int, h: int, tol: float = 0.15) -> bool:
+        """
+        Return True if the image is clearly larger than A5 (beyond tolerance).
+        """
+        img_short, img_long = sorted((w, h))
+        a5_short, a5_long = self._a5_dims()
+        return img_short > (1 + tol) * a5_short or img_long > (1 + tol) * a5_long
+
+    def _pack_page_a5(self, remaining: List[ImageInfo], margin: int) -> Tuple[List[Tuple[ImageInfo, Tuple[int,int,int,int]]], int, bool]:
+        """
+        Implement the requested A5 logic:
+        - If first image is larger than A5 -> put it as a single full-page image.
+        - If first two images are both roughly A5 -> place them side-by-side on one page.
+        Returns (cells, used_count, allow_upscale).
+        """
+        if not remaining:
+            return [], 0, False
+
+        page_w = self.A4_W - 2 * margin
+        page_h = self.A4_H - 2 * margin
+        x0, y0 = margin, margin
+
+        first = remaining[0]
+        if self._is_larger_than_a5(first.width, first.height):
+            # Single full page cell
+            return [(first, (x0, y0, page_w, page_h))], 1, False
+
+        # try side-by-side if two roughly A5 images exist
+        if len(remaining) >= 2 and self._is_a5_roughly(first.width, first.height):
+            second = remaining[1]
+            if self._is_a5_roughly(second.width, second.height):
+                gutter = max(self._mm_to_px(5.0), 8)  # small gap between halves
+                cell_w = (page_w - gutter) // 2
+                left_cell = (x0, y0, cell_w, page_h)
+                right_cell = (x0 + cell_w + gutter, y0, cell_w, page_h)
+                return [(first, left_cell), (second, right_cell)], 2, False
+
+        # no special packing
+        return [], 0, False
 
     def compose(self, job: Dict, image_files: List[Path]) -> PDFComposeResult:
         if not image_files:
