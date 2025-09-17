@@ -19,6 +19,9 @@ TOL_AR = 0.10    # 10% aspect ratio tolerance for "roughly A5"
 # Consider "larger than A5" if long side >= 100% and short side >= 65% of A5 at comparison DPI
 LARGER_MIN_SHORT = 0.65
 LARGER_MIN_LONG = 1.00
+# Treat as A5-like if it's a reasonably scaled version (e.g., phone-resized scans)
+A5_SCALE_MIN = 0.60
+A5_SCALE_MAX = 1.15
 PAIR_SEARCH_N = 50       # Search window for finding a second A5-like image
 GUTTER_MM = 5.0          # Gap between side-by-side A5 cells
 
@@ -59,7 +62,11 @@ class PDFComposer:
         # logger
         self._log = logging.getLogger(__name__).info
         try:
-            self._log(f"pdf_packer init: dpi={self.dpi} A4_px=({self.A4_W}x{self.A4_H}) A5_px=({self.A5_W}x{self.A5_H})")
+            a5c_s, a5c_l = self._a5_dims(use_compare_dpi=True)
+            self._log(
+                f"pdf_packer init: dpi={self.dpi} A4_px=({self.A4_W}x{self.A4_H}) "
+                f"A5_px=({self.A5_W}x{self.A5_H}) A5_cmp_dpi={A5_COMPARE_DPI} A5_cmp_px=({a5c_s}x{a5c_l})"
+            )
         except Exception:
             pass
 
@@ -129,7 +136,10 @@ class PDFComposer:
     def _is_a5_roughly(self, w: int, h: int, tol: float = TOL_DIM) -> bool:
         """
         Return True if the image dimensions are roughly equal to A5.
-        Accept either per-dimension match within tol, or (area within TOL_AREA and aspect ratio within TOL_AR).
+        Accept one of:
+          - per-dimension match within tol, OR
+          - (area within TOL_AREA and aspect ratio within TOL_AR), OR
+          - uniform scale of A5 within [A5_SCALE_MIN, A5_SCALE_MAX] on both sides.
         Orientation is normalized by sorting sides. Uses a more permissive comparison DPI for robustness.
         """
         img_short, img_long = sorted((w, h))
@@ -141,8 +151,13 @@ class PDFComposer:
             (1 - tol) * a5_short <= img_short <= (1 + tol) * a5_short and
             (1 - tol) * a5_long  <= img_long  <= (1 + tol) * a5_long
         )
-
         if dim_ok:
+            return True
+
+        # Uniform scale check (both sides scaled by roughly the same factor)
+        rs = img_short / max(a5_short, 1)
+        rl = img_long / max(a5_long, 1)
+        if (A5_SCALE_MIN <= rs <= A5_SCALE_MAX) and (A5_SCALE_MIN <= rl <= A5_SCALE_MAX) and (abs(rs - rl) <= 0.12):
             return True
 
         # Fallback by area + aspect
