@@ -16,9 +16,10 @@ from .storage import Storage
 TOL_DIM = 0.18   # 18% per-dimension tolerance for "roughly A5"
 TOL_AREA = 0.30  # 30% area tolerance for "roughly A5"
 TOL_AR = 0.10    # 10% aspect ratio tolerance for "roughly A5"
-# Consider "larger than A5" if long side >= 100% and short side >= 65% of A5 at comparison DPI
-LARGER_MIN_SHORT = 0.65
-LARGER_MIN_LONG = 1.00
+# Consider "larger than A5" only when it's clearly bigger (not small changes):
+# long side >= 110% and short side >= 90% of A5 at comparison DPI
+LARGER_MIN_SHORT = 0.90
+LARGER_MIN_LONG = 1.10
 # Treat as A5-like if it's a reasonably scaled version (e.g., phone-resized scans)
 A5_SCALE_MIN = 0.60
 A5_SCALE_MAX = 1.15
@@ -110,10 +111,19 @@ class PDFComposer:
                         w, h = im.size
             except Exception:
                 # Skip files PIL cannot identify (e.g., PDFs or text)
+                try:
+                    self._log(f"[LOAD] Skipping non-image or unreadable file: {p}")
+                except Exception:
+                    pass
                 continue
             infos.append(ImageInfo(path=p, width=w, height=h, area=w*h, cls=self._classify(w, h)))
         # deterministic: sort by area desc then name
         infos.sort(key=lambda x: (-x.area, str(x.path)))
+        try:
+            sizes = ", ".join(f"{i.width}x{i.height}" for i in infos)
+            self._log(f"[LOAD] Loaded {len(infos)} images (sorted): {sizes}")
+        except Exception:
+            pass
         return infos
 
     def _margin_px(self) -> int:
@@ -196,34 +206,35 @@ class PDFComposer:
 
         return False
 
-    def _pack_page_a5(self, remaining: List[ImageInfo], margin: int) -> Tuple[List[Tuple[ImageInfo, Tuple[int,int,int,int]]], int, bool, List[int]]:
+    def _pack_page_a5(self, remaining: List[ImageInfo], margin: int) -> Tuple[List[Tuple[ImageInfo, Tuple[int,int,int,int]]], int, bool, List[int], bool]:
         """
         Implement the requested A5 logic:
-        - If first image is larger than A5 -> put it as a single full-page image.
-        - Else, search the first PAIR_SEARCH_N items for a pair of roughly-A5 images and place them side-by-side.
-        Returns (cells, used_count, allow_upscale, used_indices_relative_to_remaining).
+        - If first image is larger than A5 -> put it as a single full-page image (portrait).
+        - Else, search the first PAIR_SEARCH_N items for a pair of roughly-A5 images and place them side-by-side on LANDSCAPE A4.
+        Returns (cells, used_count, allow_upscale, used_indices_relative_to_remaining, landscape_page).
         """
         if not remaining:
-            return [], 0, False, []
+            return [], 0, False, [], False
 
-        page_w = self.A4_W - 2 * margin
-        page_h = self.A4_H - 2 * margin
+        # Default assume portrait page for single full image
+        page_w_portrait = self.A4_W - 2 * margin
+        page_h_portrait = self.A4_H - 2 * margin
         x0, y0 = margin, margin
 
         first = remaining[0]
         a5_short, a5_long = self._a5_dims()
         try:
-            self._log(f"[A5] page_w={page_w} page_h={page_h} a5_px=({a5_short}x{a5_long}) first=({first.width}x{first.height})")
+            self._log(f"[A5] page_w={page_w_portrait} page_h={page_h_portrait} a5_px=({a5_short}x{a5_long}) first=({first.width}x{first.height})")
         except Exception:
             pass
 
         if self._is_larger_than_a5(first.width, first.height):
             try:
-                self._log(f"[A5] first image considered larger-than-A5 -> full page")
+                self._log(f"[A5] first image considered larger-than-A5 -> full page (portrait)")
             except Exception:
                 pass
-            # Single full page cell
-            return [(first, (x0, y0, page_w, page_h))], 1, False, [0]
+            # Single full page cell on portrait
+            return [(first, (x0, y0, page_w_portrait, page_h_portrait))], 1, False, [0], False
 
         # Find two A5-like images within a window
         window_n = min(PAIR_SEARCH_N, len(remaining))
@@ -238,25 +249,28 @@ class PDFComposer:
                     pass
 
         if len(a5_indices) >= 2:
+            # For side-by-side A5 on a landscape A4 page, swap page width/height
             i, j = a5_indices[0], a5_indices[1]
             left_info = remaining[i]
             right_info = remaining[j]
+            page_w = self.A4_H - 2 * margin   # landscape width
+            page_h = self.A4_W - 2 * margin   # landscape height
             gutter = max(self._mm_to_px(GUTTER_MM), 8)  # small gap between halves
             cell_w = (page_w - gutter) // 2
             left_cell = (x0, y0, cell_w, page_h)
             right_cell = (x0 + cell_w + gutter, y0, cell_w, page_h)
             try:
-                self._log(f"[A5] pairing indices {i},{j} -> side-by-side cells width={cell_w} gutter={gutter}")
+                self._log(f"[A5] pairing indices {i},{j} -> side-by-side (LANDSCAPE) cells width={cell_w} gutter={gutter} page=({page_w}x{page_h})")
             except Exception:
                 pass
-            return [(left_info, left_cell), (right_info, right_cell)], 2, False, [i, j]
+            return [(left_info, left_cell), (right_info, right_cell)], 2, False, [i, j], True
 
         try:
             self._log(f"[A5] no special A5 placement, fallback to advanced packer")
         except Exception:
             pass
         # no special packing
-        return [], 0, False, []
+        return [], 0, False, [], False
 
     def compose(self, job: Dict, image_files: List[Path]) -> PDFComposeResult:
         if not image_files:
@@ -273,15 +287,22 @@ class PDFComposer:
         packing_decisions: List[Dict] = []
 
         i = 0
-        while i < len(infos):
+        while i &lt; len(infos):
             # Try A5 rules first. This may select non-consecutive indices; if so, we'll remove them explicitly.
             special = self._pack_page_a5(infos[i:], margin)
-            if special[1] > 0:
-                special_cells, used_special, allow_upscale_special, used_indices = special
+            if special[1] &gt; 0:
+                # Unpack extended tuple with landscape flag
+                special_cells, used_special, allow_upscale_special, used_indices, landscape_page = special
                 cells, allow_upscale = special_cells, allow_upscale_special
 
+                # Set page size depending on orientation (landscape for A5 pair, portrait otherwise)
+                if landscape_page:
+                    c.setPageSize((self.A4_H, self.A4_W))
+                else:
+                    c.setPageSize((self.A4_W, self.A4_H))
+
                 # draw page with cells
-                page_meta = {"items": []}
+                page_meta = {"items": [], "orientation": "landscape" if landscape_page else "portrait"}
                 for info, (x, y, w, h) in cells:
                     scale = min(w / info.width, h / info.height)
                     if not allow_upscale:
@@ -298,7 +319,9 @@ class PDFComposer:
                     })
                 border_inset = self._mm_to_px(5.0)
                 c.setLineWidth(1)
-                c.rect(border_inset, border_inset, self.A4_W - 2 * border_inset, self.A4_H - 2 * border_inset, stroke=1, fill=0)
+                # Use current page size for border
+                pw, ph = c._pagesize  # reportlab stores current page size
+                c.rect(border_inset, border_inset, int(pw) - 2 * border_inset, int(ph) - 2 * border_inset, stroke=1, fill=0)
                 packing_decisions.append(page_meta)
                 c.showPage()
 
@@ -310,10 +333,12 @@ class PDFComposer:
                 continue
             else:
                 # Fallback to advanced packer which always consumes from the head
+                # Ensure portrait page for advanced packer
+                c.setPageSize((self.A4_W, self.A4_H))
                 cells, used, allow_upscale, stretch = self._pack_page_advanced(infos[i:], margin)
 
                 # draw page with cells
-                page_meta = {"items": []}
+                page_meta = {"items": [], "orientation": "portrait"}
                 for info, (x, y, w, h) in cells:
                     scale = min(w / info.width, h / info.height)
                     if not allow_upscale:
@@ -330,7 +355,8 @@ class PDFComposer:
                     })
                 border_inset = self._mm_to_px(5.0)
                 c.setLineWidth(1)
-                c.rect(border_inset, border_inset, self.A4_W - 2 * border_inset, self.A4_H - 2 * border_inset, stroke=1, fill=0)
+                pw, ph = c._pagesize
+                c.rect(border_inset, border_inset, int(pw) - 2 * border_inset, int(ph) - 2 * border_inset, stroke=1, fill=0)
                 packing_decisions.append(page_meta)
                 c.showPage()
                 i += used
