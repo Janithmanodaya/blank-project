@@ -74,7 +74,7 @@ class PDFComposer:
         packing_decisions: List[Dict] = []
 
         i = 0
-        while i &lt; len(infos):
+        while i < len(infos):
             cells, used = self._pack_page(infos[i:], margin)
             # draw page with cells
             page_meta = {"items": []}
