@@ -3,9 +3,9 @@ import json
 import logging
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import httpx
 from fastapi import Depends, FastAPI, Request
@@ -24,7 +24,7 @@ except Exception:
     GeminiResponder = None  # type: ignore
 
 APP_TITLE = "GreenAPI Image→PDF Relay"
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -155,6 +155,40 @@ def _extract_text_from_payload(payload: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _extract_event_time(payload: Dict[str, Any]) -> Optional[datetime]:
+    """
+    Try to get the message event time as UTC datetime.
+    Looks for common Green API fields: 'timestamp' (epoch seconds).
+    """
+    candidates: List[Optional[Union[int, float, str]]] = []
+    # top-level
+    candidates.append(payload.get("timestamp"))
+    # typical locations
+    md = payload.get("messageData") or {}
+    candidates.append(md.get("timestamp"))
+    # sometimes stored under 'sendTime' or similar
+    candidates.append(payload.get("sendTime"))
+    candidates.append(md.get("sendTime"))
+    # process
+    for c in candidates:
+        if c is None:
+            continue
+        try:
+            # parse numeric epoch seconds
+            if isinstance(c, (int, float)) or (isinstance(c, str) and c.isdigit()):
+                sec = float(c)
+                # treat values that look like ms
+                if sec > 1e12:
+                    sec = sec / 1000.0
+                return datetime.fromtimestamp(sec, tz=timezone.utc)
+        except Exception:
+            continue
+    return None
+
+
+WINDOW_SECONDS = 180  # 3 minutes
+
+
 async def maybe_auto_reply(payload: Dict[str, Any], db: Database):
     # settings gate
     enabled = (db.get_setting("auto_reply_enabled", "0") or "0") == "1"
@@ -201,6 +235,14 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
     sender = payload.get("senderData", {}).get("chatId") or payload.get("senderData", {}).get("sender") or "unknown"
     msg_id = payload.get("idMessage") or payload.get("messageData", {}).get("idMessage") or payload.get("receiptId") or ts
     message_data = payload.get("messageData") or {}
+
+    # Time window filter (3 minutes)
+    now = datetime.now(tz=timezone.utc)
+    evt_time = _extract_event_time(payload) or now
+    age = (now - evt_time).total_seconds()
+    if age > WINDOW_SECONDS:
+        json_log("message_skipped_outside_window", sender=sender, msg_id=str(msg_id), age_seconds=int(age))
+        return {"ok": True, "skipped": "outside_window", "age_seconds": int(age)}
 
     # Idempotency: skip if we've already handled this message id
     if db.has_processed(str(msg_id)):
