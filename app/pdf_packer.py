@@ -287,10 +287,10 @@ class PDFComposer:
         packing_decisions: List[Dict] = []
 
         i = 0
-        while i &lt; len(infos):
+        while i < len(infos):
             # Try A5 rules first. This may select non-consecutive indices; if so, we'll remove them explicitly.
             special = self._pack_page_a5(infos[i:], margin)
-            if special[1] &gt; 0:
+            if special[1] > 0:
                 # Unpack extended tuple with landscape flag
                 special_cells, used_special, allow_upscale_special, used_indices, landscape_page = special
                 cells, allow_upscale = special_cells, allow_upscale_special
