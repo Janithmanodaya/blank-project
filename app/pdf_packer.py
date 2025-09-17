@@ -74,28 +74,8 @@ class PDFComposer:
         packing_decisions: List[Dict] = []
 
         i = 0
-        while i < len(infos):
-            first = infos[i]
-            if first.cls == "full":
-                cells = [(first, (margin, margin, self.A4_W - 2*margin, self.A4_H - 2*margin))]
-                i += 1
-            else:
-                # Try to pack 2 or 4 per page based on classes
-                candidates = [first]
-                j = i + 1
-                # collect up to 3 more for quarter/small or 1 more for half
-                if first.cls == "half":
-                    if j < len(infos) and infos[j].cls in {"half", "small", "quarter"}:
-                        candidates.append(infos[j])
-                        j += 1
-                else:
-                    while j < len(infos) and len(candidates) < 4:
-                        candidates.append(infos[j])
-                        j += 1
-
-                cells = self._compute_cells(candidates, margin)
-                i = j
-
+        while i &lt; len(infos):
+            cells, used = self._pack_page(infos[i:], margin)
             # draw page with cells
             page_meta = {"items": []}
             for info, (x, y, w, h) in cells:
@@ -114,6 +94,7 @@ class PDFComposer:
                 })
             packing_decisions.append(page_meta)
             c.showPage()
+            i += used
 
         c.save()
 
@@ -165,3 +146,70 @@ class PDFComposer:
 
         # fallback single
         return [(first, (x0, y0, W, H))]
+
+    def _pack_page(self, remaining: List[ImageInfo], margin: int) -> Tuple[List[Tuple[ImageInfo, Tuple[int,int,int,int]]], int]:
+        """
+        Choose how many images to place on the current page to maximize filled area.
+        Returns (cells, used_count).
+        Strategy:
+        - Try layouts with 1, 2, 3, 4 slots (full page, 1x2 or 2x1, 2x2).
+        - For each layout, simulate placing next N images and compute used area based on aspect-fit.
+        - Pick the layout with highest filled ratio. Avoid upscaling.
+        """
+        W, H = self.A4_W - 2 * margin, self.A4_H - 2 * margin
+        x0, y0 = margin, margin
+
+        def simulate(layout: str, k: int):
+            if layout == "1":
+                slots = [(x0, y0, W, H)]
+            elif layout == "2v":  # two vertical stacked
+                slots = [(x0, y0 + H//2, W, H//2), (x0, y0, W, H//2)]
+            elif layout == "2h":  # two side by side
+                slots = [(x0, y0, W//2, H), (x0 + W//2, y0, W//2, H)]
+            elif layout == "2x2":
+                slots = [
+                    (x0, y0 + H//2, W//2, H//2),
+                    (x0 + W//2, y0 + H//2, W//2, H//2),
+                    (x0, y0, W//2, H//2),
+                    (x0 + W//2, y0, W//2, H//2),
+                ]
+            else:
+                raise ValueError("unknown layout")
+
+            items = []
+            used_area = 0
+            for idx, info in enumerate(remaining[:k]):
+                if idx >= len(slots):
+                    break
+                sx, sy, sw, sh = slots[idx]
+                scale = min(sw / info.width, sh / info.height, 1.0)
+                rw, rh = int(info.width * scale), int(info.height * scale)
+                used_area += rw * rh
+                items.append((info, (sx, sy, sw, sh)))
+            fill_ratio = used_area / (W * H)
+            return items, fill_ratio
+
+        candidates = []
+        n = min(4, len(remaining))
+        # Try 1
+        items, ratio = simulate("1", 1)
+        candidates.append((ratio, items, 1))
+        if n >= 2:
+            items, ratio = simulate("2v", 2)
+            candidates.append((ratio, items, 2))
+            items, ratio = simulate("2h", 2)
+            candidates.append((ratio, items, 2))
+        if n >= 3:
+            # 3 will occupy first 3 slots of 2x2
+            items, ratio = simulate("2x2", 3)
+            candidates.append((ratio, items, 3))
+        if n >= 4:
+            items, ratio = simulate("2x2", 4)
+            candidates.append((ratio, items, 4))
+
+        # Prefer higher ratio, and if tie prefer more images to reduce pages
+        candidates.sort(key=lambda x: (x[0], x[2]), reverse=True)
+        best_ratio, best_items, used = candidates[0]
+
+        # Convert slots to cells with full slot sizes; actual draw scales inside preserve AR
+        return best_items, used
