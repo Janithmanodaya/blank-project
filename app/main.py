@@ -24,7 +24,7 @@ except Exception:
     GeminiResponder = None  # type: ignore
 
 APP_TITLE = "GreenAPI Image→PDF Relay"
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,6 +48,11 @@ app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 # Global components
 storage = Storage(base=Path("storage"))
 composer = PDFComposer(storage=storage)
+
+# Batching state per chat for media -> PDF
+BATCH_WINDOW_SECONDS = int(os.getenv("BATCH_WINDOW_SECONDS", "60"))
+pending_batches: Dict[str, Dict[str, Any]] = {}
+pending_lock = asyncio.Lock()
 
 # Background queue and worker are defined in app.tasks to avoid circular imports
 
@@ -102,7 +107,7 @@ async def worker_loop(worker_id: int):
                 downloaded_files = []
                 for m in media_items:
                     try:
-                        file_path = await storage.download_media(http_client, m, job)
+                        file_path = await storage.download_media(http_client, m["payload"], job)
                         db.update_media_local_path(m["id"], str(file_path))
                         downloaded_files.append(file_path)
                     except Exception as e:
@@ -219,6 +224,27 @@ async def maybe_auto_reply(payload: Dict[str, Any], db: Database):
         json_log("auto_reply_failed", error=str(e))
 
 
+async def _enqueue_batch_later(sender: str, db: Database):
+    try:
+        await asyncio.sleep(BATCH_WINDOW_SECONDS)
+        async with pending_lock:
+            b = pending_batches.get(sender)
+            if not b:
+                return
+            job_id = b["job_id"]
+            # Move to queue only if still pending
+            db.update_job_status(job_id, "PENDING")
+            await job_queue.put(job_id)
+            json_log("batch_enqueued", sender=sender, job_id=job_id)
+            # Remove batch
+            pending_batches.pop(sender, None)
+    except asyncio.CancelledError:
+        # Batch was cancelled due to new batch or shutdown
+        raise
+    except Exception as e:
+        json_log("batch_enqueue_error", sender=sender, error=str(e))
+
+
 async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict[str, Any]:
     # Persist raw payload
     ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
@@ -264,24 +290,38 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
     except Exception:
         pass
 
-    # Create job
-    job_id = db.create_job(sender=sender, msg_id=str(msg_id), payload=payload, instance_id=str(instance_id))
-    for m in media_list:
-        db.add_media(job_id, m)
-
-    # Enqueue if media present
+    # Media batching logic: if images present, accumulate per sender for BATCH_WINDOW_SECONDS
     if media_list:
-        await job_queue.put(job_id)
-        db.update_job_status(job_id, "PENDING")
-        json_log("job_enqueued", job_id=job_id, msg_id=msg_id, sender=sender, medias=len(media_list))
+        async with pending_lock:
+            batch = pending_batches.get(sender)
+            if batch:
+                # Append to existing batch job
+                job_id = batch["job_id"]
+                for m in media_list:
+                    db.add_media(job_id, m)
+                json_log("batch_appended", sender=sender, job_id=job_id, added=len(media_list))
+                result_job_id = job_id
+            else:
+                # Create new job and start timer
+                job_id = db.create_job(sender=sender, msg_id=str(msg_id), payload=payload, instance_id=str(instance_id))
+                for m in media_list:
+                    db.add_media(job_id, m)
+                db.update_job_status(job_id, "NEW")
+                task = asyncio.create_task(_enqueue_batch_later(sender, db))
+                pending_batches[sender] = {"job_id": job_id, "started_at": now.isoformat(), "task": task}
+                json_log("batch_started", sender=sender, job_id=job_id, window_seconds=BATCH_WINDOW_SECONDS, medias=len(media_list))
+                result_job_id = job_id
     else:
+        # Create a job just to track non-media message; complete immediately
+        job_id = db.create_job(sender=sender, msg_id=str(msg_id), payload=payload, instance_id=str(instance_id))
         db.update_job_status(job_id, "COMPLETED")
         json_log("no_media_payload_stored", job_id=job_id)
+        result_job_id = job_id
 
     # Try auto reply (non-blocking)
     asyncio.create_task(maybe_auto_reply(payload, db))
 
-    return {"ok": True, "job_id": job_id}
+    return {"ok": True, "job_id": result_job_id}
 
 
 async def notification_poller():
