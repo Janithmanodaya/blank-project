@@ -60,6 +60,20 @@ async def on_startup():
     # Initialize DB and tables
     db = Database()
     db.init()
+
+    # Load sensitive/API settings from DB into environment for downstream modules
+    for key in [
+        "GREEN_API_BASE_URL",
+        "GREEN_API_INSTANCE_ID",
+        "GREEN_API_API_TOKEN",
+        "GEMINI_API_KEY",
+        "ADMIN_PASSWORD",
+        "GEMINI_SYSTEM_PROMPT",
+    ]:
+        val = db.get_setting(key, None)
+        if val is not None and val != "":
+            os.environ[key] = val
+
     json_log("startup", version=VERSION)
 
     # Launch workers

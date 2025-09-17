@@ -140,20 +140,56 @@ def ui(db: Database = Depends(get_db), token: Optional[str] = Query(default=None
     # settings snapshot
     auto_enabled = (db.get_setting("auto_reply_enabled", "0") or "0") == "1"
     sys_prompt = db.get_setting("auto_reply_system_prompt", "") or ""
+    g_base = db.get_setting("GREEN_API_BASE_URL", os.getenv("GREEN_API_BASE_URL", "https://api.green-api.com")) or ""
+    g_inst = db.get_setting("GREEN_API_INSTANCE_ID", os.getenv("GREEN_API_INSTANCE_ID", "")) or ""
+    g_token = db.get_setting("GREEN_API_API_TOKEN", os.getenv("GREEN_API_API_TOKEN", "")) or ""
+    gemini_key = db.get_setting("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY", "")) or ""
+    admin_pwd = db.get_setting("ADMIN_PASSWORD", os.getenv("ADMIN_PASSWORD", "")) or ""
+    gemini_sys = db.get_setting("GEMINI_SYSTEM_PROMPT", os.getenv("GEMINI_SYSTEM_PROMPT", "")) or ""
 
     settings_html = f"""
     <div class="card">
-      <h3>AI Auto Reply (Gemini)</h3>
-      <p class="muted">Automatically reply to incoming text messages using Google Gemini. Requires GEMINI_API_KEY in environment.</p>
+      <h3>Configuration</h3>
+      <p class="muted">Manage API keys and behavior. Saved values are stored securely in the local database and loaded on startup.</p>
       <div class="row">
-        Status:
+        Auto Reply:
         {"<span class='badge ok'>Enabled</span>" if auto_enabled else "<span class='badge'>Disabled</span>"}
         <a class="button" href="/ui/auto-reply/toggle?token={token}">{'Disable' if auto_enabled else 'Enable'}</a>
       </div>
-      <form action="/ui/settings?token={token}" method="post">
-        <label for="system_prompt">System Prompt</label>
-        <textarea id="system_prompt" name="system_prompt" placeholder="You are a concise helpful WhatsApp assistant.">{sys_prompt}</textarea>
-        <div class="hint">Set the assistant behavior. Leave blank for a default helpful style.</div>
+      <form action="/ui/settings?token={token}" method="post" autocomplete="off">
+        <h4>Green API</h4>
+        <div class="row">
+          <label for="GREEN_API_BASE_URL">Base URL</label>
+          <input type="text" id="GREEN_API_BASE_URL" name="GREEN_API_BASE_URL" placeholder="https://api.green-api.com" value="{g_base}"/>
+          <div class="hint">Default: https://api.green-api.com</div>
+        </div>
+        <div class="row">
+          <label for="GREEN_API_INSTANCE_ID">Instance ID</label>
+          <input type="text" id="GREEN_API_INSTANCE_ID" name="GREEN_API_INSTANCE_ID" value="{g_inst}" />
+        </div>
+        <div class="row">
+          <label for="GREEN_API_API_TOKEN">API Token</label>
+          <input type="password" id="GREEN_API_API_TOKEN" name="GREEN_API_API_TOKEN" value="{g_token}" />
+        </div>
+
+        <h4>Gemini</h4>
+        <div class="row">
+          <label for="GEMINI_API_KEY">GEMINI_API_KEY</label>
+          <input type="password" id="GEMINI_API_KEY" name="GEMINI_API_KEY" value="{gemini_key}" />
+          <div class="hint">Required for AI auto-replies.</div>
+        </div>
+        <div class="row">
+          <label for="GEMINI_SYSTEM_PROMPT">System Prompt</label>
+          <textarea id="GEMINI_SYSTEM_PROMPT" name="GEMINI_SYSTEM_PROMPT" placeholder="You are a concise helpful WhatsApp assistant.">{gemini_sys or sys_prompt}</textarea>
+        </div>
+
+        <h4>Admin</h4>
+        <div class="row">
+          <label for="ADMIN_PASSWORD">UI Password</label>
+          <input type="password" id="ADMIN_PASSWORD" name="ADMIN_PASSWORD" value="{admin_pwd}" />
+          <div class="hint">Used as the ?token=... query parameter to access this UI.</div>
+        </div>
+
         <div class="actions">
           <button class="button" type="submit">Save Settings</button>
         </div>
@@ -215,6 +251,32 @@ def toggle_auto_reply(db: Database = Depends(get_db), token: Optional[str] = Que
 async def save_settings(request: Request, db: Database = Depends(get_db), token: Optional[str] = Query(default=None)):
     check_auth(token)
     form = await request.form()
-    system_prompt = (form.get("system_prompt") or "").strip()
-    db.set_setting("auto_reply_system_prompt", system_prompt)
-    return RedirectResponse(url=f"/ui?token={token}", status_code=302)
+
+    # Collect fields
+    keys = [
+        "GREEN_API_BASE_URL",
+        "GREEN_API_INSTANCE_ID",
+        "GREEN_API_API_TOKEN",
+        "GEMINI_API_KEY",
+        "GEMINI_SYSTEM_PROMPT",
+        "ADMIN_PASSWORD",
+        "auto_reply_system_prompt",  # legacy field for backward compatibility in DB
+    ]
+
+    # Write settings and update process env for immediate effect
+    new_token = token
+    for key in keys:
+        if key in {"auto_reply_system_prompt"}:
+            # Sync legacy system prompt key
+            val = (form.get("GEMINI_SYSTEM_PROMPT") or "").strip()
+            db.set_setting("auto_reply_system_prompt", val)
+            continue
+
+        val = (form.get(key) or "").strip()
+        db.set_setting(key, val)
+        if val != "":
+            os.environ[key] = val
+        if key == "ADMIN_PASSWORD" and val:
+            new_token = val  # so we can continue to access UI after password change
+
+    return RedirectResponse(url=f"/ui?token={new_token}", status_code=302)
