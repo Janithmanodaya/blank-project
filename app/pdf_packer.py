@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Tuple
 from PIL import Image
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4
+import random
 
 from .storage import Storage
 
@@ -78,24 +79,29 @@ class PDFComposer:
 
         i = 0
         while i < len(infos):
-            cells, used, allow_upscale = self._pack_page(infos[i:], margin)
+            cells, used, allow_upscale, stretch = self._pack_page_advanced(infos[i:], margin)
             # draw page with cells
             page_meta = {"items": []}
             for info, (x, y, w, h) in cells:
-                # scale to fit cell, preserve aspect
-                scale = min(w / info.width, h / info.height) if allow_upscale else min(w / info.width, h / info.height, 1.0)
-                rw, rh = int(info.width * scale), int(info.height * scale)
-                # center within cell
-                ox = x + (w - rw) // 2
-                oy = y + (h - rh) // 2
-                c.drawImage(str(info.path), ox, oy, width=rw, height=rh, preserveAspectRatio=True, anchor='c')
+                if stretch:
+                    # fill the rectangle, ignore original aspect
+                    ox, oy, rw, rh = int(x), int(y), int(w), int(h)
+                    c.drawImage(str(info.path), ox, oy, width=rw, height=rh, preserveAspectRatio=False, anchor='c')
+                else:
+                    # scale to fit cell, preserve aspect
+                    scale = min(w / info.width, h / info.height) if allow_upscale else min(w / info.width, h / info.height, 1.0)
+                    rw, rh = int(info.width * scale), int(info.height * scale)
+                    # center within cell
+                    ox = int(x + (w - rw) // 2)
+                    oy = int(y + (h - rh) // 2)
+                    c.drawImage(str(info.path), ox, oy, width=rw, height=rh, preserveAspectRatio=True, anchor='c')
                 page_meta["items"].append({
                     "file": str(info.path),
                     "orig": [info.width, info.height],
                     "placed": [ox, oy, rw, rh],
                     "cls": info.cls,
                 })
-            # draw 0.5 cm border around the A4 page
+            # draw 0.5 cm border around page
             border_inset = self._mm_to_px(5.0)
             c.setLineWidth(1)
             c.rect(border_inset, border_inset, self.A4_W - 2 * border_inset, self.A4_H - 2 * border_inset, stroke=1, fill=0)
@@ -156,94 +162,89 @@ class PDFComposer:
 
     def _pack_page(self, remaining: List[ImageInfo], margin: int) -> Tuple[List[Tuple[ImageInfo, Tuple[int,int,int,int]]], int, bool]:
         """
-        Choose how many images to place on the current page to maximize filled area.
-        Returns (cells, used_count, allow_upscale).
-        Also includes special-case: if next images are all below half-A4 (A5) size,
-        put 8 images on the page (4x2 grid) and allow upscaling to fill page.
+        Backward-compat packing kept for reference; not used once advanced is present.
         """
-        W, H = self.A4_W - 2 * margin, self.A4_H - 2 * margin
-        x0, y0 = margin, margin
+        cells, used, allow_upscale, _ = self._pack_page_advanced(remaining, margin)
+        return cells, used, allow_upscale
 
-        # Check special 8-up rule: if all of the next up to 8 images are below half A4
-        def is_below_half(info: ImageInfo) -> bool:
-            return info.width < self.A4_W/2 and info.height < self.A4_H/2
+    def _pack_page_advanced(self, remaining: List[ImageInfo], margin: int) -> Tuple[List[Tuple[ImageInfo, Tuple[int,int,int,int]]], int, bool, bool]:
+        """
+        Advanced packing based on target area fill.
+        - Compute available area in mm^2 (A4 minus margins), target ~ 62370 mm^2 (user-guided constant).
+        - Determine scaled sizes for a batch of images so total area approximates target, respecting gaps and border.
+        - Place rectangles in a simple shelf-packing manner without overlap.
+        Returns (cells, used_count, allow_upscale, stretch)
+        - allow_upscale: True when we intentionally scale images up.
+        - stretch: True if we fill cells ignoring aspect ratio to match target area.
+        """
+        # Convert geometry to mm to follow user's requirement
+        W_px, H_px = self.A4_W - 2 * margin, self.A4_H - 2 * margin
+        W_mm, H_mm = W_px / self.dpi * 25.4, H_px / self.dpi * 25.4
+        target_area_mm2 = 62370.0  # as per instruction
+        gap_mm = 5.0  # 0.5 cm gap
+        gap_px = self._mm_to_px(gap_mm)
 
-        up_to_8 = remaining[:min(8, len(remaining))]
-        if up_to_8 and all(is_below_half(img) for img in up_to_8):
-            # layout 4 columns x 2 rows with 0.5 cm gaps between images
-            gap = self._mm_to_px(5.0)
-            cols, rows = 4, 2
-            total_gap_w = gap * (cols - 1)
-            total_gap_h = gap * (rows - 1)
-            cell_w = (W - total_gap_w) // cols
-            cell_h = (H - total_gap_h) // rows
-            cells = []
-            k = 0
-            for r in range(rows):
-                for c in range(cols):
-                    if k >= len(up_to_8):
-                        break
-                    sx = x0 + c * (cell_w + gap)
-                    sy = y0 + (rows - 1 - r) * (cell_h + gap)
-                    cells.append((remaining[k], (sx, sy, cell_w, cell_h)))
-                    k += 1
-            return cells, k, True  # allow upscaling to fill
+        # Decide how many images to try on this page: up to 8 provides variety
+        max_try = min(8, len(remaining))
+        batch = remaining[:max_try]
 
-        def simulate(layout: str, k: int):
-            if layout == "1":
-                slots = [(x0, y0, W, H)]
-            elif layout == "2v":  # two vertical stacked with 0.5cm gap
-                gap = self._mm_to_px(5.0)
-                half_h = (H - gap) // 2
-                slots = [(x0, y0 + half_h + gap, W, half_h), (x0, y0, W, half_h)]
-            elif layout == "2h":  # two side by side with 0.5cm gap
-                gap = self._mm_to_px(5.0)
-                half_w = (W - gap) // 2
-                slots = [(x0, y0, half_w, H), (x0 + half_w + gap, y0, half_w, H)]
-            elif layout == "2x2":
-                slots = [
-                    (x0, y0 + H//2, W//2, H//2),
-                    (x0 + W//2, y0 + H//2, W//2, H//2),
-                    (x0, y0, W//2, H//2),
-                    (x0 + W//2, y0, W//2, H//2),
-                ]
-            else:
-                raise ValueError("unknown layout")
+        # Base sizes: treat each input as \"A4-sized\" reference for fair split, then scale to target
+        # Compute each image aspect, then assign widths proportionally so that sum of areas ~= target
+        aspects = []
+        for info in batch:
+            ar = max(info.width, 1) / max(info.height, 1)
+            aspects.append(ar)
 
-            items = []
-            used_area = 0
-            for idx, info in enumerate(remaining[:k]):
-                if idx >= len(slots):
-                    break
-                sx, sy, sw, sh = slots[idx]
-                scale = min(sw / info.width, sh / info.height, 1.0)
-                rw, rh = int(info.width * scale), int(info.height * scale)
-                used_area += rw * rh
-                items.append((info, (sx, sy, sw, sh)))
-            fill_ratio = used_area / (W * H)
-            return items, fill_ratio
+        # Heuristic: split target area evenly by count, then adjust rectangles by aspect
+        per_img_area = target_area_mm2 / max_try
+        rects_mm = []  # (w_mm, h_mm)
+        for ar in aspects:
+            h_mm = (per_img_area / ar) ** 0.5
+            w_mm = ar * h_mm
+            rects_mm.append((w_mm, h_mm))
 
-        candidates = []
-        n = min(4, len(remaining))
-        # Try 1
-        items, ratio = simulate("1", 1)
-        candidates.append((ratio, items, 1))
-        if n >= 2:
-            items, ratio = simulate("2v", 2)
-            candidates.append((ratio, items, 2))
-            items, ratio = simulate("2h", 2)
-            candidates.append((ratio, items, 2))
-        if n >= 3:
-            # 3 will occupy first 3 slots of 2x2
-            items, ratio = simulate("2x2", 3)
-            candidates.append((ratio, items, 3))
-        if n >= 4:
-            items, ratio = simulate("2x2", 4)
-            candidates.append((ratio, items, 4))
+        # Convert to px
+        rects_px = [(int(round(w_mm / 25.4 * self.dpi)), int(round(h_mm / 25.4 * self.dpi))) for (w_mm, h_mm) in rects_mm]
 
-        # Prefer higher ratio, and if tie prefer more images to reduce pages
-        candidates.sort(key=lambda x: (x[0], x[2]), reverse=True)
-        best_ratio, best_items, used = candidates[0]
+        # Shelf-pack left-to-right, top-to-bottom with gap, randomize order for \"random placement\"
+        order = list(range(len(rects_px)))
+        random.shuffle(order)
 
-        # Default: no upscaling unless 8-up special case
-        return best_items, used, False
+        positions: List[Tuple[int, int, int, int]] = []  # x, y, w, h
+        x = 0
+        y_top = H_px
+        row_h = 0
+        used_count = 0
+
+        for idx in order:
+            w, h = rects_px[idx]
+            # If it doesn't fit in current row, move to new row
+            if x > 0 and x + w > W_px:
+                # new row
+                y_top -= (row_h + gap_px)
+                x = 0
+                row_h = 0
+            # If doesn't fit vertically, stop
+            if y_top - h < 0:
+                break
+            # place
+            positions.append((x, int(y_top - h), w, h))
+            x += w + gap_px
+            row_h = max(row_h, h)
+            used_count += 1
+
+        # Map positions back to actual page coordinates with margins
+        cells = []
+        for pos_idx, (px, py, pw, ph) in enumerate(positions):
+            img_info = batch[order[pos_idx]]
+            cells.append((img_info, (margin + px, margin + py, pw, ph)))
+
+        allow_upscale = True  # we are assigning synthetic sizes
+        stretch = True        # we fill rectangles ignoring original aspect when drawing
+
+        # If nothing placed (e.g., extremely large rects), fall back to previous logic for robustness
+        if not cells:
+            cells_fallback, used_fb, allow_up_fb = self._pack_page(remaining, margin)
+            return cells_fallback, used_fb, allow_up_fb, False
+
+        return cells, used_count, allow_upscale, stretch
