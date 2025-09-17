@@ -78,15 +78,13 @@ class PDFComposer:
         packing_decisions: List[Dict] = []
 
         i = 0
-        while i < len(infos):
+        while  << len(infos):
             cells, used, allow_upscale, stretch = self._pack_page_advanced(infos[i:], margin)
             # draw page with cells
             page_meta = {"items": []}
             for info, (x, y, w, h) in cells:
-                if stretch:
-                    # fill the rectangle, ignore original aspect
-                    ox, oy, rw, rh = int(x), int(y), int(w), int(h)
-                    c.drawImage(str(info.path), ox, oy, width=rw, height=rh, preserveAspectRatio=False, anchor='c')
+                # Always preserve aspect ratio to avoid distortion
+                scale = min(w / info.width, h / info.height) if allow_upscale else min(w / info.width, h / info.heightawImage(str(info.path), ox, oy, width=rw, height=rh, preserveAspectRatio=False, anchor='c')
                 else:
                     # scale to fit cell, preserve aspect
                     scale = min(w / info.width, h / info.height) if allow_upscale else min(w / info.width, h / info.height, 1.0)
