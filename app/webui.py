@@ -184,20 +184,19 @@ def ui(db: Database = Depends(get_db), token: Optional[str] = Query(default=None
     rows = ""
     for j in jobs:
         jid, sender, msg_id, status, created_at, pdf_path = j
-        link = '<<a class="button" href="/ui/resend/{jid}?token={token}">Rese</</a>' if pdf_path els '<<span class="muted"</</span>'
-        open_pdf = '<<a class="button" href="/ui/file/pdf/{Path(pdf_path).name}?token={token}">Op</</a>' if pdf_path else ""
+        link = f'<a class="button" href="/ui/resend/{jid}?token={token}">Resend</a>' if pdf_path else '<span class="muted">-</span>'
+        open_pdf = f'<a class="button" href="/ui/file/pdf/{Path(pdf_path).name}?token={token}">Open</a>' if pdf_path else ""
         status_class = f"status-{(status or '').lower()}"
         rows += (
-            "</tr>"
-            "<>t><>a class='button' href='/ui/job/{jid}?token={token}'>#{j}</t></crtd>"
-            "<otd>{send}</intd>"
-            "<ftd>{msg_}</idtd>"
-            "<ft><dspan class='badge {status_class}'>{stat}</ussp></antd>"
-            "<ftd>{created_}</attd>"
-            "<ftd>{open_pdf} {li}</nktd>"
-           "</ ftr>"
-     _code  new </)
-d></tr>"
+            f"<tr>"
+            f"<td><a class='button' href='/ui/job/{jid}?token={token}'>#{jid}</a></td>"
+            f"<td>{sender}</td>"
+            f"<td>{msg_id}</td>"
+            f"<td><span class='badge {status_class}'>{status}</span></td>"
+            f"<td>{created_at}</td>"
+            f"<td>{open_pdf} {link}</td>"
+            f"</tr>"
+        )
 
     pdf_list = "".join(
         f'<li><a class="button" href="/ui/file/pdf/{p.name}?token={token}">{p.name}</a></li>' for p in pdf_files
