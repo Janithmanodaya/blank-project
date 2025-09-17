@@ -60,6 +60,14 @@ class Database:
                 )
                 """
             )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS processed_messages (
+                    msg_id TEXT PRIMARY KEY,
+                    created_at TEXT
+                )
+                """
+            )
             con.commit()
 
     @contextmanager
@@ -188,6 +196,24 @@ class Database:
         with self._conn() as con:
             cur = con.cursor()
             cur.execute("INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+            con.commit()
+
+    # Idempotency helpers -------------------------------------------------
+
+    def has_processed(self, msg_id: str) -> bool:
+        with self._conn() as con:
+            cur = con.cursor()
+            row = cur.execute("SELECT 1 FROM processed_messages WHERE msg_id=?", (msg_id,)).fetchone()
+            return bool(row)
+
+    def mark_processed(self, msg_id: str):
+        from datetime import datetime
+        with self._conn() as con:
+            cur = con.cursor()
+            cur.execute(
+                "INSERT OR IGNORE INTO processed_messages (msg_id, created_at) VALUES (?, ?)",
+                (msg_id, datetime.utcnow().isoformat() + "Z"),
+            )
             con.commit()
 
 

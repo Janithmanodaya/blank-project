@@ -202,6 +202,14 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
     msg_id = payload.get("idMessage") or payload.get("messageData", {}).get("idMessage") or payload.get("receiptId") or ts
     message_data = payload.get("messageData") or {}
 
+    # Idempotency: skip if we've already handled this message id
+    if db.has_processed(str(msg_id)):
+        json_log("duplicate_message_skipped", msg_id=str(msg_id), sender=sender)
+        return {"ok": True, "duplicate": True, "msg_id": str(msg_id)}
+
+    # Mark as processed early to avoid races on re-delivery
+    db.mark_processed(str(msg_id))
+
     media_list: List[Dict[str, Any]] = []
     try:
         type_message = message_data.get("typeMessage")

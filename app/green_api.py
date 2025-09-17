@@ -82,10 +82,24 @@ class GreenAPIClient:
     async def delete_notification(self, receipt_id: int) -> None:
         """
         Acknowledge and remove a notification so it is not delivered again.
+        There are two API variants observed:
+          1) DELETE /DeleteNotification/{receiptId}/{token}
+          2) POST   /DeleteNotification/{token} with JSON {"receiptId": ...}
+        We'll try DELETE first, then fall back to POST on auth/method errors.
         """
-        url = self._url(f"DeleteNotification/{receipt_id}")
         async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.delete(url)
-            # Some implementations return 200 with result: true
-            if resp.status_code not in (200, 204):
-                resp.raise_for_status()
+            # Variant 1: DELETE with receipt id in path
+            url_delete = self._url(f"DeleteNotification/{receipt_id}")
+            resp = await client.delete(url_delete)
+            if resp.status_code in (200, 204):
+                return
+            # Fallback on common failures
+            if resp.status_code in (400, 401, 404, 405):
+                # Variant 2: POST with JSON body
+                url_post = self._url("DeleteNotification")
+                resp2 = await client.post(url_post, json={"receiptId": receipt_id})
+                if resp2.status_code in (200, 204):
+                    return
+                resp2.raise_for_status()
+            # If other status, raise
+            resp.raise_for_status()
