@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Form
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, RedirectResponse
 
 from .db import Database, get_db
-from .main import job_queue
+from .tasks import job_queue
 from .storage import Storage
 
 router = APIRouter()

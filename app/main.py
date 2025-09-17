@@ -16,7 +16,7 @@ from .db import Database, get_db
 from .green_api import GreenAPIClient
 from .pdf_packer import PDFComposer, PDFComposeResult
 from .storage import Storage
-from .webui import router as web_router
+from .tasks import job_queue, workers
 
 try:
     from .gemini import GeminiResponder  # optional; only used if enabled
@@ -49,9 +49,7 @@ app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 storage = Storage(base=Path("storage"))
 composer = PDFComposer(storage=storage)
 
-# Background queue and worker
-job_queue: "asyncio.Queue[int]" = asyncio.Queue()
-workers: List[asyncio.Task] = []
+# Background queue and worker are defined in app.tasks to avoid circular imports
 
 
 @app.on_event("startup")
@@ -69,7 +67,8 @@ async def on_startup():
     for i in range(worker_count):
         workers.append(asyncio.create_task(worker_loop(i)))
 
-    # Attach web router after components are ready
+    # Attach web router after components are ready (import here to avoid circular import)
+    from .webui import router as web_router  # local import
     app.include_router(web_router)
 
 
