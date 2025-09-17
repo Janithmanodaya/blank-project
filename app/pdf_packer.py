@@ -78,21 +78,21 @@ class PDFComposer:
         packing_decisions: List[Dict] = []
 
         i = 0
-        while  << len(infos):
+        while i < len(infos):
             cells, used, allow_upscale, stretch = self._pack_page_advanced(infos[i:], margin)
             # draw page with cells
             page_meta = {"items": []}
             for info, (x, y, w, h) in cells:
-                # Always preserve aspect ratio to avoid distortion
-                scale = min(w / info.width, h / info.height) if allow_upscale else min(w / info.width, h / info.heightawImage(str(info.path), ox, oy, width=rw, height=rh, preserveAspectRatio=False, anchor='c')
-                else:
-                    # scale to fit cell, preserve aspect
-                    scale = min(w / info.width, h / info.height) if allow_upscale else min(w / info.width, h / info.height, 1.0)
-                    rw, rh = int(info.width * scale), int(info.height * scale)
-                    # center within cell
-                    ox = int(x + (w - rw) // 2)
-                    oy = int(y + (h - rh) // 2)
-                    c.drawImage(str(info.path), ox, oy, width=rw, height=rh, preserveAspectRatio=True, anchor='c')
+                # Always preserve original aspect ratio.
+                # Compute scale to fit inside the cell, optionally avoiding upscaling.
+                scale = min(w / info.width, h / info.height)
+                if not allow_upscale:
+                    scale = min(scale, 1.0)
+                rw, rh = int(info.width * scale), int(info.height * scale)
+                # center within cell
+                ox = int(x + (w - rw) // 2)
+                oy = int(y + (h - rh) // 2)
+                c.drawImage(str(info.path), ox, oy, width=rw, height=rh, preserveAspectRatio=True, anchor='c')
                 page_meta["items"].append({
                     "file": str(info.path),
                     "orig": [info.width, info.height],
