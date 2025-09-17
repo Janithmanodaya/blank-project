@@ -7,6 +7,8 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4
 import random
 import math
+import logging
+from datetime import datetime, timezone
 
 from .storage import Storage
 
@@ -18,6 +20,10 @@ LARGER_MIN_SHORT = 0.80  # Short side must be at least 80% of A5 short to count 
 LARGER_MIN_LONG = 1.00   # Long side must be at least 100% of A5 long
 PAIR_SEARCH_N = 6        # Search window for finding a second A5-like image
 GUTTER_MM = 5.0          # Gap between side-by-side A5 cells
+
+# Use a separate DPI for A5 comparison to better reflect typical phone images
+# This makes "larger than A5" more permissive while still reasonable.
+A5_COMPARE_DPI = 200
 
 
 @dataclass
@@ -49,8 +55,19 @@ class PDFComposer:
         self.A5_W = self._mm_to_px(148.0)
         self.A5_H = self._mm_to_px(210.0)
 
+        # logger
+        self._log = logging.getLogger(__name__).info
+        try:
+            self._log(f"pdf_packer init: dpi={self.dpi} A4_px=({self.A4_W}x{self.A4_H}) A5_px=({self.A5_W}x{self.A5_H})")
+        except Exception:
+            pass
+
     def _mm_to_px(self, mm: float) -> int:
         return int(round(mm / 25.4 * self.dpi))
+
+    def _mm_to_px_custom(self, mm: float, dpi: int) -> int:
+        """Convert mm to pixels at a custom DPI, used for A5 comparison thresholds."""
+        return int(round(mm / 25.4 * dpi))
 
     def _mm_to_pts(self, mm: float) -> float:
         """Convert millimeters to points (1 pt = 1/72 inch). Useful if switching to points."""
@@ -136,16 +153,16 @@ class PDFComposer:
     def _is_larger_than_a5(self, w: int, h: int) -> bool:
         """
         Return True if the image should be considered larger than A5.
-        Strategy:
-        - Primary: both dimensions are at least (1 - 5%) of A5's corresponding dimensions.
-        - Fallback: area is at least (1 + 10%) of A5 area (even if one dimension is a bit short).
+        Recommended strategy:
+        - Primary: max_dim >= A5_long AND min_dim >= A5_short * LARGER_MIN_SHORT (e.g., 0.8)
+        - Fallback: area >= A5 area * (1 + 10%)
         """
         img_short, img_long = sorted((w, h))
         a5_short, a5_long = self._a5_dims()
 
-        # Primary dimensional check with small margin (5%)
-        small_margin = 0.05
-        if (img_short >= a5_short * (1 - small_margin)) and (img_long >= a5_long * (1 - small_margin)):
+        primary = (img_long >= a5_long * LARGER_MIN_LONG) and (img_short >= a5_short * LARGER_MIN_SHORT)
+
+        if primary:
             return True
 
         # Fallback by area
@@ -171,13 +188,31 @@ class PDFComposer:
         x0, y0 = margin, margin
 
         first = remaining[0]
+        a5_short, a5_long = self._a5_dims()
+        try:
+            self._log(f"[A5] page_w={page_w} page_h={page_h} a5_px=({a5_short}x{a5_long}) first=({first.width}x{first.height})")
+        except Exception:
+            pass
+
         if self._is_larger_than_a5(first.width, first.height):
+            try:
+                self._log(f"[A5] first image considered larger-than-A5 -> full page")
+            except Exception:
+                pass
             # Single full page cell
             return [(first, (x0, y0, page_w, page_h))], 1, False, [0]
 
         # Find two A5-like images within a window
         window_n = min(PAIR_SEARCH_N, len(remaining))
-        a5_indices = [idx for idx in range(window_n) if self._is_a5_roughly(remaining[idx].width, remaining[idx].height)]
+        a5_indices = []
+        for idx in range(window_n):
+            info = remaining[idx]
+            if self._is_a5_roughly(info.width, info.height):
+                a5_indices.append(idx)
+                try:
+                    self._log(f"[A5] candidate roughly A5 at idx={idx} size=({info.width}x{info.height})")
+                except Exception:
+                    pass
 
         if len(a5_indices) >= 2:
             i, j = a5_indices[0], a5_indices[1]
@@ -187,8 +222,16 @@ class PDFComposer:
             cell_w = (page_w - gutter) // 2
             left_cell = (x0, y0, cell_w, page_h)
             right_cell = (x0 + cell_w + gutter, y0, cell_w, page_h)
+            try:
+                self._log(f"[A5] pairing indices {i},{j} -> side-by-side cells width={cell_w} gutter={gutter}")
+            except Exception:
+                pass
             return [(left_info, left_cell), (right_info, right_cell)], 2, False, [i, j]
 
+        try:
+            self._log(f"[A5] no special A5 placement, fallback to advanced packer")
+        except Exception:
+            pass
         # no special packing
         return [], 0, False, []
 
