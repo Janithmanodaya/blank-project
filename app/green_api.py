@@ -34,7 +34,7 @@ class GreenAPIClient:
         return f"{self.base_url}/waInstance{self.id_instance}/DeleteNotification/{self.api_token}"
 
     async def upload_file(self, file_path: Path) -> Dict[str, Any]:
-        # Recommended flow: uploadFile -> returns urlFile
+        # Recommended flow: uploadFile -> returns urlFile and sometimes idFile
         url = self._url("uploadFile")
         async with httpx.AsyncClient(timeout=60) as client:
             with file_path.open("rb") as f:
@@ -48,6 +48,23 @@ class GreenAPIClient:
         payload = {
             "chatId": chat_id,
             "urlFile": url_file,
+            "fileName": filename,
+        }
+        if caption:
+            payload["caption"] = caption
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(url, json=payload)
+            resp.raise_for_status()
+            return resp.json()
+
+    async def send_file_by_id(self, chat_id: str, file_id: str, filename: str, caption: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Alternative to send by URL: some deployments prefer sending by previously uploaded file id.
+        """
+        url = self._url("sendFileById")
+        payload = {
+            "chatId": chat_id,
+            "idMessage": file_id,  # some docs use 'idFile' or 'fileId', Green API expects idMessage for upload id
             "fileName": filename,
         }
         if caption:

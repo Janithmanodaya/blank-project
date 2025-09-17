@@ -121,14 +121,16 @@ async def worker_loop(worker_id: int):
                 # Upload and send
                 upload = await client.upload_file(pdf_result.pdf_path)
                 db.update_job_upload(job_id, upload)
+                # Choose destination chat: ADMIN_CHAT_ID if set, otherwise original sender
+                dest_chat = os.getenv("ADMIN_CHAT_ID", "") or (job.get("sender") or "")
                 send_resp = await client.send_file_by_url(
-                    chat_id=os.getenv("ADMIN_CHAT_ID", ""),
-                    url_file=upload["urlFile"],
+                    chat_id=dest_chat,
+                    url_file=upload.get("urlFile", ""),
                     filename=pdf_result.pdf_path.name,
                     caption=f"PDF from {job['sender']} message {job['msg_id']}",
                 )
                 db.update_job_status(job_id, "SENT")
-                db.append_job_log(job_id, {"upload": upload, "send": send_resp})
+                db.append_job_log(job_id, {"upload": upload, "send": send_resp, "dest_chat": dest_chat})
 
                 json_log("job_sent", worker_id=worker_id, job_id=job_id)
             except asyncio.CancelledError:
