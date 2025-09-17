@@ -239,6 +239,9 @@ class PDFComposer:
         if not image_files:
             raise ValueError("No images to compose")
         infos = self._load_infos(image_files)
+        if not infos:
+            # Prevent empty PDFs: no valid image detected
+            raise ValueError("No valid images to compose (all inputs were non-image or unreadable)")
         margin = self._margin_px()
 
         pdf_path, meta_path = self.storage.pdf_output_paths(job["sender"], job["msg_id"])
