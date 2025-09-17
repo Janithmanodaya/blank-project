@@ -13,16 +13,17 @@ from datetime import datetime, timezone
 from .storage import Storage
 
 # Tolerance and layout constants
-TOL_DIM = 0.15   # 15% per-dimension tolerance for "roughly A5"
-TOL_AREA = 0.20  # 20% area tolerance for "roughly A5"
+TOL_DIM = 0.18   # 18% per-dimension tolerance for "roughly A5"
+TOL_AREA = 0.30  # 30% area tolerance for "roughly A5"
 TOL_AR = 0.10    # 10% aspect ratio tolerance for "roughly A5"
-LARGER_MIN_SHORT = 0.80  # Short side must be at least 80% of A5 short to count as "larger"
-LARGER_MIN_LONG = 1.00   # Long side must be at least 100% of A5 long
-PAIR_SEARCH_N = 6        # Search window for finding a second A5-like image
+# Consider "larger than A5" if long side >= 100% and short side >= 65% of A5 at comparison DPI
+LARGER_MIN_SHORT = 0.65
+LARGER_MIN_LONG = 1.00
+PAIR_SEARCH_N = 50       # Search window for finding a second A5-like image
 GUTTER_MM = 5.0          # Gap between side-by-side A5 cells
 
-# Use a separate DPI for A5 comparison to better reflect typical phone images
-# This makes "larger than A5" more permissive while still reasonable.
+# Use a separate DPI for A5 comparison to better reflect typical phone images (often scaled)
+# This makes "larger than A5" and "roughly A5" more permissive while still reasonable.
 A5_COMPARE_DPI = 200
 
 
@@ -115,20 +116,25 @@ class PDFComposer:
         return min(max(margin_from_mm, 0), max(margin_from_pct, 0)) or margin_from_mm
 
     # --- A5-specific logic ---
-    def _a5_dims(self) -> Tuple[int, int]:
-        """Return (short_side_px, long_side_px) for A5 at current DPI."""
-        short = min(self.A5_W, self.A5_H)
-        long = max(self.A5_W, self.A5_H)
+    def _a5_dims(self, use_compare_dpi: bool = False) -> Tuple[int, int]:
+        """Return (short_side_px, long_side_px) for A5. If use_compare_dpi=True, use A5_COMPARE_DPI."""
+        if use_compare_dpi:
+            short = min(self._mm_to_px_custom(148.0, A5_COMPARE_DPI), self._mm_to_px_custom(210.0, A5_COMPARE_DPI))
+            long = max(self._mm_to_px_custom(148.0, A5_COMPARE_DPI), self._mm_to_px_custom(210.0, A5_COMPARE_DPI))
+        else:
+            short = min(self.A5_W, self.A5_H)
+            long = max(self.A5_W, self.A5_H)
         return short, long
 
     def _is_a5_roughly(self, w: int, h: int, tol: float = TOL_DIM) -> bool:
         """
         Return True if the image dimensions are roughly equal to A5.
         Accept either per-dimension match within tol, or (area within TOL_AREA and aspect ratio within TOL_AR).
-        Orientation is normalized by sorting sides.
+        Orientation is normalized by sorting sides. Uses a more permissive comparison DPI for robustness.
         """
         img_short, img_long = sorted((w, h))
-        a5_short, a5_long = self._a5_dims()
+        # Use comparison DPI to reduce false negatives from scaling artifacts
+        a5_short, a5_long = self._a5_dims(use_compare_dpi=True)
 
         # Per-dimension tolerance check
         dim_ok = (
@@ -142,6 +148,8 @@ class PDFComposer:
         # Fallback by area + aspect
         img_area = max(1, img_short * img_long)
         a5_area = a5_short * a5_long
+        if a5_area <= 0:
+            return False
         area_ok = abs(img_area - a5_area) / a5_area <= TOL_AREA
 
         img_ar = img_long / max(img_short, 1)
