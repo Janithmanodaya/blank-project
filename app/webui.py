@@ -101,6 +101,8 @@ def html_page(body: str) -> HTMLResponse:
       .hint {{ font-size: 12px; color: var(--muted); margin-top: 4px; }}
       .grid-2 {{ display:grid; gap:12px; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }}
       label {{ display:block; margin: 8px 0 6px; font-size: 13px; color:#cfd3e4; }}
+      .codebox {{ background:#0e1020; padding:10px; border-radius:10px; overflow:auto; }}
+      code {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }}
     </style>
   </head>
   <body>
@@ -137,7 +139,7 @@ def ui(db: Database = Depends(get_db), token: Optional[str] = Query(default=None
         jid, sender, msg_id, status, created_at, pdf_path = j
         link = f'<a class="button" href="/ui/resend/{jid}?token={token}">Resend</a>' if pdf_path else '<span class="muted">-</span>'
         open_pdf = f'<a class="button" href="/ui/file/pdf/{Path(pdf_path).name}?token={token}">Open</a>' if pdf_path else ""
-        rows += f"<tr><td>{jid}</td><td>{sender}</td><td>{msg_id}</td><td><span class='badge'>{status}</span></td><td>{created_at}</td><td>{open_pdf} {link}</td></tr>"
+        rows += f"<tr><td><a class='button' href='/ui/job/{jid}?token={token}'>#{jid}</a></td><td>{sender}</td><td>{msg_id}</td><td><span class='badge'>{status}</span></td><td>{created_at}</td><td>{open_pdf} {link}</td></tr>"
 
     pdf_list = "".join(
         f'<li><a class="button" href="/ui/file/pdf/{p.name}?token={token}">{p.name}</a></li>' for p in pdf_files
@@ -220,6 +222,33 @@ def ui(db: Database = Depends(get_db), token: Optional[str] = Query(default=None
     </div>
     """
 
+    # Recent logs for quick analysis
+    recent_logs = db.get_recent_logs(50)
+    log_rows = ""
+    import html as _html
+    import json as _json
+    for l in recent_logs:
+        entry_json = _json.dumps(l["entry"]) if l.get("entry") is not None else ""
+        entry_preview = _html.escape(entry_json[:120] + ("..." if len(entry_json) > 120 else ""))
+        log_rows += (
+            f"<tr>"
+            f"<td>{l['id']}</td>"
+            f"<td><a class='button' href='/ui/job/{l['job_id']}?token={token}'>#{l['job_id']}</a></td>"
+            f"<td>{l['created_at']}</td>"
+            f"<td><code>{entry_preview}</code></td>"
+            f"</tr>"
+        )
+
+    logs_html = f"""
+    <div class="card">
+      <h3>Recent Logs</h3>
+      <table>
+        <tr><th>ID</th><th>Job</th><th>Time</th><th>Entry</th></tr>
+        {log_rows or '<tr><td colspan="4"><span class="muted">No logs yet</span></td></tr>'}
+      </table>
+    </div>
+    """
+
     body = f"""
     <div class="grid">
       {settings_html}
@@ -235,6 +264,71 @@ def ui(db: Database = Depends(get_db), token: Optional[str] = Query(default=None
         <div class="row">
           {pdf_list if pdf_list else '<span class="muted">No PDFs yet</span>'}
         </div>
+      </div>
+      {logs_html}
+    </div>
+    """
+    return html_page(body)
+
+
+@router.get("/ui/job/{job_id}")
+def job_detail(job_id: int, db: Database = Depends(get_db), token: Optional[str] = Query(default=None)):
+    check_auth(token, db)
+    job = db.get_job(job_id)
+    if not job:
+        raise HTTPException(404, "job not found")
+    media = db.get_media_for_job(job_id)
+    logs = db.get_job_logs(job_id)
+
+    import json as _json
+    import html as _html
+
+    def code_block(obj) -> str:
+        try:
+            s = _json.dumps(obj, indent=2, ensure_ascii=False)
+        except Exception:
+            s = str(obj)
+        return f"<div class='codebox'><pre><code>{_html.escape(s)}</code></pre></div>"
+
+    media_rows = ""
+    for m in media:
+        media_rows += f"<tr><td>{m['id']}</td><td>{_html.escape(_json.dumps(m['payload'])[:80])}</td><td>{_html.escape(str(m['local_path'] or ''))}</td></tr>"
+
+    log_items = "".join(
+        f"<li><div class='muted'>{_html.escape(l['created_at'])} · log #{l['id']}</div>{code_block(l['entry'])}</li>"
+        for l in logs
+    ) or "<span class='muted'>No logs</span>"
+
+    pdf_actions = ""
+    if job.get("pdf_path"):
+        name = Path(job["pdf_path"]).name
+        pdf_actions = f"<a class='button' href='/ui/file/pdf/{name}?token={token}'>Open PDF</a>"
+
+    body = f"""
+    <div class="grid">
+      <div class="card">
+        <h3>Job #{job_id}</h3>
+        <div class="row">Status: <span class='badge'>{_html.escape(job.get('status') or '')}</span></div>
+        <div class="row">Sender: {_html.escape(job.get('sender') or '')}</div>
+        <div class="row">Msg ID: {_html.escape(job.get('msg_id') or '')}</div>
+        <div class="row">Created: {_html.escape(job.get('created_at') or '')}</div>
+        <div class="row">Updated: {_html.escape(job.get('updated_at') or '')}</div>
+        <div class="row">{pdf_actions}</div>
+      </div>
+
+      <div class="card">
+        <h3>Media</h3>
+        <table>
+          <tr><th>ID</th><th>Payload</th><th>Local Path</th></tr>
+          {media_rows or '<tr><td colspan="3"><span class="muted">No media</span></td></tr>'}
+        </table>
+      </div>
+
+      <div class="card" style="grid-column: 1 / -1;">
+        <h3>Logs</h3>
+        <ul style="list-style:none; padding:0; margin:0;">
+          {log_items}
+        </ul>
       </div>
     </div>
     """

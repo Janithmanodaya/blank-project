@@ -152,6 +152,30 @@ class Database:
             )
             con.commit()
 
+    def get_job_logs(self, job_id: int) -> List[Dict[str, Any]]:
+        with self._conn() as con:
+            cur = con.cursor()
+            rows = cur.execute(
+                "SELECT id, job_id, entry_json, created_at FROM job_logs WHERE job_id=? ORDER BY id ASC",
+                (job_id,),
+            ).fetchall()
+            res = []
+            for r in rows:
+                res.append({"id": r[0], "job_id": r[1], "entry": json.loads(r[2]) if r[2] else None, "created_at": r[3]})
+            return res
+
+    def get_recent_logs(self, limit: int = 100) -> List[Dict[str, Any]]:
+        with self._conn() as con:
+            cur = con.cursor()
+            rows = cur.execute(
+                "SELECT id, job_id, entry_json, created_at FROM job_logs ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            res = []
+            for r in rows:
+                res.append({"id": r[0], "job_id": r[1], "entry": json.loads(r[2]) if r[2] else None, "created_at": r[3]})
+            return res
+
     def get_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:
         with self._conn() as con:
             cur = con.cursor()
