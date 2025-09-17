@@ -23,16 +23,18 @@ def check_auth(token: Optional[str], db: Optional[Database] = None):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
+from string import Template
+
 def html_page(body: str) -> HTMLResponse:
-    html = f"""
-<!doctype html>
+    admin_token = os.getenv("ADMIN_PASSWORD", "") or ""
+    html = Template("""<!doctype html>
 <html>
   <head>
     <meta charset="utf-8"/>
     <title>Relay WebUI</title>
     <meta name="viewport" content="width=device-width, initial-scale=1"/>
     <style>
-      :root {{
+      :root {
         --bg: #0f1120;
         --card: #16182a;
         --muted: #8a8fa6;
@@ -40,10 +42,13 @@ def html_page(body: str) -> HTMLResponse:
         --accent: #7c4dff;
         --accent2: #00d4ff;
         --ok: #3ddc97;
+        --warn: #f7b955;
         --err: #ff6b6b;
-      }}
-      * {{ box-sizing: border-box; }}
-      body {{
+        --surface: rgba(255,255,255,0.06);
+      }
+      * { box-sizing: border-box; }
+      html, body { height: 100%; }
+      body {
         margin: 0;
         font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
         color: var(--text);
@@ -52,57 +57,99 @@ def html_page(body: str) -> HTMLResponse:
           radial-gradient(1000px 500px at 110% 10%, rgba(0,212,255,0.15), transparent 60%),
           linear-gradient(180deg, #0b0d1a, #0f1120);
         min-height: 100vh;
-      }}
-      header {{
-        padding: 24px 20px;
+      }
+      header {
+        padding: 16px 20px;
         display: flex;
         justify-content: space-between;
         align-items: center;
         border-bottom: 1px solid rgba(255,255,255,0.06);
         background: linear-gradient(180deg, rgba(255,255,255,0.02), transparent);
-      }}
-      .brand {{
+        position: sticky;
+        top: 0;
+        z-index: 10;
+        backdrop-filter: blur(8px);
+      }
+      .brand {
         font-weight: 700;
         letter-spacing: 0.3px;
         font-size: 18px;
-      }}
-      .container {{ padding: 24px; max-width: 1200px; margin: 0 auto; }}
-      .grid {{ display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }}
-      .card {{
+      }
+      .container { padding: 20px; max-width: 1280px; margin: 0 auto; }
+      /* Layout: main content with a right sidebar having independent scroll */
+      .layout {
+        display: grid;
+        grid-template-columns: 1fr 360px;
+        gap: 16px;
+        align-items: start;
+      }
+      .stack { display: grid; gap: 16px; }
+      .card {
         background: var(--card);
-        border: 1px solid rgba(255,255,255,0.06);
+        border: 1px solid var(--surface);
         border-radius: 14px;
         padding: 16px;
         box-shadow: 0 10px 25px rgba(0,0,0,0.25);
-      }}
-      .card h3 {{ margin: 0 0 10px; font-size: 16px; color: #fff; }}
-      .muted {{ color: var(--muted); }}
-      .button {{
+      }
+      .card h3 { margin: 0 0 10px; font-size: 16px; color: #fff; }
+      .muted { color: var(--muted); }
+      .button {
         display: inline-block; padding: 8px 12px; border-radius: 10px;
         border: 1px solid rgba(255,255,255,0.12); color: #fff; text-decoration: none;
         background: linear-gradient(135deg, rgba(124,77,255,0.25), rgba(0,212,255,0.18));
         transition: transform .08s ease, filter .15s ease, opacity .2s ease;
-      }}
-      .button:hover {{ filter: brightness(1.06); transform: translateY(-1px); }}
-      .button.danger {{ background: linear-gradient(135deg, rgba(255,107,107,0.25), rgba(255,0,102,0.18)); }}
-      .badge {{ padding: 4px 8px; border-radius: 999px; font-size: 12px; border: 1px solid rgba(255,255,255,0.2); }}
-      .ok {{ color: var(--ok); }}
-      .err {{ color: var(--err); }}
-      table {{ border-collapse: collapse; width: 100%; }}
-      th, td {{ border-bottom: 1px solid rgba(255,255,255,0.08); padding: 10px; font-size: 14px; }}
-      th {{ text-align: left; color: #cfd3e4; }}
-      .row {{ margin-bottom: 10px; }}
-      input[type="text"], input[type="password"], textarea {{
+      }
+      .button:hover { filter: brightness(1.06); transform: translateY(-1px); }
+      .button.danger { background: linear-gradient(135deg, rgba(255,107,107,0.25), rgba(255,0,102,0.18)); }
+      .badge {
+        padding: 4px 8px; border-radius: 999px; font-size: 12px;
+        border: 1px solid rgba(255,255,255,0.2); display:inline-block;
+      }
+      .ok { color: var(--ok); }
+      .err { color: var(--err); }
+      .status-pending { color: var(--warn); border-color: rgba(247,185,85,0.35); }
+      .status-done, .status-success { color: var(--ok); border-color: rgba(61,220,151,0.35); }
+      .status-error, .status-failed { color: var(--err); border-color: rgba(255,107,107,0.35); }
+      .stats {
+        display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px;
+      }
+      .stat {
+        background: linear-gradient(180deg, rgba(255,255,255,0.02), transparent);
+        border: 1px solid var(--surface);
+        border-radius: 12px; padding: 12px;
+      }
+      .stat .label { font-size: 12px; color: var(--muted); }
+      .stat .value { font-size: 20px; font-weight: 700; }
+      table { border-collapse: collapse; width: 100%; }
+      thead th { position: sticky; top: 0; background: #15172b; z-index: 1; }
+      th, td { border-bottom: 1px solid rgba(255,255,255,0.08); padding: 10px; font-size: 14px; }
+      th { text-align: left; color: #cfd3e4; }
+      tr:hover td { background: rgba(255,255,255,0.02); }
+      .row { margin-bottom: 10px; }
+      input[type="text"], input[type="password"], textarea {
         width: 100%; padding: 10px; border-radius: 10px;
         border: 1px solid rgba(255,255,255,0.12); background: #0e1020; color: #fff;
-      }}
-      textarea {{ min-height: 100px; resize: vertical; }}
-      form .actions {{ margin-top: 10px; display: flex; gap: 10px; }}
-      .hint {{ font-size: 12px; color: var(--muted); margin-top: 4px; }}
-      .grid-2 {{ display:grid; gap:12px; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }}
-      label {{ display:block; margin: 8px 0 6px; font-size: 13px; color:#cfd3e4; }}
-      .codebox {{ background:#0e1020; padding:10px; border-radius:10px; overflow:auto; }}
-      code {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }}
+      }
+      textarea { min-height: 100px; resize: vertical; }
+      form .actions { margin-top: 10px; display: flex; gap: 10px; }
+      .hint { font-size: 12px; color: var(--muted); margin-top: 4px; }
+      .grid-2 { display:grid; gap:12px; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+      label { display:block; margin: 8px 0 6px; font-size: 13px; color:#cfd3e4; }
+      .codebox { background:#0e1020; padding:10px; border-radius:10px; overflow:auto; }
+      code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+      /* Scrollable sections */
+      .scroll {
+        max-height: 420px;
+        overflow: auto;
+        border-radius: 10px;
+      }
+      .list { list-style: none; padding: 0; margin: 0; }
+      .list-item {
+        display: flex; justify-content: space-between; align-items: center;
+        padding: 8px 0; border-bottom: 1px dashed rgba(255,255,255,0.08);
+      }
+      .list-item:last-child { border-bottom: none; }
+      .kicker { font-size: 12px; color: var(--muted); }
     </style>
   </head>
   <body>
@@ -110,15 +157,15 @@ def html_page(body: str) -> HTMLResponse:
       <div class="brand">GreenAPI Image→PDF Relay</div>
       <div>
         <a class="button" href="https://green-api.com" target="_blank" rel="noreferrer">Green-API</a>
-        <a class="button" href="/ui?token={os.getenv("ADMIN_PASSWORD","")}" title="Refresh">Refresh</a>
+        <a class="button" href="/ui?token=$admin_token" title="Refresh">Refresh</a>
       </div>
     </header>
     <div class="container">
-      {body}
+      $body
     </div>
   </body>
 </html>
-"""
+""").substitute(body=body, admin_token=admin_token)
     return HTMLResponse(html)
 
 
@@ -139,7 +186,17 @@ def ui(db: Database = Depends(get_db), token: Optional[str] = Query(default=None
         jid, sender, msg_id, status, created_at, pdf_path = j
         link = f'<a class="button" href="/ui/resend/{jid}?token={token}">Resend</a>' if pdf_path else '<span class="muted">-</span>'
         open_pdf = f'<a class="button" href="/ui/file/pdf/{Path(pdf_path).name}?token={token}">Open</a>' if pdf_path else ""
-        rows += f"<tr><td><a class='button' href='/ui/job/{jid}?token={token}'>#{jid}</a></td><td>{sender}</td><td>{msg_id}</td><td><span class='badge'>{status}</span></td><td>{created_at}</td><td>{open_pdf} {link}</td></tr>"
+        status_class = f"status-{(status or '').lower()}"
+        rows += (
+            f"<tr>"
+            f"<td><a class='button' href='/ui/job/{jid}?token={token}'>#{jid}</a></td>"
+            f"<td>{sender}</td>"
+            f"<td>{msg_id}</td>"
+            f"<td><span class='badge {status_class}'>{status}</span></td>"
+            f"<td>{created_at}</td>"
+            f"<td>{open_pdf} {link}</td>"
+            f"</tr>"
+        )
 
     pdf_list = "".join(
         f'<li><a class="button" href="/ui/file/pdf/{p.name}?token={token}">{p.name}</a></li>' for p in pdf_files
@@ -242,30 +299,61 @@ def ui(db: Database = Depends(get_db), token: Optional[str] = Query(default=None
     logs_html = f"""
     <div class="card">
       <h3>Recent Logs</h3>
-      <table>
-        <tr><th>ID</th><th>Job</th><th>Time</th><th>Entry</th></tr>
-        {log_rows or '<tr><td colspan="4"><span class="muted">No logs yet</span></td></tr>'}
-      </table>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>ID</th><th>Job</th><th>Time</th><th>Entry</th></tr></thead>
+          {log_rows or '<tr><td colspan="4"><span class="muted">No logs yet</span></td></tr>'}
+        </table>
+      </div>
     </div>
     """
 
     body = f"""
-    <div class="grid">
-      {settings_html}
-      <div class="card">
-        <h3>Recent Jobs</h3>
-        <table>
-          <tr><th>ID</th><th>Sender</th><th>Msg</th><th>Status</th><th>Created</th><th>Actions</th></tr>
-          {rows}
-        </table>
-      </div>
-      <div class="card">
-        <h3>Recent PDFs</h3>
-        <div class="row">
-          {pdf_list if pdf_list else '<span class="muted">No PDFs yet</span>'}
+    <div class="layout">
+      <div class="stack">
+        <div class="card">
+          <h3>Dashboard</h3>
+          <div class="stats">
+            <div class="stat"><div class="label">Jobs (last 100)</div><div class="value">{len(jobs)}</div></div>
+            <div class="stat"><div class="label">PDFs (recent)</div><div class="value">{len(pdf_files)}</div></div>
+            <div class="stat"><div class="label">Queue</div><div class="value" id="qsize">—</div></div>
+          </div>
+          <div class="kicker">Overview</div>
         </div>
+
+        {settings_html}
+
+        <div class="card">
+          <h3>Recent Jobs</h3>
+          <div class="scroll">
+            <table>
+              <thead><tr><th>ID</th><th>Sender</th><th>Msg</th><th>Status</th><th>Created</th><th>Actions</th></tr></thead>
+              {rows}
+            </table>
+          </div>
+        </div>
+
+        {logs_html}
       </div>
-      {logs_html}
+
+      <aside class="stack">
+        <div class="card">
+          <h3>Recent PDFs</h3>
+          <div class="scroll">
+            <ul class="list">
+              {pdf_list if pdf_list else '<li><span class="muted">No PDFs yet</span></li>'}
+            </ul>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>Quick Actions</h3>
+          <div class="list">
+            <div class="list-item"><span>Toggle Auto-Reply</span><a class="button" href="/ui/auto-reply/toggle?token={token}">Toggle</a></div>
+            <div class="list-item"><span>Reload</span><a class="button" href="/ui?token={token}">Refresh</a></div>
+          </div>
+        </div>
+      </aside>
     </div>
     """
     return html_page(body)

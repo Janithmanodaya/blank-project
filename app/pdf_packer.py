@@ -6,8 +6,24 @@ from PIL import Image
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4
 import random
+import math
+import logging
+from datetime import datetime, timezone
 
 from .storage import Storage
+
+# Tolerance and layout constants
+TOL_DIM = 0.15   # 15% per-dimension tolerance for "roughly A5"
+TOL_AREA = 0.20  # 20% area tolerance for "roughly A5"
+TOL_AR = 0.10    # 10% aspect ratio tolerance for "roughly A5"
+LARGER_MIN_SHORT = 0.80  # Short side must be at least 80% of A5 short to count as "larger"
+LARGER_MIN_LONG = 1.00   # Long side must be at least 100% of A5 long
+PAIR_SEARCH_N = 6        # Search window for finding a second A5-like image
+GUTTER_MM = 5.0          # Gap between side-by-side A5 cells
+
+# Use a separate DPI for A5 comparison to better reflect typical phone images
+# This makes "larger than A5" more permissive while still reasonable.
+A5_COMPARE_DPI = 200
 
 
 @dataclass
@@ -31,12 +47,31 @@ class PDFComposer:
         self.dpi = dpi
         self.margin_mm = margin_mm
 
-        # A4 at 300 DPI
+        # A4 at 300 DPI (inches: 8.27 x 11.69)
         self.A4_W = int(8.27 * dpi)  # ~2480
         self.A4_H = int(11.69 * dpi)  # ~3508
 
+        # A5 size in pixels at given DPI (148 x 210 mm)
+        self.A5_W = self._mm_to_px(148.0)
+        self.A5_H = self._mm_to_px(210.0)
+
+        # logger
+        self._log = logging.getLogger(__name__).info
+        try:
+            self._log(f"pdf_packer init: dpi={self.dpi} A4_px=({self.A4_W}x{self.A4_H}) A5_px=({self.A5_W}x{self.A5_H})")
+        except Exception:
+            pass
+
     def _mm_to_px(self, mm: float) -> int:
         return int(round(mm / 25.4 * self.dpi))
+
+    def _mm_to_px_custom(self, mm: float, dpi: int) -> int:
+        """Convert mm to pixels at a custom DPI, used for A5 comparison thresholds."""
+        return int(round(mm / 25.4 * dpi))
+
+    def _mm_to_pts(self, mm: float) -> float:
+        """Convert millimeters to points (1 pt = 1/72 inch). Useful if switching to points."""
+        return mm * 72.0 / 25.4
 
     def _classify(self, w: int, h: int) -> str:
         a4w, a4h = self.A4_W, self.A4_H
@@ -51,10 +86,23 @@ class PDFComposer:
         return "small"
 
     def _load_infos(self, files: List[Path]) -> List[ImageInfo]:
+        """
+        Load image metadata, skipping non-image files gracefully (e.g., PDFs or corrupt files).
+        """
         infos: List[ImageInfo] = []
         for p in files:
-            with Image.open(p) as im:
-                w, h = im.size
+            try:
+                # Quick extension filter to avoid obvious non-images
+                if p.suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff", ".bmp"}:
+                    # Try to open anyway in case extension is misleading
+                    with Image.open(p) as im:
+                        w, h = im.size
+                else:
+                    with Image.open(p) as im:
+                        w, h = im.size
+            except Exception:
+                # Skip files PIL cannot identify (e.g., PDFs or text)
+                continue
             infos.append(ImageInfo(path=p, width=w, height=h, area=w*h, cls=self._classify(w, h)))
         # deterministic: sort by area desc then name
         infos.sort(key=lambda x: (-x.area, str(x.path)))
@@ -66,10 +114,134 @@ class PDFComposer:
         margin_from_pct = int(round(0.03 * self.A4_W))
         return min(max(margin_from_mm, 0), max(margin_from_pct, 0)) or margin_from_mm
 
+    # --- A5-specific logic ---
+    def _a5_dims(self) -> Tuple[int, int]:
+        """Return (short_side_px, long_side_px) for A5 at current DPI."""
+        short = min(self.A5_W, self.A5_H)
+        long = max(self.A5_W, self.A5_H)
+        return short, long
+
+    def _is_a5_roughly(self, w: int, h: int, tol: float = TOL_DIM) -> bool:
+        """
+        Return True if the image dimensions are roughly equal to A5.
+        Accept either per-dimension match within tol, or (area within TOL_AREA and aspect ratio within TOL_AR).
+        Orientation is normalized by sorting sides.
+        """
+        img_short, img_long = sorted((w, h))
+        a5_short, a5_long = self._a5_dims()
+
+        # Per-dimension tolerance check
+        dim_ok = (
+            (1 - tol) * a5_short <= img_short <= (1 + tol) * a5_short and
+            (1 - tol) * a5_long  <= img_long  <= (1 + tol) * a5_long
+        )
+
+        if dim_ok:
+            return True
+
+        # Fallback by area + aspect
+        img_area = max(1, img_short * img_long)
+        a5_area = a5_short * a5_long
+        area_ok = abs(img_area - a5_area) / a5_area <= TOL_AREA
+
+        img_ar = img_long / max(img_short, 1)
+        a5_ar = a5_long / max(a5_short, 1)
+        ar_ok = abs(img_ar - a5_ar) / a5_ar <= TOL_AR
+
+        return area_ok and ar_ok
+
+    def _is_larger_than_a5(self, w: int, h: int) -> bool:
+        """
+        Return True if the image should be considered larger than A5.
+        Recommended strategy:
+        - Primary: max_dim >= A5_long AND min_dim >= A5_short * LARGER_MIN_SHORT (e.g., 0.8)
+        - Fallback: area >= A5 area * (1 + 10%)
+        """
+        img_short, img_long = sorted((w, h))
+        a5_short, a5_long = self._a5_dims()
+
+        primary = (img_long >= a5_long * LARGER_MIN_LONG) and (img_short >= a5_short * LARGER_MIN_SHORT)
+
+        if primary:
+            return True
+
+        # Fallback by area
+        img_area = img_short * img_long
+        a5_area = a5_short * a5_long
+        if a5_area > 0 and (img_area >= a5_area * 1.10):
+            return True
+
+        return False
+
+    def _pack_page_a5(self, remaining: List[ImageInfo], margin: int) -> Tuple[List[Tuple[ImageInfo, Tuple[int,int,int,int]]], int, bool, List[int]]:
+        """
+        Implement the requested A5 logic:
+        - If first image is larger than A5 -> put it as a single full-page image.
+        - Else, search the first PAIR_SEARCH_N items for a pair of roughly-A5 images and place them side-by-side.
+        Returns (cells, used_count, allow_upscale, used_indices_relative_to_remaining).
+        """
+        if not remaining:
+            return [], 0, False, []
+
+        page_w = self.A4_W - 2 * margin
+        page_h = self.A4_H - 2 * margin
+        x0, y0 = margin, margin
+
+        first = remaining[0]
+        a5_short, a5_long = self._a5_dims()
+        try:
+            self._log(f"[A5] page_w={page_w} page_h={page_h} a5_px=({a5_short}x{a5_long}) first=({first.width}x{first.height})")
+        except Exception:
+            pass
+
+        if self._is_larger_than_a5(first.width, first.height):
+            try:
+                self._log(f"[A5] first image considered larger-than-A5 -> full page")
+            except Exception:
+                pass
+            # Single full page cell
+            return [(first, (x0, y0, page_w, page_h))], 1, False, [0]
+
+        # Find two A5-like images within a window
+        window_n = min(PAIR_SEARCH_N, len(remaining))
+        a5_indices = []
+        for idx in range(window_n):
+            info = remaining[idx]
+            if self._is_a5_roughly(info.width, info.height):
+                a5_indices.append(idx)
+                try:
+                    self._log(f"[A5] candidate roughly A5 at idx={idx} size=({info.width}x{info.height})")
+                except Exception:
+                    pass
+
+        if len(a5_indices) >= 2:
+            i, j = a5_indices[0], a5_indices[1]
+            left_info = remaining[i]
+            right_info = remaining[j]
+            gutter = max(self._mm_to_px(GUTTER_MM), 8)  # small gap between halves
+            cell_w = (page_w - gutter) // 2
+            left_cell = (x0, y0, cell_w, page_h)
+            right_cell = (x0 + cell_w + gutter, y0, cell_w, page_h)
+            try:
+                self._log(f"[A5] pairing indices {i},{j} -> side-by-side cells width={cell_w} gutter={gutter}")
+            except Exception:
+                pass
+            return [(left_info, left_cell), (right_info, right_cell)], 2, False, [i, j]
+
+        try:
+            self._log(f"[A5] no special A5 placement, fallback to advanced packer")
+        except Exception:
+            pass
+        # no special packing
+        return [], 0, False, []
+
     def compose(self, job: Dict, image_files: List[Path]) -> PDFComposeResult:
         if not image_files:
             raise ValueError("No images to compose")
         infos = self._load_infos(image_files)
+        if not infos:
+            # Prevent empty PDFs: no valid image detected
+            raise ValueError("No valid images to compose (all inputs were non-image or unreadable)")
         margin = self._margin_px()
 
         pdf_path, meta_path = self.storage.pdf_output_paths(job["sender"], job["msg_id"])
@@ -79,33 +251,66 @@ class PDFComposer:
 
         i = 0
         while i < len(infos):
-            cells, used, allow_upscale, stretch = self._pack_page_advanced(infos[i:], margin)
-            # draw page with cells
-            page_meta = {"items": []}
-            for info, (x, y, w, h) in cells:
-                # Always preserve original aspect ratio.
-                # Compute scale to fit inside the cell, optionally avoiding upscaling.
-                scale = min(w / info.width, h / info.height)
-                if not allow_upscale:
-                    scale = min(scale, 1.0)
-                rw, rh = int(info.width * scale), int(info.height * scale)
-                # center within cell
-                ox = int(x + (w - rw) // 2)
-                oy = int(y + (h - rh) // 2)
-                c.drawImage(str(info.path), ox, oy, width=rw, height=rh, preserveAspectRatio=True, anchor='c')
-                page_meta["items"].append({
-                    "file": str(info.path),
-                    "orig": [info.width, info.height],
-                    "placed": [ox, oy, rw, rh],
-                    "cls": info.cls,
-                })
-            # draw 0.5 cm border around page
-            border_inset = self._mm_to_px(5.0)
-            c.setLineWidth(1)
-            c.rect(border_inset, border_inset, self.A4_W - 2 * border_inset, self.A4_H - 2 * border_inset, stroke=1, fill=0)
-            packing_decisions.append(page_meta)
-            c.showPage()
-            i += used
+            # Try A5 rules first. This may select non-consecutive indices; if so, we'll remove them explicitly.
+            special = self._pack_page_a5(infos[i:], margin)
+            if special[1] > 0:
+                special_cells, used_special, allow_upscale_special, used_indices = special
+                cells, allow_upscale = special_cells, allow_upscale_special
+
+                # draw page with cells
+                page_meta = {"items": []}
+                for info, (x, y, w, h) in cells:
+                    scale = min(w / info.width, h / info.height)
+                    if not allow_upscale:
+                        scale = min(scale, 1.0)
+                    rw, rh = int(info.width * scale), int(info.height * scale)
+                    ox = int(x + (w - rw) // 2)
+                    oy = int(y + (h - rh) // 2)
+                    c.drawImage(str(info.path), ox, oy, width=rw, height=rh, preserveAspectRatio=True, anchor='c')
+                    page_meta["items"].append({
+                        "file": str(info.path),
+                        "orig": [info.width, info.height],
+                        "placed": [ox, oy, rw, rh],
+                        "cls": info.cls,
+                    })
+                border_inset = self._mm_to_px(5.0)
+                c.setLineWidth(1)
+                c.rect(border_inset, border_inset, self.A4_W - 2 * border_inset, self.A4_H - 2 * border_inset, stroke=1, fill=0)
+                packing_decisions.append(page_meta)
+                c.showPage()
+
+                # Remove used items from infos[i:] by popping indices in descending order
+                if used_indices:
+                    for rel_idx in sorted(used_indices, reverse=True):
+                        infos.pop(i + rel_idx)
+                # Do not advance i; the next item shifts into position i
+                continue
+            else:
+                # Fallback to advanced packer which always consumes from the head
+                cells, used, allow_upscale, stretch = self._pack_page_advanced(infos[i:], margin)
+
+                # draw page with cells
+                page_meta = {"items": []}
+                for info, (x, y, w, h) in cells:
+                    scale = min(w / info.width, h / info.height)
+                    if not allow_upscale:
+                        scale = min(scale, 1.0)
+                    rw, rh = int(info.width * scale), int(info.height * scale)
+                    ox = int(x + (w - rw) // 2)
+                    oy = int(y + (h - rh) // 2)
+                    c.drawImage(str(info.path), ox, oy, width=rw, height=rh, preserveAspectRatio=True, anchor='c')
+                    page_meta["items"].append({
+                        "file": str(info.path),
+                        "orig": [info.width, info.height],
+                        "placed": [ox, oy, rw, rh],
+                        "cls": info.cls,
+                    })
+                border_inset = self._mm_to_px(5.0)
+                c.setLineWidth(1)
+                c.rect(border_inset, border_inset, self.A4_W - 2 * border_inset, self.A4_H - 2 * border_inset, stroke=1, fill=0)
+                packing_decisions.append(page_meta)
+                c.showPage()
+                i += used
 
         c.save()
 
