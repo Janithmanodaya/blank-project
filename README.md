@@ -42,7 +42,7 @@ Setup
    export GREEN_API_API_TOKEN=...
    export ADMIN_CHAT_ID=...
    export GEMINI_API_KEY=...           # required for auto-replies and file QA
-   export GEMINI_MODEL=gemini-1.5-flash  # optional, override default model
+   export GEMINI_MODEL=gemma-3n-E4B-it   # optional, override default model
 
 3) Run the server:
    python run.py
@@ -65,7 +65,7 @@ Environment variables
 - PORT (default: 8080)
 - WORKERS (default: 2)
 - GEMINI_API_KEY (required for LLM features)
-- GEMINI_MODEL (optional; defaults to gemini-1.5-flash)
+- GEMINI_MODEL (optional; defaults to gemma-3n-E4B-it)
 
 Deterministic A4 PDF rules
 - A4 @ 300 DPI → 2480 × 3508 px

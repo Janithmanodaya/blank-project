@@ -111,7 +111,7 @@ class GeminiFileQA:
             or db.get_setting("GEMINI_MODEL", None)
             or os.getenv("GEMINI_MODEL")
         )
-        model = configured or "gemini-1.5-flash"
+        model = configured or "gemma-3n-E4B-it"
         genai.configure(api_key=api_key)
         self.model = genai.GenerativeModel(model)
 
