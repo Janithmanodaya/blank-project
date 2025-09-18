@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: greenapi-image-pdf-relay
+    env: python
+    plan: free
+    region: oregon
+    autoDeploy: true
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      # Set the following securely in the Render Dashboard after creating the service:
+      # - GREEN_API_BASE_URL (optional; defaults to https://api.green-api.com)
+      # - GREEN_API_INSTANCE_ID
+      # - GREEN_API_API_TOKEN
+      # - ADMIN_CHAT_ID
+      # - ADMIN_PASSWORD (optional, for /ui protection)
+      # - GEMINI_API_KEY (required for LLM features)
+      # - GEMINI_MODEL (optional)
+    disk:
+      name: storage
+      mountPath: /opt/render/project/src/storage
+      sizeGB: 1
+    healthCheckPath: /health
+    # Install native packages required by yt-dlp for some operations
+    # (reportlab/Pillow ship wheels; ffmpeg is useful for video handling)
+    # See https://render.com/docs/native-dependencies
+    aptPackages:
+      - ffmpeg
