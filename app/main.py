@@ -26,6 +26,15 @@ except Exception:
 APP_TITLE = "GreenAPI Image→PDF Relay"
 VERSION = "0.4.0"
 
+# Ensure stdout uses UTF-8 so emojis and non-ASCII don't crash logging on Windows
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(message)s",
@@ -35,7 +44,7 @@ logging.basicConfig(
 
 def json_log(event: str, **kwargs):
     payload = {"ts": datetime.utcnow().isoformat() + "Z", "event": event, **kwargs}
-    logging.info(json.dumps(payload))
+    logging.info(json.dumps(payload, ensure_ascii=False))
 
 
 app = FastAPI(title=APP_TITLE, version=VERSION)
