@@ -14,7 +14,7 @@ import httpx
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse, parse_qs
 
 from .db import Database, get_db
 from .green_api import GreenAPIClient
@@ -356,20 +356,44 @@ def _fmt_mb(nbytes: Optional[Union[int, float]]) -> str:
         return "unknown"
 
 
+def _normalize_youtube_url(url: str) -> str:
+    """
+    Convert youtu.be and shorts URLs to canonical watch?v= form where possible.
+    """
+    try:
+        u = urlparse(url)
+        host = (u.netloc or "").lower()
+        path = u.path or ""
+        if "youtu.be" in host:
+            vid = path.strip("/").split("/")[0]
+            if vid:
+                return f"https://www.youtube.com/watch?v={vid}"
+        if "youtube.com" in host and "/shorts/" in path:
+            vid = path.split("/shorts/")[1].split("/")[0]
+            if vid:
+                return f"https://www.youtube.com/watch?v={vid}"
+        return url
+    except Exception:
+        return url
+
+
 async def _ytdl_prepare_choices(url: str) -> List[Dict[str, Any]]:
     """
     Inspect available formats with yt-dlp -J and pick reasonable 480p and 720p progressive formats.
     Returns a list of dicts: [{"key":"1","label":"480p","format_id":"XXX","size_mb":80}, ...]
     """
     try:
+        norm_url = _normalize_youtube_url(url)
         proc = await asyncio.create_subprocess_exec(
-            "yt-dlp", "-J", url,
+            "yt-dlp", "-J", "--no-playlist", "--force-ipv4",
+            "--extractor-args", "youtube:player_client=android",
+            norm_url,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         stdout, stderr = await proc.communicate()
         if proc.returncode != 0:
-            json_log("ytdl_probe_error", url=url, stderr=stderr.decode("utf-8", "ignore")[:200])
+            json_log("ytdl_probe_error", url=norm_url, stderr=stderr.decode("utf-8", "ignore")[:200])
             return []
         import json as _json
         info = _json.loads(stdout.decode("utf-8", "ignore") or "{}")
@@ -493,6 +517,10 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
     if not webhook_type:
         json_log("webhook_ignored", reason="missing_typeWebhook")
         return {"ok": True, "ignored": True}
+    # Only process incoming messages; ignore outgoing echoes to avoid replying to ourselves
+    if str(webhook_type).lower() not in {"incomingmessagereceived"}:
+        json_log("webhook_ignored", reason="not_incoming", type=str(webhook_type))
+        return {"ok": True, "ignored": True}
 
     # Extract sender, message id, media list heuristically
     instance_id = payload.get("instanceData", {}).get("idInstance") or os.getenv("GREEN_API_INSTANCE_ID", "")
@@ -608,8 +636,13 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
             tmp_dir.mkdir(parents=True, exist_ok=True)
             out_tpl = str(tmp_dir / "yt_video.%(ext)s")
             fmt_selector = str(selected_fmt.get("format_id") or "best")
-            # If format_id looks like a selector (contains '[' or 'best'), pass as-is; else an exact id
-            cmd = f"yt-dlp -f {shlex.quote(fmt_selector)} -o {shlex.quote(out_tpl)} {shlex.quote(pending_url)}"
+            url_norm = _normalize_youtube_url(pending_url)
+            # More resilient flags for YouTube (ipv4, android client); avoid playlists
+            cmd = (
+                f"yt-dlp --no-playlist --force-ipv4 "
+                f"--extractor-args youtube:player_client=android "
+                f"-f {shlex.quote(fmt_selector)} -o {shlex.quote(out_tpl)} {shlex.quote(url_norm)}"
+            )
             proc = await asyncio.create_subprocess_shell(cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
             stdout, stderr = await proc.communicate()
             if proc.returncode != 0:
@@ -644,19 +677,20 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
     # If text contains a YouTube link
     yt_url = find_youtube_url(text_msg or "")
     if yt_url:
-        json_log("youtube_link_detected", sender=sender, url=yt_url)
+        yt_norm = _normalize_youtube_url(yt_url)
+        json_log("youtube_link_detected", sender=sender, url=yt_norm)
         # Prepare choices (480p/720p) and ask user to choose
-        choices = await _ytdl_prepare_choices(yt_url)
+        choices = await _ytdl_prepare_choices(yt_norm)
         if not choices:
             # fallback to a simple yes/no with default 480p
-            qa_state.set_pending_ytdl(sender, yt_url)
-            ytdl_pending[sender] = {"url": yt_url, "choices": [{"key": "1", "label": "480p", "format_id": "best[height<=480]"}]}
+            qa_state.set_pending_ytdl(sender, yt_norm)
+            ytdl_pending[sender] = {"url": yt_norm, "choices": [{"key": "1", "label": "480p", "format_id": "best[height<=480]/best"}]}
             if _is_sender_allowed(sender, db) and sender != "unknown":
                 await client.send_message(chat_id=sender, message="You sent a YouTube link. Reply 1 to download at 480p.")
             return {"ok": True, "job_id": None}
         # Save pending menu
-        qa_state.set_pending_ytdl(sender, yt_url)
-        ytdl_pending[sender] = {"url": yt_url, "choices": choices}
+        qa_state.set_pending_ytdl(sender, yt_norm)
+        ytdl_pending[sender] = {"url": yt_norm, "choices": choices}
         json_log("ytdl_menu_prepared", sender=sender, choices=[{"key": c["key"], "label": c["label"], "size_mb": c.get("size_mb")} for c in choices])
         if _is_sender_allowed(sender, db) and sender != "unknown":
             items = []
