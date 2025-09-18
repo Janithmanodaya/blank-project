@@ -59,14 +59,20 @@ logging.basicConfig(
 
 
 def json_log(event: str, **kwargs):
-    # Write JSON log directly to a UTF-8 wrapped stdout to avoid Windows 'charmap' encoding errors
+    """
+    Emit an ASCII-only JSON log line so Windows consoles with legacy codepages don't crash
+    when messages contain emojis or non-ASCII characters.
+    """
     payload = {"ts": datetime.utcnow().isoformat() + "Z", "event": event, **kwargs}
+    line = json.dumps(payload, ensure_ascii=True)
     try:
-        _stdout_utf8.write(json.dumps(payload, ensure_ascii=False) + "\n")
-        _stdout_utf8.flush()
+        logging.info(line)
     except Exception:
-        # As a last resort, fall back to logging (may escape unicode) to avoid crashing
-        logging.info(json.dumps(payload, ensure_ascii=True))
+        # Last resort: strip any non-ascii that slipped through
+        try:
+            logging.info(line.encode("ascii", "ignore").decode("ascii"))
+        except Exception:
+           _code pnewa</sse))
 
 
 app = FastAPI(title=APP_TITLE, version=VERSION)
