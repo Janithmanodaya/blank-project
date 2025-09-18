@@ -234,6 +234,8 @@ def ui(db: Database = Depends(get_db), token: Optional[str] = Query(default=None
         f'{option("gemini-1.5-flash", "gemini-1.5-flash")}'
         f'{option("gemini-1.5-flash-8b", "gemini-1.5-flash-8b")}'
         f'{option("gemini-1.5-pro", "gemini-1.5-pro")}'
+        f'{option("gemini-2.5-flash-lite", "Gemini 2.5 Flash-Lite")}'
+        f'{option("gemini-2.5-flash", "Gemini 2.5 Flash")}'
         f"</select>"
     )
 

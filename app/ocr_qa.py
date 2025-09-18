@@ -1,31 +1,90 @@
 import os
 import re
+import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import google.generativeai as genai
 
 from .db import Database
+from .storage import Storage
 
 
-# Simple in-memory per-chat state for resource-based Q&A and pending actions
+# Sessions keep files separate per chat. Each session has its own files and timestamp.
+@dataclass
+class Session:
+    id: str
+    files: List[Path]
+    created_at: float  # epoch seconds
+
+
 class ChatState:
     def __init__(self):
-        self.files: Dict[str, List[Path]] = {}
-        self.gemini_files: Dict[str, List[object]] = {}  # uploaded Gemini file handles
+        # sessions per chat_id
+        self.sessions: Dict[str, Dict[str, Session]] = {}
+        self.active: Dict[str, str] = {}
+        # gemini uploaded handles per chat_id per session_id
+        self.gemini_files: Dict[str, Dict[str, List[object]]] = {}
         self.pending_ytdl: Dict[str, Optional[str]] = {}
 
-    def add_files(self, chat_id: str, paths: List[Path]):
-        self.files.setdefault(chat_id, []).extend(paths)
+    def create_session(self, chat_id: str, session_id: str, paths: List[Path]):
+        sess = Session(id=session_id, files=list(paths), created_at=time.time())
+        self.sessions.setdefault(chat_id, {})[session_id] = sess
+        # make this the active session
+        self.active[chat_id] = session_id
 
-    def get_files(self, chat_id: str) -> List[Path]:
-        return self.files.get(chat_id, [])
+    def get_session(self, chat_id: str, session_id: Optional[str]) -> Optional[Session]:
+        if session_id:
+            return (self.sessions.get(chat_id) or {}).get(session_id)
+        # fallback to active
+        sid = self.active.get(chat_id)
+        if not sid:
+            # fallback to latest by created time
+            m = self.sessions.get(chat_id) or {}
+            if not m:
+                return None
+            sid = sorted(m.values(), key=lambda s: s.created_at, reverse=True)[0].id
+            self.active[chat_id] = sid
+        return (self.sessions.get(chat_id) or {}).get(sid)
 
-    def clear(self, chat_id: str):
-        self.files.pop(chat_id, None)
-        self.pending_ytdl.pop(chat_id, None)
-        # NOTE: we do not call genai.delete_file on uploaded handles to avoid requiring extra perms
+    def list_sessions(self, chat_id: str) -> List[Session]:
+        return sorted((self.sessions.get(chat_id) or {}).values(), key=lambda s: s.created_at, reverse=True)
+
+    def set_active(self, chat_id: str, session_id: str) -> bool:
+        if (self.sessions.get(chat_id) or {}).get(session_id):
+            self.active[chat_id] = session_id
+            return True
+        return False
+
+    def delete_session(self, chat_id: str, session_id: str, storage: Storage):
+        sess = (self.sessions.get(chat_id) or {}).pop(session_id, None)
+        if not sess:
+            return
+        # delete files
+        storage.delete_files(sess.files)
+        # clear handles
+        try:
+            self.gemini_files.get(chat_id, {}).pop(session_id, None)
+        except Exception:
+            pass
+        # adjust active if needed
+        if self.active.get(chat_id) == session_id:
+            self.active.pop(chat_id, None)
+
+    def clear_all(self, chat_id: str, storage: Storage):
+        for sid in list((self.sessions.get(chat_id) or {}).keys()):
+            self.delete_session(chat_id, sid, storage)
+        self.sessions.pop(chat_id, None)
         self.gemini_files.pop(chat_id, None)
+        self.pending_ytdl.pop(chat_id, None)
+
+    def purge_old(self, storage: Storage, max_age_seconds: int = 24 * 3600):
+        now = time.time()
+        for chat_id in list(self.sessions.keys()):
+            for sid, sess in list(self.sessions[chat_id].items()):
+                if now - sess.created_at >= max_age_seconds:
+                    self.delete_session(chat_id, sid, storage)
 
     def set_pending_ytdl(self, chat_id: str, url: Optional[str]):
         if url:
@@ -50,31 +109,33 @@ class GeminiFileQA:
         genai.configure(api_key=api_key)
         self.model = genai.GenerativeModel(model)
 
-    def _upload_for_chat(self, chat_id: str, files: List[Path]) -> List[object]:
-        uploaded = state.gemini_files.get(chat_id)
-        if uploaded is not None and len(uploaded) > 0:
-            return uploaded
+    def _upload_for_session(self, chat_id: str, session_id: str, files: List[Path]) -> List[object]:
+        uploaded_by_chat = state.gemini_files.setdefault(chat_id, {})
+        cached = uploaded_by_chat.get(session_id)
+        if cached is not None and len(cached) > 0:
+            return cached
         handles = []
         for p in files:
             try:
                 handle = genai.upload_file(path=str(p))
                 handles.append(handle)
             except Exception:
-                # If upload fails for an image, try passing PIL image? Keep it simple: skip
                 continue
-        state.gemini_files[chat_id] = handles
+        uploaded_by_chat[session_id] = handles
         return handles
 
-    def answer(self, chat_id: str, question: str, system_prompt: Optional[str] = None) -> str:
-        files = state.get_files(chat_id)
+    def answer(self, chat_id: str, question: str, system_prompt: Optional[str] = None, session_id: Optional[str] = None) -> str:
+        sess = state.get_session(chat_id, session_id)
+        if not sess:
+            return "I can't find that file. Can you send it again?"
+        files = sess.files
         if not files:
-            return "No resources available. Send an image or PDF first."
-        handles = self._upload_for_chat(chat_id, files)
+            return "I can't find that file. Can you send it again?"
+        handles = self._upload_for_session(chat_id, sess.id, files)
         if not handles:
-            return "Couldn't prepare the files for answering. Please try re-sending the file(s)."
+            return "Couldn't read the file(s). Please try sending them again."
         instructions = system_prompt or "Answer strictly and only using the provided files. If the information is not present, say you don't know."
         parts = [{"text": instructions}]
-        # Add user question last
         parts.extend(handles)
         parts.append({"text": f"User question: {question}"})
         try:

@@ -74,6 +74,8 @@ async def on_startup():
 
     # Launch Green API notification poller (for setups without webhooks)
     workers.append(asyncio.create_task(notification_poller()))
+    # Launch QA cleanup loop to purge sessions older than 24h
+    workers.append(asyncio.create_task(qa_cleanup_loop()))
 
     # Attach web router after components are ready (import here to avoid circular import)
     from .webui import router as web_router  # local import
@@ -406,7 +408,7 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
         return {"ok": True, "job_id": result_job_id}
 
     if media_list and not pdf_packer_enabled:
-        # Immediate download and enter QA mode for this chat
+        # Immediate download and create a separate session for this message (no batching)
         async with httpx.AsyncClient(timeout=60) as http_client:
             job_id = db.create_job(sender=sender, msg_id=str(msg_id), payload=payload, instance_id=str(instance_id))
             db.update_job_status(job_id, "PROCESSING")
@@ -419,26 +421,59 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
                 except Exception as e:
                     json_log("media_download_error", error=str(e))
             db.update_job_status(job_id, "COMPLETED")
-        from .ocr_qa import GeminiFileQA
-        try:
-            qa_state.add_files(sender, downloaded)
+        # Filter to files Gemini can read (images, pdf)
+        valid_ext = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp"}
+        valid_files = [p for p in downloaded if p.suffix.lower() in valid_ext]
+        from .ocr_qa import state as _state
+        # Create a new session id from msg_id (short)
+        session_id = str(msg_id)[-8:]
+        if valid_files:
+            _state.create_session(sender, session_id, valid_files)
             if _is_sender_allowed(sender, db):
-                await client.send_message(chat_id=sender, message=f"Received {len(downloaded)} file(s). You can now ask questions based only on these file(s). Send \"Stop\" to end this mode.")
-        except Exception as e:
+                await client.send_message(
+                    chat_id=sender,
+                    message=f"Received {len(valid_files)} file(s). Saved as session {session_id}. Ask questions about this file. You can switch with 'use {session_id}', list sessions with 'list', delete with 'delete {session_id}', or send 'Stop' to end and delete.",
+                )
+        else:
+            # Delete any downloaded non-usable files
+            storage.delete_files(downloaded)
             if _is_sender_allowed(sender, db):
-                await client.send_message(chat_id=sender, message=f"Files received. Q&A setup had an issue: {e}")
+                await client.send_message(chat_id=sender, message="I couldn't read the file(s) you sent. Please send images or PDFs.")
         return {"ok": True, "job_id": job_id}
 
     # If text and we are in QA mode for this chat
     if text_msg:
-        if text_msg.strip().lower() in {"stop", "exit", "quit"}:
-            from .ocr_qa import state as _state
-            _state.clear(sender)
-            if _is_sender_allowed(sender, db):
-                await client.send_message(chat_id=sender, message="Okay, exiting document Q&A mode.")
-            return {"ok": True, "job_id": None}
+        low = text_msg.strip().lower()
         from .ocr_qa import state as _state
-        if _state.get_files(sender):
+        # Commands for sessions
+        if low in {"stop", "exit", "quit"}:
+            _state.clear_all(sender, storage)
+            if _is_sender_allowed(sender, db):
+                await client.send_message(chat_id=sender, message="Okay, exiting document Q&A mode. I deleted your files.")
+            return {"ok": True, "job_id": None}
+        if low == "list":
+            sessions = _state.list_sessions(sender)
+            if _is_sender_allowed(sender, db):
+                if not sessions:
+                    await client.send_message(chat_id=sender, message="No saved sessions.")
+                else:
+                    lines = [f"{s.id} · {len(s.files)} file(s)" for s in sessions]
+                    await client.send_message(chat_id=sender, message="Sessions:\n" + "\n".join(lines))
+            return {"ok": True, "job_id": None}
+        if low.startswith("use "):
+            sid = text_msg.strip().split(" ", 1)[1].strip()
+            ok = _state.set_active(sender, sid)
+            if _is_sender_allowed(sender, db):
+                await client.send_message(chat_id=sender, message=("Switched to session " + sid) if ok else "I can't find that session id.")
+            return {"ok": True, "job_id": None}
+        if low.startswith("delete "):
+            sid = text_msg.strip().split(" ", 1)[1].strip()
+            _state.delete_session(sender, sid, storage)
+            if _is_sender_allowed(sender, db):
+                await client.send_message(chat_id=sender, message=f"Deleted session {sid}.")
+            return {"ok": True, "job_id": None}
+        # If we have any sessions, answer from active one
+        if _state.list_sessions(sender):
             try:
                 system_prompt = db.get_setting("auto_reply_system_prompt", "") or os.getenv(
                     "GEMINI_SYSTEM_PROMPT", "Answer strictly from the provided file(s)."
@@ -505,6 +540,21 @@ async def notification_poller():
         except Exception as e:
             json_log("receive_notification_error", error=str(e))
             await asyncio.sleep(2.0)
+
+
+async def qa_cleanup_loop():
+    """
+    Periodically purge per-chat sessions and files older than 24 hours.
+    """
+    from .ocr_qa import state as _state
+    while True:
+        try:
+            _state.purge_old(storage, 24 * 3600)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            json_log("qa_cleanup_error", error=str(e))
+        await asyncio.sleep(1800)  # every 30 minutes
 
 
 @app.post("/webhook")

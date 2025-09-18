@@ -84,6 +84,16 @@ class Storage:
         (raw_dir / "meta.json").write_text(json.dumps(meta, indent=2))
         return target
 
+    def delete_files(self, paths: List[Path]):
+        for p in paths:
+            try:
+                # only delete within storage
+                p = Path(p)
+                if self.base in p.resolve().parents:
+                    p.unlink(missing_ok=True)
+            except Exception:
+                pass
+
     def pdf_output_paths(self, sender: str, msg_id: str, suggest_name: Optional[str] = None):
         ts = datetime.utcnow().strftime("%Y%m%d")
         name = suggest_name or f"{ts}_{sender}_{msg_id}.pdf"
