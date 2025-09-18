@@ -12,6 +12,24 @@ from .storage import Storage
 router = APIRouter()
 storage = Storage()
 
+def _pretty_chat(chat: Optional[str]) -> str:
+    """
+    Render Green-API chatId like '94770889232@c.us' or '94770889232@us'
+    as human-friendly phone format '+94770889232'.
+    Leave non-phone/group ids unchanged.
+    """
+    if not chat:
+        return ""
+    s = str(chat).strip()
+    # If it already looks like a plus phone, keep it
+    if s.startswith("+") and "@" not in s:
+        return s
+    # Strip suffix like @c.us/@us and ensure it is digits-only before suffix
+    base = s.split("@", 1)[0]
+    if base.isdigit():
+        return "+" + base.lstrip("0").rjust(len(base), "0") if base.startswith("+") is False else base
+    return s
+
 
 def check_auth(token: Optional[str], db: Optional[Database] = None):
     expected = None
@@ -190,7 +208,7 @@ def ui(db: Database = Depends(get_db), token: Optional[str] = Query(default=None
         rows += (
             f"<tr>"
             f"<td><a class='button' href='/ui/job/{jid}?token={token}'>#{jid}</a></td>"
-            f"<td>{sender}</td>"
+            f"<td>{_pretty_chat(sender)}</td>"
             f"<td>{msg_id}</td>"
             f"<td><span class='badge {status_class}'>{status}</span></td>"
             f"<td>{created_at}</td>"
@@ -457,7 +475,7 @@ def job_detail(job_id: int, db: Database = Depends(get_db), token: Optional[str]
       <div class="card">
         <h3>Job #{job_id}</h3>
         <div class="row">Status: <span class='badge'>{_html.escape(job.get('status') or '')}</span></div>
-        <div class="row">Sender: {_html.escape(job.get('sender') or '')}</div>
+        <div class="row">Sender: {_html.escape(_pretty_chat(job.get('sender')))}</div>
         <div class="row">Msg ID: {_html.escape(job.get('msg_id') or '')}</div>
         <div class="row">Created: {_html.escape(job.get('created_at') or '')}</div>
         <div class="row">Updated: {_html.escape(job.get('updated_at') or '')}</div>
