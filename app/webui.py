@@ -8,6 +8,7 @@ from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, Redirect
 from .db import Database, get_db
 from .tasks import job_queue
 from .storage import Storage
+from .utils import normalize_whatsapp_id
 
 router = APIRouter()
 storage = Storage()
@@ -187,10 +188,11 @@ def ui(db: Database = Depends(get_db), token: Optional[str] = Query(default=None
         link = f'<a class="button" href="/ui/resend/{jid}?token={token}">Resend</a>' if pdf_path else '<span class="muted">-</span>'
         open_pdf = f'<a class="button" href="/ui/file/pdf/{Path(pdf_path).name}?token={token}">Open</a>' if pdf_path else ""
         status_class = f"status-{(status or '').lower()}"
+        sender_human = normalize_whatsapp_id(sender) or (sender or "")
         rows += (
             f"<tr>"
             f"<td><a class='button' href='/ui/job/{jid}?token={token}'>#{jid}</a></td>"
-            f"<td>{sender}</td>"
+            f"<td>{sender_human}</td>"
             f"<td>{msg_id}</td>"
             f"<td><span class='badge {status_class}'>{status}</span></td>"
             f"<td>{created_at}</td>"
@@ -292,7 +294,7 @@ def ui(db: Database = Depends(get_db), token: Optional[str] = Query(default=None
 
           <div>
             <label for="ADMIN_CHAT_ID">Admin Chat ID</label>
-            <input type="text" id="ADMIN_CHAT_ID" name="ADMIN_CHAT_ID" value="{admin_chat_id}" placeholder="1234567890@c.us"/>
+            <input type="text" id="ADMIN_CHAT_ID" name="ADMIN_CHAT_ID" value="{admin_chat_id}" placeholder="+1234567890"/>
           </div>
 
           <div>
@@ -309,13 +311,13 @@ def ui(db: Database = Depends(get_db), token: Optional[str] = Query(default=None
           </div>
           <div>
             <label for="ALLOW_NUMBERS">Allowed WhatsApp Numbers</label>
-            <textarea id="ALLOW_NUMBERS" name="ALLOW_NUMBERS" placeholder="1234567890@c.us, 2345678901@c.us">{allow_numbers}</textarea>
-            <div class="hint">Comma or newline separated. Used when Reply Policy = Allowed only.</div>
+            <textarea id="ALLOW_NUMBERS" name="ALLOW_NUMBERS" placeholder="+1234567890, +2345678901">{allow_numbers}</textarea>
+            <div class="hint">Comma or newline separated. You can use either +E.164 (e.g., +94770889232) or raw chat IDs; both are accepted.</div>
           </div>
           <div>
             <label for="BLOCK_NUMBERS">Blocked WhatsApp Numbers</label>
-            <textarea id="BLOCK_NUMBERS" name="BLOCK_NUMBERS" placeholder="spam1@c.us, spam2@c.us">{block_numbers}</textarea>
-            <div class="hint">Comma or newline separated. Used when Reply Policy = Block list.</div>
+            <textarea id="BLOCK_NUMBERS" name="BLOCK_NUMBERS" placeholder="+1111111111, +2222222222">{block_numbers}</textarea>
+            <div class="hint">Comma or newline separated. You can use either +E.164 or raw chat IDs.</div>
           </div>
         </div>
 
@@ -457,7 +459,7 @@ def job_detail(job_id: int, db: Database = Depends(get_db), token: Optional[str]
       <div class="card">
         <h3>Job #{job_id}</h3>
         <div class="row">Status: <span class='badge'>{_html.escape(job.get('status') or '')}</span></div>
-        <div class="row">Sender: {_html.escape(job.get('sender') or '')}</div>
+        <div class="row">Sender: {_html.escape(normalize_whatsapp_id(job.get('sender') or '') or (job.get('sender') or ''))}</div>
         <div class="row">Msg ID: {_html.escape(job.get('msg_id') or '')}</div>
         <div class="row">Created: {_html.escape(job.get('created_at') or '')}</div>
         <div class="row">Updated: {_html.escape(job.get('updated_at') or '')}</div>

@@ -21,6 +21,7 @@ from .green_api import GreenAPIClient
 from .pdf_packer import PDFComposer, PDFComposeResult
 from .storage import Storage
 from .tasks import job_queue, workers
+from .utils import normalize_whatsapp_id, to_chat_jid
 
 # Transient store for pending yt-dlp choices per sender
 ytdl_pending: Dict[str, Dict[str, Any]] = {}
@@ -177,15 +178,16 @@ async def worker_loop(worker_id: int):
                 upload = await client.upload_file(pdf_result.pdf_path)
                 db.update_job_upload(job_id, upload)
                 # Choose destination chat: ADMIN_CHAT_ID if set, otherwise original sender
-                dest_chat = os.getenv("ADMIN_CHAT_ID", "") or (job.get("sender") or "")
+                dest_chat_raw = os.getenv("ADMIN_CHAT_ID", "") or (job.get("sender") or "")
+                dest_chat_jid = to_chat_jid(dest_chat_raw) or dest_chat_raw
                 send_resp = await client.send_file_by_url(
-                    chat_id=dest_chat,
+                    chat_id=dest_chat_jid,
                     url_file=upload.get("urlFile", ""),
                     filename=pdf_result.pdf_path.name,
                     caption=f"PDF from {job['sender']} message {job['msg_id']}",
                 )
                 db.update_job_status(job_id, "SENT")
-                db.append_job_log(job_id, {"upload": upload, "send": send_resp, "dest_chat": dest_chat})
+                db.append_job_log(job_id, {"upload": upload, "send": send_resp, "dest_chat": dest_chat_jid})
 
                 json_log("job_sent", worker_id=worker_id, job_id=job_id)
             except asyncio.CancelledError:
@@ -283,15 +285,25 @@ def _is_sender_allowed(chat_id: Optional[str], db: Database) -> bool:
     mode = (db.get_setting("REPLY_MODE", "everyone") or "everyone").lower()
     allow_raw = db.get_setting("ALLOW_NUMBERS", "") or ""
     block_raw = db.get_setting("BLOCK_NUMBERS", "") or ""
+
     def parse_list(s: str) -> List[str]:
         parts = [p.strip() for p in s.replace("\n", ",").split(",") if p.strip()]
         return [p for p in parts]
+
     allows = set(parse_list(allow_raw))
     blocks = set(parse_list(block_raw))
+
+    # Normalize to human phone format like '+94770889232' for comparison
+    norm_sender = normalize_whatsapp_id(chat_id) or chat_id
+    allows_norm = {normalize_whatsapp_id(x) or x for x in allows}
+    blocks_norm = {normalize_whatsapp_id(x) or x for x in blocks}
+
     if mode == "allowlist":
-        return chat_id in allows
+        # Allow if sender matches either the raw item or its normalized form
+        return (chat_id in allows) or (norm_sender in allows_norm)
     if mode == "blocklist":
-        return chat_id not in blocks
+        # Block if matches raw or normalized; otherwise allowed
+        return (chat_id not in blocks) and (norm_sender not in blocks_norm)
     return True  # everyone
 
 async def maybe_auto_reply(payload: Dict[str, Any], db: Database):
