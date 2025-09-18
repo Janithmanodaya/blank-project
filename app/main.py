@@ -182,7 +182,7 @@ async def worker_loop(worker_id: int):
                     chat_id=dest_chat,
                     url_file=upload.get("urlFile", ""),
                     filename=pdf_result.pdf_path.name,
-                    caption=f"PDF from {job['sender']} message {job['msg_id']}",
+                    caption=f"PDF from {_format_display_chat(job.get('sender'))} message {job['msg_id']}",
                 )
                 db.update_job_status(job_id, "SENT")
                 db.append_job_log(job_id, {"upload": upload, "send": send_resp, "dest_chat": dest_chat})
@@ -355,6 +355,23 @@ def _fmt_mb(nbytes: Optional[Union[int, float]]) -> str:
         return f"{int(round(nbytes / (1024*1024)))}MB"
     except Exception:
         return "unknown"
+
+
+def _format_display_chat(chat_id: Optional[str]) -> str:
+    """
+    Format a WhatsApp chatId like '94770889232@c.us' into a human-friendly
+    phone number '+94770889232' for display purposes. Does not affect routing.
+    """
+    try:
+        if not chat_id:
+            return ""
+        s = str(chat_id)
+        num = s.split("@", 1)[0]  # strip any '@...'
+        if not num.startswith("+"):
+            num = "+" + num
+        return num
+    except Exception:
+        return str(chat_id or "")
 
 
 def _normalize_youtube_url(url: str) -> str:
