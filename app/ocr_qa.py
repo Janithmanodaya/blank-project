@@ -140,7 +140,14 @@ class GeminiFileQA:
         handles = self._upload_for_session(chat_id, sess.id, files)
         if not handles:
             return "Couldn't read the file(s). Please try sending them again."
-        instructions = system_prompt or "Answer strictly and only using the provided files. If the information is not present, say you don't know."
+        # Instruction upgraded to explicitly allow translation/explanation in any target language.
+        instructions = system_prompt or (
+            "You are a helpful assistant answering strictly and only using the provided files. "
+            "If the user asks you to translate or explain content in a specific language, respond in that language, "
+            "even if the source file text is in another language (translate as needed). "
+            "Do not refuse solely due to language differences. "
+            "If the requested information truly is not present in the files, say you don't know."
+        )
         # Use list-of-parts; google-generativeai supports passing a list
         parts: List[object] = [{"text": instructions}]
         parts.extend(handles)
