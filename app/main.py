@@ -4,6 +4,8 @@ import logging
 import os
 import sys
 import io
+import re
+import random
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union, TextIO
@@ -12,6 +14,7 @@ import httpx
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from urllib.parse import quote_plus
 
 from .db import Database, get_db
 from .green_api import GreenAPIClient
@@ -25,7 +28,7 @@ except Exception:
     GeminiResponder = None  # type: ignore
 
 APP_TITLE = "GreenAPI Image→PDF Relay"
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 # Predeclare stream so type checkers (Pylance) see it before first use
 _stdout_utf8: TextIO = sys.stdout
@@ -315,6 +318,57 @@ async def _enqueue_batch_later(sender: str, db: Database):
         json_log("batch_enqueue_error", sender=sender, error=str(e))
 
 
+async def _download_and_send_image(sender: str, query: str, prefer_ext: str, db: Database) -> bool:
+    client = GreenAPIClient.from_env()
+    tmp_dir = storage.base / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    ext = ".jpg" if prefer_ext.lower() in {"jpg", "jpeg"} else ".png"
+    name = f"img_{int(datetime.utcnow().timestamp())}_{random.randint(1000,9999)}{ext}"
+    out_path = tmp_dir / name
+
+    # Select a reliable source
+    url = ""
+    qlow = (query or "").strip().lower()
+    if "cat" in qlow and ("image" in qlow or "photo" in qlow or "jpg" in qlow or "jpeg" in qlow):
+        # Deterministic cute cat
+        w, h = 800, 600
+        seed = random.randint(1, 1_000_000)
+        url = f"https://placekitten.com/seed/{seed}/{w}/{h}"
+        ext = ".jpg"
+        out_path = tmp_dir / (out_path.stem + ".jpg")
+    else:
+        # Unsplash Source supports keyword without API key
+        url = f"https://source.unsplash.com/800x600/?{quote_plus(query)}"
+
+    try:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as hc:
+            r = await hc.get(url, headers={"User-Agent": "Mozilla/5.0"})
+            if r.status_code != 200 or not r.content:
+                return False
+            with out_path.open("wb") as f:
+                f.write(r.content)
+        up = await client.upload_file(out_path)
+        if _is_sender_allowed(sender, db):
+            await client.send_file_by_url(chat_id=sender, url_file=up.get("urlFile", ""), filename=out_path.name, caption=f"Image for: {query}")
+        try:
+            out_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return True
+    except Exception as e:
+        json_log("image_fetch_error", error=str(e), query=query)
+        try:
+            out_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        if _is_sender_allowed(sender, db):
+            try:
+                await client.send_message(chat_id=sender, message="I couldn't fetch an image right now.")
+            except Exception:
+                pass
+        return False
+
+
 async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict[str, Any]:
     # Persist raw payload
     ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
@@ -431,6 +485,20 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
                 head = "\n".join(links[:8])
                 await client.send_message(chat_id=sender, message=f"Top results for \"{query}\":\n{head}")
         return {"ok": True, "job_id": None}
+
+    # Image fetch command: "image: cats jpg" or "img: cat"
+    low = (text_msg or "").strip().lower()
+    if low.startswith("image:") or low.startswith("img:") or (("image" in low or "photo" in low or "picture" in low) and ("jpg" in low or "jpeg" in low or "png" in low or "cat" in low)):
+        body = text_msg.split(":", 1)[1].strip() if ":" in text_msg[:6] else text_msg
+        prefer_ext = "jpg"
+        if "png" in low:
+            prefer_ext = "png"
+        elif "jpeg" in low or "jpg" in low:
+            prefer_ext = "jpg"
+        ok_img = await _download_and_send_image(sender, body, prefer_ext, db)
+        if ok_img:
+            return {"ok": True, "job_id": None}
+        # if failed, fall through to other handlers
 
     # Toggle: if pdf_packer_enabled -> existing batching to PDF, else switch to QA mode
     pdf_packer_enabled = (db.get_setting("pdf_packer_enabled", "1") or "1") == "1"
