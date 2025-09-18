@@ -201,16 +201,42 @@ async def worker_loop(worker_id: int):
 
 
 def _extract_text_from_payload(payload: Dict[str, Any]) -> Optional[str]:
+    """
+    Extract human text from common Green-API payload shapes.
+    Handles:
+      - textMessageData.textMessage (typeMessage == textMessage)
+      - extendedTextMessageData.text (typeMessage == extendedTextMessage)
+      - captions for image/file/document
+    Fallback: None
+    """
     md = payload.get("messageData") or {}
     if not md:
         return None
-    # Green-API text messages carry typeMessage == "textMessage"
-    if md.get("typeMessage") == "textMessage":
+
+    t = (md.get("typeMessage") or "").lower()
+
+    # Standard text
+    if t == "textmessage":
         tmd = md.get("textMessageData") or {}
-        return tmd.get("textMessage") or None
-    # Some media messages may include caption; optionally reply on caption too
-    if "imageMessageData" in md:
-        return md.get("imageMessageData", {}).get("caption")
+        if tmd.get("textMessage"):
+            return tmd.get("textMessage")
+
+    # Extended text (links often live here)
+    if t == "extendedtextmessage":
+        etd = md.get("extendedTextMessageData") or {}
+        # Green-API usually uses 'text'
+        for k in ("text", "description", "title"):
+            v = etd.get(k)
+            if isinstance(v, str) and v.strip():
+                return v
+
+    # Captions on images/documents
+    for k in ("imageMessageData", "fileMessageData", "documentMessageData"):
+        if k in md:
+            cap = (md.get(k) or {}).get("caption")
+            if isinstance(cap, str) and cap.strip():
+                return cap
+
     return None
 
 
@@ -382,9 +408,17 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
 
     # Extract sender, message id, media list heuristically
     instance_id = payload.get("instanceData", {}).get("idInstance") or os.getenv("GREEN_API_INSTANCE_ID", "")
-    sender = payload.get("senderData", {}).get("chatId") or payload.get("senderData", {}).get("sender") or "unknown"
-    msg_id = payload.get("idMessage") or payload.get("messageData", {}).get("idMessage") or payload.get("receiptId") or ts
+    # Try multiple locations for sender/chat id; some notifications omit senderData
     message_data = payload.get("messageData") or {}
+    sender = (
+        payload.get("senderData", {}).get("chatId")
+        or payload.get("senderData", {}).get("sender")
+        or payload.get("chatId")
+        or message_data.get("chatId")
+        or payload.get("author")
+        or "unknown"
+    )
+    msg_id = payload.get("idMessage") or message_data.get("idMessage") or payload.get("receiptId") or ts
 
     # Time window filter (3 minutes)
     now = datetime.now(tz=timezone.utc)
@@ -430,9 +464,10 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
     # If text contains a YouTube link
     yt_url = find_youtube_url(text_msg or "")
     if yt_url:
+        json_log("youtube_link_detected", sender=sender, url=yt_url)
         # ask for confirmation
         qa_state.set_pending_ytdl(sender, yt_url)
-        if _is_sender_allowed(sender, db):
+        if _is_sender_allowed(sender, db) and sender != "unknown":
             await client.send_message(chat_id=sender, message="You sent a YouTube link. Do you want me to download this video and send it back? Reply YES to confirm.")
         return {"ok": True, "job_id": None}
 
