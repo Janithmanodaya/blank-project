@@ -196,13 +196,30 @@ def _extract_event_time(payload: Dict[str, Any]) -> Optional[datetime]:
 WINDOW_SECONDS = 180  # 3 minutes
 
 
+def _is_sender_allowed(chat_id: Optional[str], db: Database) -> bool:
+    if not chat_id:
+        return False
+    mode = (db.get_setting("REPLY_MODE", "everyone") or "everyone").lower()
+    allow_raw = db.get_setting("ALLOW_NUMBERS", "") or ""
+    block_raw = db.get_setting("BLOCK_NUMBERS", "") or ""
+    def parse_list(s: str) -> List[str]:
+        parts = [p.strip() for p in s.replace("\n", ",").split(",") if p.strip()]
+        return [p for p in parts]
+    allows = set(parse_list(allow_raw))
+    blocks = set(parse_list(block_raw))
+    if mode == "allowlist":
+        return chat_id in allows
+    if mode == "blocklist":
+        return chat_id not in blocks
+    return True  # everyone
+
 async def maybe_auto_reply(payload: Dict[str, Any], db: Database):
     # settings gate
     enabled = (db.get_setting("auto_reply_enabled", "0") or "0") == "1"
-    if not enabled:
-        return
     chat_id = payload.get("senderData", {}).get("chatId")
     if not chat_id:
+        return
+    if not _is_sender_allowed(chat_id, db):
         return
     text = _extract_text_from_payload(payload)
     if not text:
@@ -214,6 +231,8 @@ async def maybe_auto_reply(payload: Dict[str, Any], db: Database):
 
     if GeminiResponder is None:
         json_log("auto_reply_error", reason="gemini_module_missing")
+        return
+    if not enabled:
         return
 
     try:
@@ -304,7 +323,8 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
     if yt_url:
         # ask for confirmation
         qa_state.set_pending_ytdl(sender, yt_url)
-        await client.send_message(chat_id=sender, message="You sent a YouTube link. Do you want me to download this video and send it back? Reply YES to confirm.")
+        if _is_sender_allowed(sender, db):
+            await client.send_message(chat_id=sender, message="You sent a YouTube link. Do you want me to download this video and send it back? Reply YES to confirm.")
         return {"ok": True, "job_id": None}
 
     # If awaiting yt-dlp confirmation
@@ -321,23 +341,27 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
             proc = await asyncio.create_subprocess_shell(cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
             stdout, stderr = await proc.communicate()
             if proc.returncode != 0:
-                await client.send_message(chat_id=sender, message=f"Failed to download video. Error: {stderr.decode('utf-8', 'ignore')[:200]}")
+                if _is_sender_allowed(sender, db):
+                    await client.send_message(chat_id=sender, message=f"Failed to download video. Error: {stderr.decode('utf-8', 'ignore')[:200]}")
             else:
                 # find the produced file (mp4 preferred)
                 candidates = sorted(tmp_dir.glob("yt_video.*"), key=lambda p: p.stat().st_mtime, reverse=True)
                 if not candidates:
-                    await client.send_message(chat_id=sender, message="Download finished but no file was produced.")
+                    if _is_sender_allowed(sender, db):
+                        await client.send_message(chat_id=sender, message="Download finished but no file was produced.")
                 else:
                     video_path = candidates[0]
                     up = await client.upload_file(video_path)
-                    await client.send_file_by_url(chat_id=sender, url_file=up.get("urlFile", ""), filename=video_path.name, caption="Here is your video.")
+                    if _is_sender_allowed(sender, db):
+                        await client.send_file_by_url(chat_id=sender, url_file=up.get("urlFile", ""), filename=video_path.name, caption="Here is your video.")
                     try:
                         video_path.unlink()
                     except Exception:
                         pass
             qa_state.set_pending_ytdl(sender, None)
         except Exception as e:
-            await client.send_message(chat_id=sender, message=f"Error while downloading video: {e}")
+            if _is_sender_allowed(sender, db):
+                await client.send_message(chat_id=sender, message=f"Error while downloading video: {e}")
             qa_state.set_pending_ytdl(sender, None)
         return {"ok": True, "job_id": None}
 
@@ -345,11 +369,12 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
     if text_msg.lower().startswith("search:") or text_msg.lower().startswith("search "):
         query = text_msg.split(":", 1)[1].strip() if ":" in text_msg else text_msg.split(" ", 1)[1].strip()
         links = await _web_search_links(query)
-        if not links:
-            await client.send_message(chat_id=sender, message="No results found.")
-        else:
-            head = "\n".join(links[:8])
-            await client.send_message(chat_id=sender, message=f"Top results for \"{query}\":\n{head}")
+        if _is_sender_allowed(sender, db):
+            if not links:
+                await client.send_message(chat_id=sender, message="No results found.")
+            else:
+                head = "\n".join(links[:8])
+                await client.send_message(chat_id=sender, message=f"Top results for \"{query}\":\n{head}")
         return {"ok": True, "job_id": None}
 
     # Toggle: if pdf_packer_enabled -> existing batching to PDF, else switch to QA mode
@@ -397,9 +422,11 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
         from .ocr_qa import GeminiFileQA
         try:
             qa_state.add_files(sender, downloaded)
-            await client.send_message(chat_id=sender, message=f"Received {len(downloaded)} file(s). You can now ask questions based only on these file(s). Send \"Stop\" to end this mode.")
+            if _is_sender_allowed(sender, db):
+                await client.send_message(chat_id=sender, message=f"Received {len(downloaded)} file(s). You can now ask questions based only on these file(s). Send \"Stop\" to end this mode.")
         except Exception as e:
-            await client.send_message(chat_id=sender, message=f"Files received. Q&A setup had an issue: {e}")
+            if _is_sender_allowed(sender, db):
+                await client.send_message(chat_id=sender, message=f"Files received. Q&A setup had an issue: {e}")
         return {"ok": True, "job_id": job_id}
 
     # If text and we are in QA mode for this chat
@@ -407,7 +434,8 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
         if text_msg.strip().lower() in {"stop", "exit", "quit"}:
             from .ocr_qa import state as _state
             _state.clear(sender)
-            await client.send_message(chat_id=sender, message="Okay, exiting document Q&A mode.")
+            if _is_sender_allowed(sender, db):
+                await client.send_message(chat_id=sender, message="Okay, exiting document Q&A mode.")
             return {"ok": True, "job_id": None}
         from .ocr_qa import state as _state
         if _state.get_files(sender):
@@ -417,10 +445,11 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
                 )
                 qa = GeminiFileQA()
                 ans = qa.answer(sender, text_msg, system_prompt)
-                # GeminiFileQA.answer is sync; wrap in thread? It's fast since it's API call. Keep direct.
-                await client.send_message(chat_id=sender, message=ans)
+                if _is_sender_allowed(sender, db):
+                    await client.send_message(chat_id=sender, message=ans)
             except Exception as e:
-                await client.send_message(chat_id=sender, message=f"Error answering from files: {e}")
+                if _is_sender_allowed(sender, db):
+                    await client.send_message(chat_id=sender, message=f"Error answering from files: {e}")
             return {"ok": True, "job_id": None}
 
     # If no media and not QA/text special, create a job just to track non-media message; complete immediately
@@ -428,7 +457,22 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
     db.update_job_status(job_id, "COMPLETED")
     json_log("no_media_payload_stored", job_id=job_id)
 
-    # Try auto reply (non-blocking)
+    # Fallback intent understanding with Gemini when auto-reply is disabled or nothing matched
+    if text_msg and GeminiResponder is not None and _is_sender_allowed(sender, db):
+        auto_enabled = (db.get_setting("auto_reply_enabled", "0") or "0") == "1"
+        if not auto_enabled:
+            try:
+                system_prompt = db.get_setting("auto_reply_system_prompt", "") or os.getenv(
+                    "GEMINI_SYSTEM_PROMPT", "You are a helpful assistant. Identify the user's intent and respond concisely."
+                )
+                responder = GeminiResponder()
+                reply = responder.generate(text_msg, system_prompt)
+                await client.send_message(chat_id=sender, message=reply)
+                json_log("fallback_gemini_reply_sent", chat_id=sender)
+            except Exception as e:
+                json_log("fallback_gemini_reply_error", error=str(e))
+
+    # Try auto reply (non-blocking) if enabled
     asyncio.create_task(maybe_auto_reply(payload, db))
 
     return {"ok": True, "job_id": job_id}

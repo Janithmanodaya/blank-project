@@ -8,7 +8,7 @@ import google.generativeai as genai
 from .db import Database
 
 
-# Simple in-memory per-chat state for resource-based Q&amp;A and pending actions
+# Simple in-memory per-chat state for resource-based Q&A and pending actions
 class ChatState:
     def __init__(self):
         self.files: Dict[str, List[Path]] = {}
@@ -41,13 +41,14 @@ state = ChatState()
 
 
 class GeminiFileQA:
-    def __init__(self, model_name: str = "gemini-1.5-flash"):
+    def __init__(self, model_name: Optional[str] = None):
         db = Database()
         api_key = db.get_setting("GEMINI_API_KEY", None) or os.getenv("GEMINI_API_KEY")
         if not api_key:
             raise RuntimeError("GEMINI_API_KEY is not set")
+        model = model_name or db.get_setting("GEMINI_MODEL", None) or os.getenv("GEMINI_MODEL") or "gemini-1.5-flash"
         genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel(model_name)
+        self.model = genai.GenerativeModel(model)
 
     def _upload_for_chat(self, chat_id: str, files: List[Path]) -> List[object]:
         uploaded = state.gemini_files.get(chat_id)

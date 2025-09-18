@@ -211,6 +211,7 @@ def ui(db: Database = Depends(get_db), token: Optional[str] = Query(default=None
         return "<span class='badge ok'>Set</span>" if (val and len(val) > 0) else "<span class='badge'>Not set</span>"
 
     gemini_set = status_badge(db.get_setting("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY")))
+    gemini_model = db.get_setting("GEMINI_MODEL", os.getenv("GEMINI_MODEL", "gemini-1.5-flash")) or "gemini-1.5-flash"
     green_base = db.get_setting("GREEN_API_BASE_URL", os.getenv("GREEN_API_BASE_URL", "https://api.green-api.com")) or ""
     green_id = db.get_setting("GREEN_API_INSTANCE_ID", os.getenv("GREEN_API_INSTANCE_ID", "")) or ""
     green_token_set = status_badge(db.get_setting("GREEN_API_API_TOKEN", os.getenv("GREEN_API_API_TOKEN")))
@@ -218,6 +219,31 @@ def ui(db: Database = Depends(get_db), token: Optional[str] = Query(default=None
     workers_val = db.get_setting("WORKERS", os.getenv("WORKERS", "2")) or "2"
     admin_pw_set = status_badge(db.get_setting("ADMIN_PASSWORD", os.getenv("ADMIN_PASSWORD")))
     pdf_packer_enabled = (db.get_setting("pdf_packer_enabled", "1") or "1") == "1"
+
+    reply_mode = db.get_setting("REPLY_MODE", os.getenv("REPLY_MODE", "everyone")) or "everyone"
+    allow_numbers = db.get_setting("ALLOW_NUMBERS", os.getenv("ALLOW_NUMBERS", "")) or ""
+    block_numbers = db.get_setting("BLOCK_NUMBERS", os.getenv("BLOCK_NUMBERS", "")) or ""
+
+    # model select options
+    def option(val: str, label: str) -> str:
+        sel = " selected" if gemini_model == val else ""
+        return f'<option value="{val}"{sel}>{label}</option>'
+
+    model_select = (
+        f'<select id="GEMINI_MODEL" name="GEMINI_MODEL">'
+        f'{option("gemini-1.5-flash", "gemini-1.5-flash")}'
+        f'{option("gemini-1.5-flash-8b", "gemini-1.5-flash-8b")}'
+        f'{option("gemini-1.5-pro", "gemini-1.5-pro")}'
+        f"</select>"
+    )
+
+    reply_mode_select = (
+        f'<select id="REPLY_MODE" name="REPLY_MODE">'
+        f'<option value="everyone"{" selected" if reply_mode=="everyone" else ""}>Everyone</option>'
+        f'<option value="allowlist"{" selected" if reply_mode=="allowlist" else ""}>Allowed only</option>'
+        f'<option value="blocklist"{" selected" if reply_mode=="blocklist" else ""}>Block list</option>'
+        f"</select>"
+    )
 
     settings_html = f"""
     <div class="card">
@@ -232,6 +258,12 @@ def ui(db: Database = Depends(get_db), token: Optional[str] = Query(default=None
             <label for="GEMINI_API_KEY">Gemini API Key {gemini_set}</label>
             <input type="password" id="GEMINI_API_KEY" name="GEMINI_API_KEY" placeholder="Paste Gemini API key"/>
             <div class="hint">Leave blank to keep current.</div>
+          </div>
+
+          <div>
+            <label for="GEMINI_MODEL">Gemini Model</label>
+            {model_select}
+            <div class="hint">Pick the model used for answers and document Q&amp;A.</div>
           </div>
 
           <div>
@@ -264,6 +296,24 @@ def ui(db: Database = Depends(get_db), token: Optional[str] = Query(default=None
           <div>
             <label for="WORKERS">Workers</label>
             <input type="text" id="WORKERS" name="WORKERS" value="{workers_val}" placeholder="2"/>
+          </div>
+        </div>
+
+        <div class="grid-2" style="margin-top:10px;">
+          <div>
+            <label for="REPLY_MODE">Reply Policy</label>
+            {reply_mode_select}
+            <div class="hint">Everyone: reply to all; Allowed only: reply only to numbers listed below; Block list: reply to all except blocked numbers.</div>
+          </div>
+          <div>
+            <label for="ALLOW_NUMBERS">Allowed WhatsApp Numbers</label>
+            <textarea id="ALLOW_NUMBERS" name="ALLOW_NUMBERS" placeholder="1234567890@c.us, 2345678901@c.us">{allow_numbers}</textarea>
+            <div class="hint">Comma or newline separated. Used when Reply Policy = Allowed only.</div>
+          </div>
+          <div>
+            <label for="BLOCK_NUMBERS">Blocked WhatsApp Numbers</label>
+            <textarea id="BLOCK_NUMBERS" name="BLOCK_NUMBERS" placeholder="spam1@c.us, spam2@c.us">{block_numbers}</textarea>
+            <div class="hint">Comma or newline separated. Used when Reply Policy = Block list.</div>
           </div>
         </div>
 
@@ -484,6 +534,10 @@ async def save_settings(request: Request, db: Database = Depends(get_db), token:
         "GEMINI_API_KEY",
         "GREEN_API_API_TOKEN",
         "ADMIN_PASSWORD",
+        "GEMINI_MODEL",
+        "REPLY_MODE",
+        "ALLOW_NUMBERS",
+        "BLOCK_NUMBERS",
     ]:
         val = (form.get(key) or "").strip()
         if val:

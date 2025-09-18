@@ -7,12 +7,14 @@ from .db import Database
 
 
 class GeminiResponder:
-    def __init__(self, api_key: Optional[str] = None, model_name: str = "gemini-1.5-flash"):
+    def __init__(self, api_key: Optional[str] = None, model_name: Optional[str] = None):
+        db = Database()
         if api_key is None:
-            db = Database()
             api_key = db.get_setting("GEMINI_API_KEY", None) or os.getenv("GEMINI_API_KEY")
         if not api_key:
             raise RuntimeError("GEMINI_API_KEY is not set")
+        if model_name is None:
+            model_name = db.get_setting("GEMINI_MODEL", None) or os.getenv("GEMINI_MODEL") or "gemini-1.5-flash"
         genai.configure(api_key=api_key)
         self.model = genai.GenerativeModel(model_name)
 
