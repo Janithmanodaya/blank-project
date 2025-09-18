@@ -117,8 +117,17 @@ async def worker_loop(worker_id: int):
                         raise
 
                 # Compose PDF
-                pdf_result: PDFComposeResult = composer.compose(job, downloaded_files)
-                db.update_job_pdf(job_id, pdf_result.pdf_path, pdf_result.meta_path)
+                try:
+                    pdf_result: PDFComposeResult = composer.compose(job, downloaded_files)
+                    db.update_job_pdf(job_id, pdf_result.pdf_path, pdf_result.meta_path)
+                except Exception as e:
+                    # Inform original sender if allowed, then mark failed
+                    try:
+                        if _is_sender_allowed(job.get("sender"), db):
+                            await client.send_message(chat_id=(job.get("sender") or ""), message="I couldn't read the image(s) to create a PDF. Please resend clear images.")
+                    except Exception:
+                        pass
+                    raise
 
                 # Upload and send
                 upload = await client.upload_file(pdf_result.pdf_path)
@@ -304,8 +313,14 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
     media_list: List[Dict[str, Any]] = []
     try:
         type_message = message_data.get("typeMessage")
-        if type_message in {"imageMessage", "videoMessage", "documentMessage"}:
-            img = message_data.get("imageMessageData") or message_data.get("fileMessageData") or message_data.get("documentMessageData") or {}
+        if type_message in {"imageMessage", "videoMessage", "documentMessage", "audioMessage"}:
+            img = (
+                message_data.get("imageMessageData")
+                or message_data.get("fileMessageData")
+                or message_data.get("documentMessageData")
+                or message_data.get("audioMessageData")
+                or {}
+            )
             if img:
                 media_list.append(img)
         if "medias" in message_data and isinstance(message_data["medias"], list):
@@ -421,8 +436,8 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
                 except Exception as e:
                     json_log("media_download_error", error=str(e))
             db.update_job_status(job_id, "COMPLETED")
-        # Filter to files Gemini can read (images, pdf)
-        valid_ext = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp"}
+        # Filter to files Gemini can read (images, pdf, audio)
+        valid_ext = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp", ".mp3", ".wav", ".m4a", ".ogg", ".webm"}
         valid_files = [p for p in downloaded if p.suffix.lower() in valid_ext]
         from .ocr_qa import state as _state
         # Create a new session id from msg_id (short)
@@ -438,7 +453,7 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
             # Delete any downloaded non-usable files
             storage.delete_files(downloaded)
             if _is_sender_allowed(sender, db):
-                await client.send_message(chat_id=sender, message="I couldn't read the file(s) you sent. Please send images or PDFs.")
+                await client.send_message(chat_id=sender, message="I couldn't read the file(s) you sent. Please send images, audio, or PDFs.")
         return {"ok": True, "job_id": job_id}
 
     # If text and we are in QA mode for this chat

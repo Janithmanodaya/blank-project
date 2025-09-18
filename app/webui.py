@@ -263,9 +263,9 @@ def ui(db: Database = Depends(get_db), token: Optional[str] = Query(default=None
           </div>
 
           <div>
-            <label for="GEMINI_MODEL">Gemini Model</label>
+            <label for="GEMINI_MODEL">Answer Model</label>
             {model_select}
-            <div class="hint">Pick the model used for answers and document Q&amp;A.</div>
+            <div class="hint">Used only for document answers. Other tasks use Gemma 3n by default.</div>
           </div>
 
           <div>

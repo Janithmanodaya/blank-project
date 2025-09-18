@@ -105,7 +105,8 @@ class GeminiFileQA:
         api_key = db.get_setting("GEMINI_API_KEY", None) or os.getenv("GEMINI_API_KEY")
         if not api_key:
             raise RuntimeError("GEMINI_API_KEY is not set")
-        model = model_name or db.get_setting("GEMINI_MODEL", None) or os.getenv("GEMINI_MODEL") or "gemini-1.5-flash"
+        # For document answers, use the model selected in UI; default to Gemma 3n if not set
+        model = model_name or db.get_setting("GEMINI_MODEL", None) or os.getenv("GEMINI_MODEL") or "gemma-3n"
         genai.configure(api_key=api_key)
         self.model = genai.GenerativeModel(model)
 
