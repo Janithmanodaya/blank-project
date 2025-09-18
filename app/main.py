@@ -318,7 +318,8 @@ async def maybe_auto_reply(payload: Dict[str, Any], db: Database):
 
     try:
         responder = GeminiResponder()
-        reply = responder.generate(text, system_prompt)
+        # Offload blocking SDK call to a thread to avoid event loop stalls
+        reply = await asyncio.to_thread(responder.generate, text, system_prompt)
         client = GreenAPIClient.from_env()
         await client.send_message(chat_id=chat_id, message=reply)
         json_log("auto_reply_sent", chat_id=chat_id)
@@ -849,7 +850,8 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
                     "GEMINI_SYSTEM_PROMPT", "You are a helpful assistant. Identify the user's intent and respond concisely."
                 )
                 responder = GeminiResponder()
-                reply = responder.generate(text_msg, system_prompt)
+                # Offload blocking SDK call to a thread to keep loop responsive
+                reply = await asyncio.to_thread(responder.generate, text_msg, system_prompt)
                 await client.send_message(chat_id=sender, message=reply)
                 json_log("fallback_gemini_reply_sent", chat_id=sender)
             except Exception as e:
