@@ -41,14 +41,10 @@ class Storage:
         - url
         - directUrl
         - fileUrl
-        Fallback: if there's a 'idMessage' and 'fileName' we cannot fetch without API; caller should supply absolute URL.
+        Handles any file type (image, pdf, video, etc.) and preserves provided filename if present.
         """
         url = media.get("downloadUrl") or media.get("url") or media.get("directUrl") or media.get("fileUrl")
-        filename = media.get("fileName") or media.get("caption") or "media"
-        if not filename.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
-            # default to jpg
-            if "." not in filename:
-                filename = f"{filename}.jpg"
+        filename = media.get("fileName") or media.get("caption") or "media.bin"
 
         if not url:
             raise ValueError("No media URL in payload")
@@ -57,7 +53,7 @@ class Storage:
         # ensure deterministic index ordering by creating a numbered filename if collision
         target = raw_dir / filename
         base = target.stem
-        ext = target.suffix or ".jpg"
+        ext = target.suffix or ".bin"
         i = 1
         while target.exists():
             target = raw_dir / f"{base}_{i:03d}{ext}"
@@ -79,7 +75,6 @@ class Storage:
                 break
             except Exception as e:
                 last_exc = e
-                await httpx.AsyncClient().aclose()
         if last_exc:
             raise last_exc
 
@@ -88,6 +83,16 @@ class Storage:
         meta = {"source_url": url, "saved_at": datetime.utcnow().isoformat() + "Z"}
         (raw_dir / "meta.json").write_text(json.dumps(meta, indent=2))
         return target
+
+    def delete_files(self, paths: List[Path]):
+        for p in paths:
+            try:
+                # only delete within storage
+                p = Path(p)
+                if self.base in p.resolve().parents:
+                    p.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     def pdf_output_paths(self, sender: str, msg_id: str, suggest_name: Optional[str] = None):
         ts = datetime.utcnow().strftime("%Y%m%d")

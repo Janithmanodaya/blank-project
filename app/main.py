@@ -24,7 +24,7 @@ except Exception:
     GeminiResponder = None  # type: ignore
 
 APP_TITLE = "GreenAPI Image→PDF Relay"
-VERSION = "0.3.2"
+VERSION = "0.4.0"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -74,6 +74,8 @@ async def on_startup():
 
     # Launch Green API notification poller (for setups without webhooks)
     workers.append(asyncio.create_task(notification_poller()))
+    # Launch QA cleanup loop to purge sessions older than 24h
+    workers.append(asyncio.create_task(qa_cleanup_loop()))
 
     # Attach web router after components are ready (import here to avoid circular import)
     from .webui import router as web_router  # local import
@@ -115,8 +117,17 @@ async def worker_loop(worker_id: int):
                         raise
 
                 # Compose PDF
-                pdf_result: PDFComposeResult = composer.compose(job, downloaded_files)
-                db.update_job_pdf(job_id, pdf_result.pdf_path, pdf_result.meta_path)
+                try:
+                    pdf_result: PDFComposeResult = composer.compose(job, downloaded_files)
+                    db.update_job_pdf(job_id, pdf_result.pdf_path, pdf_result.meta_path)
+                except Exception as e:
+                    # Inform original sender if allowed, then mark failed
+                    try:
+                        if _is_sender_allowed(job.get("sender"), db):
+                            await client.send_message(chat_id=(job.get("sender") or ""), message="I couldn't read the image(s) to create a PDF. Please resend clear images.")
+                    except Exception:
+                        pass
+                    raise
 
                 # Upload and send
                 upload = await client.upload_file(pdf_result.pdf_path)
@@ -196,13 +207,30 @@ def _extract_event_time(payload: Dict[str, Any]) -> Optional[datetime]:
 WINDOW_SECONDS = 180  # 3 minutes
 
 
+def _is_sender_allowed(chat_id: Optional[str], db: Database) -> bool:
+    if not chat_id:
+        return False
+    mode = (db.get_setting("REPLY_MODE", "everyone") or "everyone").lower()
+    allow_raw = db.get_setting("ALLOW_NUMBERS", "") or ""
+    block_raw = db.get_setting("BLOCK_NUMBERS", "") or ""
+    def parse_list(s: str) -> List[str]:
+        parts = [p.strip() for p in s.replace("\n", ",").split(",") if p.strip()]
+        return [p for p in parts]
+    allows = set(parse_list(allow_raw))
+    blocks = set(parse_list(block_raw))
+    if mode == "allowlist":
+        return chat_id in allows
+    if mode == "blocklist":
+        return chat_id not in blocks
+    return True  # everyone
+
 async def maybe_auto_reply(payload: Dict[str, Any], db: Database):
     # settings gate
     enabled = (db.get_setting("auto_reply_enabled", "0") or "0") == "1"
-    if not enabled:
-        return
     chat_id = payload.get("senderData", {}).get("chatId")
     if not chat_id:
+        return
+    if not _is_sender_allowed(chat_id, db):
         return
     text = _extract_text_from_payload(payload)
     if not text:
@@ -214,6 +242,8 @@ async def maybe_auto_reply(payload: Dict[str, Any], db: Database):
 
     if GeminiResponder is None:
         json_log("auto_reply_error", reason="gemini_module_missing")
+        return
+    if not enabled:
         return
 
     try:
@@ -283,8 +313,14 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
     media_list: List[Dict[str, Any]] = []
     try:
         type_message = message_data.get("typeMessage")
-        if type_message in {"imageMessage", "videoMessage", "documentMessage"}:
-            img = message_data.get("imageMessageData") or message_data.get("fileMessageData") or message_data.get("documentMessageData") or {}
+        if type_message in {"imageMessage", "videoMessage", "documentMessage", "audioMessage"}:
+            img = (
+                message_data.get("imageMessageData")
+                or message_data.get("fileMessageData")
+                or message_data.get("documentMessageData")
+                or message_data.get("audioMessageData")
+                or {}
+            )
             if img:
                 media_list.append(img)
         if "medias" in message_data and isinstance(message_data["medias"], list):
@@ -292,8 +328,77 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
     except Exception:
         pass
 
-    # Media batching logic: if images present, accumulate per sender for BATCH_WINDOW_SECONDS
-    if media_list:
+    # Feature: OCR/QA, YouTube, and search handling
+    from .ocr_qa import GeminiFileQA, state as qa_state, find_youtube_url
+
+    client = GreenAPIClient.from_env()
+
+    text_msg = _extract_text_from_payload(payload) or ""
+
+    # If text contains a YouTube link
+    yt_url = find_youtube_url(text_msg or "")
+    if yt_url:
+        # ask for confirmation
+        qa_state.set_pending_ytdl(sender, yt_url)
+        if _is_sender_allowed(sender, db):
+            await client.send_message(chat_id=sender, message="You sent a YouTube link. Do you want me to download this video and send it back? Reply YES to confirm.")
+        return {"ok": True, "job_id": None}
+
+    # If awaiting yt-dlp confirmation
+    pending_url = qa_state.get_pending_ytdl(sender)
+    if pending_url and (text_msg or "").strip().lower() in {"yes", "y", "download", "ok"}:
+        # download video, upload, send, delete
+        try:
+            import subprocess
+            import shlex
+            tmp_dir = storage.base / "tmp"
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            out_tpl = str(tmp_dir / "yt_video.%(ext)s")
+            cmd = f"yt-dlp -f mp4 -o {shlex.quote(out_tpl)} {shlex.quote(pending_url)}"
+            proc = await asyncio.create_subprocess_shell(cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            stdout, stderr = await proc.communicate()
+            if proc.returncode != 0:
+                if _is_sender_allowed(sender, db):
+                    await client.send_message(chat_id=sender, message=f"Failed to download video. Error: {stderr.decode('utf-8', 'ignore')[:200]}")
+            else:
+                # find the produced file (mp4 preferred)
+                candidates = sorted(tmp_dir.glob("yt_video.*"), key=lambda p: p.stat().st_mtime, reverse=True)
+                if not candidates:
+                    if _is_sender_allowed(sender, db):
+                        await client.send_message(chat_id=sender, message="Download finished but no file was produced.")
+                else:
+                    video_path = candidates[0]
+                    up = await client.upload_file(video_path)
+                    if _is_sender_allowed(sender, db):
+                        await client.send_file_by_url(chat_id=sender, url_file=up.get("urlFile", ""), filename=video_path.name, caption="Here is your video.")
+                    try:
+                        video_path.unlink()
+                    except Exception:
+                        pass
+            qa_state.set_pending_ytdl(sender, None)
+        except Exception as e:
+            if _is_sender_allowed(sender, db):
+                await client.send_message(chat_id=sender, message=f"Error while downloading video: {e}")
+            qa_state.set_pending_ytdl(sender, None)
+        return {"ok": True, "job_id": None}
+
+    # Simple internet search command: "search: ..."
+    if text_msg.lower().startswith("search:") or text_msg.lower().startswith("search "):
+        query = text_msg.split(":", 1)[1].strip() if ":" in text_msg else text_msg.split(" ", 1)[1].strip()
+        links = await _web_search_links(query)
+        if _is_sender_allowed(sender, db):
+            if not links:
+                await client.send_message(chat_id=sender, message="No results found.")
+            else:
+                head = "\n".join(links[:8])
+                await client.send_message(chat_id=sender, message=f"Top results for \"{query}\":\n{head}")
+        return {"ok": True, "job_id": None}
+
+    # Toggle: if pdf_packer_enabled -> existing batching to PDF, else switch to QA mode
+    pdf_packer_enabled = (db.get_setting("pdf_packer_enabled", "1") or "1") == "1"
+
+    if media_list and pdf_packer_enabled:
+        # Media batching logic: if images present, accumulate per sender for BATCH_WINDOW_SECONDS
         async with pending_lock:
             batch = pending_batches.get(sender)
             if batch:
@@ -313,17 +418,114 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
                 pending_batches[sender] = {"job_id": job_id, "started_at": now.isoformat(), "task": task}
                 json_log("batch_started", sender=sender, job_id=job_id, window_seconds=BATCH_WINDOW_SECONDS, medias=len(media_list))
                 result_job_id = job_id
-    else:
-        # Create a job just to track non-media message; complete immediately
-        job_id = db.create_job(sender=sender, msg_id=str(msg_id), payload=payload, instance_id=str(instance_id))
-        db.update_job_status(job_id, "COMPLETED")
-        json_log("no_media_payload_stored", job_id=job_id)
-        result_job_id = job_id
+        # Try auto reply (non-blocking)
+        asyncio.create_task(maybe_auto_reply(payload, db))
+        return {"ok": True, "job_id": result_job_id}
 
-    # Try auto reply (non-blocking)
+    if media_list and not pdf_packer_enabled:
+        # Immediate download and create a separate session for this message (no batching)
+        async with httpx.AsyncClient(timeout=60) as http_client:
+            job_id = db.create_job(sender=sender, msg_id=str(msg_id), payload=payload, instance_id=str(instance_id))
+            db.update_job_status(job_id, "PROCESSING")
+            downloaded: List[Path] = []
+            for m in media_list:
+                try:
+                    fp = await storage.download_media(http_client, m, {"sender": sender, "msg_id": str(msg_id)})
+                    db.add_media(job_id, m)
+                    downloaded.append(fp)
+                except Exception as e:
+                    json_log("media_download_error", error=str(e))
+            db.update_job_status(job_id, "COMPLETED")
+        # Filter to files Gemini can read (images, pdf, audio)
+        valid_ext = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp", ".mp3", ".wav", ".m4a", ".ogg", ".webm"}
+        valid_files = [p for p in downloaded if p.suffix.lower() in valid_ext]
+        from .ocr_qa import state as _state
+        # Create a new session id from msg_id (short)
+        session_id = str(msg_id)[-8:]
+        if valid_files:
+            _state.create_session(sender, session_id, valid_files)
+            if _is_sender_allowed(sender, db):
+                await client.send_message(
+                    chat_id=sender,
+                    message=f"Received {len(valid_files)} file(s). Saved as session {session_id}. Ask questions about this file. You can switch with 'use {session_id}', list sessions with 'list', delete with 'delete {session_id}', or send 'Stop' to end and delete.",
+                )
+        else:
+            # Delete any downloaded non-usable files
+            storage.delete_files(downloaded)
+            if _is_sender_allowed(sender, db):
+                await client.send_message(chat_id=sender, message="I couldn't read the file(s) you sent. Please send images, audio, or PDFs.")
+        return {"ok": True, "job_id": job_id}
+
+    # If text and we are in QA mode for this chat
+    if text_msg:
+        low = text_msg.strip().lower()
+        from .ocr_qa import state as _state
+        # Commands for sessions
+        if low in {"stop", "exit", "quit"}:
+            _state.clear_all(sender, storage)
+            if _is_sender_allowed(sender, db):
+                await client.send_message(chat_id=sender, message="Okay, exiting document Q&A mode. I deleted your files.")
+            return {"ok": True, "job_id": None}
+        if low == "list":
+            sessions = _state.list_sessions(sender)
+            if _is_sender_allowed(sender, db):
+                if not sessions:
+                    await client.send_message(chat_id=sender, message="No saved sessions.")
+                else:
+                    lines = [f"{s.id} · {len(s.files)} file(s)" for s in sessions]
+                    await client.send_message(chat_id=sender, message="Sessions:\n" + "\n".join(lines))
+            return {"ok": True, "job_id": None}
+        if low.startswith("use "):
+            sid = text_msg.strip().split(" ", 1)[1].strip()
+            ok = _state.set_active(sender, sid)
+            if _is_sender_allowed(sender, db):
+                await client.send_message(chat_id=sender, message=("Switched to session " + sid) if ok else "I can't find that session id.")
+            return {"ok": True, "job_id": None}
+        if low.startswith("delete "):
+            sid = text_msg.strip().split(" ", 1)[1].strip()
+            _state.delete_session(sender, sid, storage)
+            if _is_sender_allowed(sender, db):
+                await client.send_message(chat_id=sender, message=f"Deleted session {sid}.")
+            return {"ok": True, "job_id": None}
+        # If we have any sessions, answer from active one
+        if _state.list_sessions(sender):
+            try:
+                system_prompt = db.get_setting("auto_reply_system_prompt", "") or os.getenv(
+                    "GEMINI_SYSTEM_PROMPT", "Answer strictly from the provided file(s)."
+                )
+                qa = GeminiFileQA()
+                ans = qa.answer(sender, text_msg, system_prompt)
+                if _is_sender_allowed(sender, db):
+                    await client.send_message(chat_id=sender, message=ans)
+            except Exception as e:
+                if _is_sender_allowed(sender, db):
+                    await client.send_message(chat_id=sender, message=f"Error answering from files: {e}")
+            return {"ok": True, "job_id": None}
+
+    # If no media and not QA/text special, create a job just to track non-media message; complete immediately
+    job_id = db.create_job(sender=sender, msg_id=str(msg_id), payload=payload, instance_id=str(instance_id))
+    db.update_job_status(job_id, "COMPLETED")
+    json_log("no_media_payload_stored", job_id=job_id)
+
+    # Fallback intent understanding with Gemini when auto-reply is disabled or nothing matched
+    if text_msg and GeminiResponder is not None and _is_sender_allowed(sender, db):
+        auto_enabled = (db.get_setting("auto_reply_enabled", "0") or "0") == "1"
+        if not auto_enabled:
+            try:
+                system_prompt = db.get_setting("auto_reply_system_prompt", "") or os.getenv(
+                    "GEMINI_SYSTEM_PROMPT", "You are a helpful assistant. Identify the user's intent and respond concisely."
+                )
+                responder = GeminiResponder()
+                reply = responder.generate(text_msg, system_prompt)
+                await client.send_message(chat_id=sender, message=reply)
+                json_log("fallback_gemini_reply_sent", chat_id=sender)
+            except Exception as e:
+                json_log("fallback_gemini_reply_error", error=str(e))
+
+    # Try auto reply (non-blocking) if enabled
     asyncio.create_task(maybe_auto_reply(payload, db))
 
-    return {"ok": True, "job_id": result_job_id}
+    return {"ok": True, "job_id": job_id}
 
 
 async def notification_poller():
@@ -355,6 +557,21 @@ async def notification_poller():
             await asyncio.sleep(2.0)
 
 
+async def qa_cleanup_loop():
+    """
+    Periodically purge per-chat sessions and files older than 24 hours.
+    """
+    from .ocr_qa import state as _state
+    while True:
+        try:
+            _state.purge_old(storage, 24 * 3600)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            json_log("qa_cleanup_error", error=str(e))
+        await asyncio.sleep(1800)  # every 30 minutes
+
+
 @app.post("/webhook")
 async def webhook(request: Request, db: Database = Depends(get_db)):
     try:
@@ -371,6 +588,40 @@ async def webhook(request: Request, db: Database = Depends(get_db)):
 @app.get("/")
 async def root():
     return RedirectResponse(url="/ui")
+
+
+async def _web_search_links(query: str) -> List[str]:
+    # Minimal search via DuckDuckGo html
+    q = query.strip().replace(" ", "+")
+    url = f"https://duckduckgo.com/html/?q={q}"
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+            if r.status_code != 200:
+                return []
+            html = r.text
+            import re
+            links = re.findall(r'<a rel="nofollow" class="result__a" href="([^"]+)"', html)
+            # Clean /l/?kh=-1&uddg= encoded
+            cleaned: List[str] = []
+            from urllib.parse import urlparse, parse_qs, unquote
+            for L in links:
+                if "/l/?" in L and "uddg=" in L:
+                    qs = parse_qs(urlparse(L).query)
+                    tgt = qs.get("uddg", [""])[0]
+                    cleaned.append(unquote(tgt))
+                else:
+                    cleaned.append(L)
+            # de-dup
+            out = []
+            seen = set()
+            for u in cleaned:
+                if u not in seen:
+                    seen.add(u)
+                    out.append(u)
+            return out[:10]
+    except Exception:
+        return []
 
 
 def run():
