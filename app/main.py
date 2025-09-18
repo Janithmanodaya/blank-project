@@ -70,9 +70,10 @@ def json_log(event: str, **kwargs):
     except Exception:
         # Last resort: strip any non-ascii that slipped through
         try:
-            logging.info(line.encode("ascii", "ignore").decode("ascii"))
+            safe_line = line.encode("ascii", "ignore").decode("ascii")
+            logging.info(safe_line)
         except Exception:
-           _code pnewa</sse))
+            pass
 
 
 app = FastAPI(title=APP_TITLE, version=VERSION)
