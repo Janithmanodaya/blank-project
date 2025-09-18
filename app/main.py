@@ -638,25 +638,39 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
             out_tpl = str(tmp_dir / "yt_video.%(ext)s")
             fmt_selector = str(selected_fmt.get("format_id") or "best")
             url_norm = _normalize_youtube_url(pending_url)
-            # More resilient flags for YouTube (ipv4, android client); avoid playlists
+            # More resilient flags for YouTube (ipv4, android client); avoid playlists; avoid .part files; retry a bit
             cmd = (
                 f"yt-dlp --no-playlist --force-ipv4 "
                 f"--extractor-args youtube:player_client=android "
+                f"--no-part --retries 3 --fragment-retries 3 "
                 f"-f {shlex.quote(fmt_selector)} -o {shlex.quote(out_tpl)} {shlex.quote(url_norm)}"
             )
+            json_log("ytdl_download_started", sender=sender, cmd=cmd)
             proc = await asyncio.create_subprocess_shell(cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
             stdout, stderr = await proc.communicate()
+            err_txt = stderr.decode('utf-8', 'ignore')
             if proc.returncode != 0:
+                json_log("ytdl_download_failed", sender=sender, code=proc.returncode, stderr=err_txt[:300])
                 if _is_sender_allowed(sender, db):
-                    await client.send_message(chat_id=sender, message=f"Failed to download video. Error: {stderr.decode('utf-8', 'ignore')[:200]}")
+                    # Common hint if ffmpeg missing or geo/consent restricted
+                    hint = ""
+                    if "ffmpeg" in err_txt.lower():
+                        hint = " (converter missing on server)"
+                    elif "Sign in to confirm" in err_txt or "This video is only available" in err_txt:
+                        hint = " (video requires login/consent; cannot fetch without cookies)"
+                    await client.send_message(chat_id=sender, message=f"Failed to download video{hint}.")
             else:
-                # find the produced file (mp4 preferred)
-                candidates = sorted(tmp_dir.glob("yt_video.*"), key=lambda p: p.stat().st_mtime, reverse=True)
+                # find the produced file (prefer non-part, newest)
+                exts = (".mp4", ".mkv", ".webm", ".mov", ".m4v")
+                candidates = [p for p in tmp_dir.glob("yt_video.*") if p.suffix.lower() in exts and not str(p).endswith(".part")]
+                candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
                 if not candidates:
+                    json_log("ytdl_download_no_output", sender=sender)
                     if _is_sender_allowed(sender, db):
                         await client.send_message(chat_id=sender, message="Download finished but no file was produced.")
                 else:
                     video_path = candidates[0]
+                    json_log("ytdl_download_succeeded", sender=sender, file=str(video_path))
                     up = await client.upload_file(video_path)
                     if _is_sender_allowed(sender, db):
                         cap = f"Here is your video ({selected_fmt.get('label','')})."
@@ -669,6 +683,7 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
             qa_state.set_pending_ytdl(sender, None)
             ytdl_pending.pop(sender, None)
         except Exception as e:
+            json_log("ytdl_download_exception", sender=sender, error=str(e))
             if _is_sender_allowed(sender, db):
                 await client.send_message(chat_id=sender, message=f"Error while downloading video: {e}")
             qa_state.set_pending_ytdl(sender, None)
