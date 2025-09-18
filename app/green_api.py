@@ -1,4 +1,5 @@
 import os
+import mimetypes
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -30,15 +31,19 @@ class GreenAPIClient:
         return f"{self.base_url}/waInstance{self.id_instance}/DeleteNotification/{self.api_token}/{receipt_id}"
 
     def _url_delete_notification_post(self) -> str:
-        # Official: POST /waInstance{id}/DeleteNotification/{token} with {"receiptId": ...}
+        # Official: POST /waInstance{id}/DeleteNotification/{token} with {\"receiptId\": ...}
         return f"{self.base_url}/waInstance{self.id_instance}/DeleteNotification/{self.api_token}"
 
     async def upload_file(self, file_path: Path) -> Dict[str, Any]:
-        # Recommended flow: uploadFile -> returns urlFile and sometimes idFile
+        """
+        Upload any file. Content type is guessed from extension.
+        Returns JSON with urlFile, etc.
+        """
         url = self._url("uploadFile")
-        async with httpx.AsyncClient(timeout=60) as client:
+        ctype = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
+        async with httpx.AsyncClient(timeout=300) as client:
             with file_path.open("rb") as f:
-                files = {"file": (file_path.name, f, "application/pdf")}
+                files = {"file": (file_path.name, f, ctype)}
                 resp = await client.post(url, files=files)
             resp.raise_for_status()
             return resp.json()
@@ -52,7 +57,7 @@ class GreenAPIClient:
         }
         if caption:
             payload["caption"] = caption
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=60) as client:
             resp = await client.post(url, json=payload)
             resp.raise_for_status()
             return resp.json()
@@ -69,7 +74,7 @@ class GreenAPIClient:
         }
         if caption:
             payload["caption"] = caption
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=60) as client:
             resp = await client.post(url, json=payload)
             resp.raise_for_status()
             return resp.json()
@@ -87,8 +92,8 @@ class GreenAPIClient:
 
     async def receive_notification(self) -> Optional[Dict[str, Any]]:
         """
-        Polls Green API ReceiveNotification endpoint for the next incoming notification.
-        Returns the JSON or None if there is no notification available.
+        Polls Green API ReceiveNotification for incoming messages and routes them
+        through the same handler as the /webhook.
         """
         url = self._url("ReceiveNotification")
         async with httpx.AsyncClient(timeout=65) as client:
@@ -109,7 +114,7 @@ class GreenAPIClient:
         Acknowledge and remove a notification so it is not delivered again.
         Order as per docs:
           1) DELETE /.../DeleteNotification/{token}/{receiptId}
-          2) POST   /.../DeleteNotification/{token} with JSON {"receiptId": ...}
+          2) POST   /.../DeleteNotification/{token} with JSON {\"receiptId\": ...}
         """
         async with httpx.AsyncClient(timeout=30) as client:
             # Variant 1: DELETE with token before receiptId

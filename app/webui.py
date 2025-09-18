@@ -217,6 +217,7 @@ def ui(db: Database = Depends(get_db), token: Optional[str] = Query(default=None
     admin_chat_id = db.get_setting("ADMIN_CHAT_ID", os.getenv("ADMIN_CHAT_ID", "")) or ""
     workers_val = db.get_setting("WORKERS", os.getenv("WORKERS", "2")) or "2"
     admin_pw_set = status_badge(db.get_setting("ADMIN_PASSWORD", os.getenv("ADMIN_PASSWORD")))
+    pdf_packer_enabled = (db.get_setting("pdf_packer_enabled", "1") or "1") == "1"
 
     settings_html = f"""
     <div class="card">
@@ -270,6 +271,12 @@ def ui(db: Database = Depends(get_db), token: Optional[str] = Query(default=None
           Status:
           {"<span class='badge ok'>Auto Reply Enabled</span>" if auto_enabled else "<span class='badge'>Auto Reply Disabled</span>"}
           <a class="button" href="/ui/auto-reply/toggle?token={token}">{'Disable' if auto_enabled else 'Enable'}</a>
+        </div>
+
+        <div class="row" style="margin-top:10px;">
+          PDF Packer:
+          {"<span class='badge ok'>Enabled</span>" if pdf_packer_enabled else "<span class='badge'>Disabled</span>"}
+          <a class="button" href="/ui/pdf-packer/toggle?token={token}">{'Disable' if pdf_packer_enabled else 'Enable'}</a>
         </div>
 
         <div class="actions">
@@ -350,6 +357,7 @@ def ui(db: Database = Depends(get_db), token: Optional[str] = Query(default=None
           <h3>Quick Actions</h3>
           <div class="list">
             <div class="list-item"><span>Toggle Auto-Reply</span><a class="button" href="/ui/auto-reply/toggle?token={token}">Toggle</a></div>
+            <div class="list-item"><span>Toggle PDF Packer</span><a class="button" href="/ui/pdf-packer/toggle?token={token}">Toggle</a></div>
             <div class="list-item"><span>Reload</span><a class="button" href="/ui?token={token}">Refresh</a></div>
           </div>
         </div>
@@ -449,6 +457,15 @@ def toggle_auto_reply(db: Database = Depends(get_db), token: Optional[str] = Que
     cur = db.get_setting("auto_reply_enabled", "0") or "0"
     new_val = "0" if cur == "1" else "1"
     db.set_setting("auto_reply_enabled", new_val)
+    return RedirectResponse(url=f"/ui?token={token}", status_code=302)
+
+
+@router.get("/ui/pdf-packer/toggle")
+def toggle_pdf_packer(db: Database = Depends(get_db), token: Optional[str] = Query(default=None)):
+    check_auth(token, db)
+    cur = db.get_setting("pdf_packer_enabled", "1") or "1"
+    new_val = "0" if cur == "1" else "1"
+    db.set_setting("pdf_packer_enabled", new_val)
     return RedirectResponse(url=f"/ui?token={token}", status_code=302)
 
 

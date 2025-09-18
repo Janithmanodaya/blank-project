@@ -24,7 +24,7 @@ except Exception:
     GeminiResponder = None  # type: ignore
 
 APP_TITLE = "GreenAPI Image→PDF Relay"
-VERSION = "0.3.2"
+VERSION = "0.4.0"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -292,8 +292,71 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
     except Exception:
         pass
 
-    # Media batching logic: if images present, accumulate per sender for BATCH_WINDOW_SECONDS
-    if media_list:
+    # Feature: OCR/QA, YouTube, and search handling
+    from .ocr_qa import GeminiFileQA, state as qa_state, find_youtube_url
+
+    client = GreenAPIClient.from_env()
+
+    text_msg = _extract_text_from_payload(payload) or ""
+
+    # If text contains a YouTube link
+    yt_url = find_youtube_url(text_msg or "")
+    if yt_url:
+        # ask for confirmation
+        qa_state.set_pending_ytdl(sender, yt_url)
+        await client.send_message(chat_id=sender, message="You sent a YouTube link. Do you want me to download this video and send it back? Reply YES to confirm.")
+        return {"ok": True, "job_id": None}
+
+    # If awaiting yt-dlp confirmation
+    pending_url = qa_state.get_pending_ytdl(sender)
+    if pending_url and (text_msg or "").strip().lower() in {"yes", "y", "download", "ok"}:
+        # download video, upload, send, delete
+        try:
+            import subprocess
+            import shlex
+            tmp_dir = storage.base / "tmp"
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            out_tpl = str(tmp_dir / "yt_video.%(ext)s")
+            cmd = f"yt-dlp -f mp4 -o {shlex.quote(out_tpl)} {shlex.quote(pending_url)}"
+            proc = await asyncio.create_subprocess_shell(cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            stdout, stderr = await proc.communicate()
+            if proc.returncode != 0:
+                await client.send_message(chat_id=sender, message=f"Failed to download video. Error: {stderr.decode('utf-8', 'ignore')[:200]}")
+            else:
+                # find the produced file (mp4 preferred)
+                candidates = sorted(tmp_dir.glob("yt_video.*"), key=lambda p: p.stat().st_mtime, reverse=True)
+                if not candidates:
+                    await client.send_message(chat_id=sender, message="Download finished but no file was produced.")
+                else:
+                    video_path = candidates[0]
+                    up = await client.upload_file(video_path)
+                    await client.send_file_by_url(chat_id=sender, url_file=up.get("urlFile", ""), filename=video_path.name, caption="Here is your video.")
+                    try:
+                        video_path.unlink()
+                    except Exception:
+                        pass
+            qa_state.set_pending_ytdl(sender, None)
+        except Exception as e:
+            await client.send_message(chat_id=sender, message=f"Error while downloading video: {e}")
+            qa_state.set_pending_ytdl(sender, None)
+        return {"ok": True, "job_id": None}
+
+    # Simple internet search command: "search: ..."
+    if text_msg.lower().startswith("search:") or text_msg.lower().startswith("search "):
+        query = text_msg.split(":", 1)[1].strip() if ":" in text_msg else text_msg.split(" ", 1)[1].strip()
+        links = await _web_search_links(query)
+        if not links:
+            await client.send_message(chat_id=sender, message="No results found.")
+        else:
+            head = "\n".join(links[:8])
+            await client.send_message(chat_id=sender, message=f"Top results for \"{query}\":\n{head}")
+        return {"ok": True, "job_id": None}
+
+    # Toggle: if pdf_packer_enabled -> existing batching to PDF, else switch to QA mode
+    pdf_packer_enabled = (db.get_setting("pdf_packer_enabled", "1") or "1") == "1"
+
+    if media_list and pdf_packer_enabled:
+        # Media batching logic: if images present, accumulate per sender for BATCH_WINDOW_SECONDS
         async with pending_lock:
             batch = pending_batches.get(sender)
             if batch:
@@ -313,17 +376,62 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
                 pending_batches[sender] = {"job_id": job_id, "started_at": now.isoformat(), "task": task}
                 json_log("batch_started", sender=sender, job_id=job_id, window_seconds=BATCH_WINDOW_SECONDS, medias=len(media_list))
                 result_job_id = job_id
-    else:
-        # Create a job just to track non-media message; complete immediately
-        job_id = db.create_job(sender=sender, msg_id=str(msg_id), payload=payload, instance_id=str(instance_id))
-        db.update_job_status(job_id, "COMPLETED")
-        json_log("no_media_payload_stored", job_id=job_id)
-        result_job_id = job_id
+        # Try auto reply (non-blocking)
+        asyncio.create_task(maybe_auto_reply(payload, db))
+        return {"ok": True, "job_id": result_job_id}
+
+    if media_list and not pdf_packer_enabled:
+        # Immediate download and enter QA mode for this chat
+        async with httpx.AsyncClient(timeout=60) as http_client:
+            job_id = db.create_job(sender=sender, msg_id=str(msg_id), payload=payload, instance_id=str(instance_id))
+            db.update_job_status(job_id, "PROCESSING")
+            downloaded: List[Path] = []
+            for m in media_list:
+                try:
+                    fp = await storage.download_media(http_client, m, {"sender": sender, "msg_id": str(msg_id)})
+                    db.add_media(job_id, m)
+                    downloaded.append(fp)
+                except Exception as e:
+                    json_log("media_download_error", error=str(e))
+            db.update_job_status(job_id, "COMPLETED")
+        from .ocr_qa import GeminiFileQA
+        try:
+            qa_state.add_files(sender, downloaded)
+            await client.send_message(chat_id=sender, message=f"Received {len(downloaded)} file(s). You can now ask questions based only on these file(s). Send \"Stop\" to end this mode.")
+        except Exception as e:
+            await client.send_message(chat_id=sender, message=f"Files received. Q&A setup had an issue: {e}")
+        return {"ok": True, "job_id": job_id}
+
+    # If text and we are in QA mode for this chat
+    if text_msg:
+        if text_msg.strip().lower() in {"stop", "exit", "quit"}:
+            from .ocr_qa import state as _state
+            _state.clear(sender)
+            await client.send_message(chat_id=sender, message="Okay, exiting document Q&A mode.")
+            return {"ok": True, "job_id": None}
+        from .ocr_qa import state as _state
+        if _state.get_files(sender):
+            try:
+                system_prompt = db.get_setting("auto_reply_system_prompt", "") or os.getenv(
+                    "GEMINI_SYSTEM_PROMPT", "Answer strictly from the provided file(s)."
+                )
+                qa = GeminiFileQA()
+                ans = qa.answer(sender, text_msg, system_prompt)
+                # GeminiFileQA.answer is sync; wrap in thread? It's fast since it's API call. Keep direct.
+                await client.send_message(chat_id=sender, message=ans)
+            except Exception as e:
+                await client.send_message(chat_id=sender, message=f"Error answering from files: {e}")
+            return {"ok": True, "job_id": None}
+
+    # If no media and not QA/text special, create a job just to track non-media message; complete immediately
+    job_id = db.create_job(sender=sender, msg_id=str(msg_id), payload=payload, instance_id=str(instance_id))
+    db.update_job_status(job_id, "COMPLETED")
+    json_log("no_media_payload_stored", job_id=job_id)
 
     # Try auto reply (non-blocking)
     asyncio.create_task(maybe_auto_reply(payload, db))
 
-    return {"ok": True, "job_id": result_job_id}
+    return {"ok": True, "job_id": job_id}
 
 
 async def notification_poller():
@@ -371,6 +479,40 @@ async def webhook(request: Request, db: Database = Depends(get_db)):
 @app.get("/")
 async def root():
     return RedirectResponse(url="/ui")
+
+
+async def _web_search_links(query: str) -> List[str]:
+    # Minimal search via DuckDuckGo html
+    q = query.strip().replace(" ", "+")
+    url = f"https://duckduckgo.com/html/?q={q}"
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+            if r.status_code != 200:
+                return []
+            html = r.text
+            import re
+            links = re.findall(r'<a rel="nofollow" class="result__a" href="([^"]+)"', html)
+            # Clean /l/?kh=-1&uddg= encoded
+            cleaned: List[str] = []
+            from urllib.parse import urlparse, parse_qs, unquote
+            for L in links:
+                if "/l/?" in L and "uddg=" in L:
+                    qs = parse_qs(urlparse(L).query)
+                    tgt = qs.get("uddg", [""])[0]
+                    cleaned.append(unquote(tgt))
+                else:
+                    cleaned.append(L)
+            # de-dup
+            out = []
+            seen = set()
+            for u in cleaned:
+                if u not in seen:
+                    seen.add(u)
+                    out.append(u)
+            return out[:10]
+    except Exception:
+        return []
 
 
 def run():
