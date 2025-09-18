@@ -373,7 +373,7 @@ class PDFComposer:
             "files": [str(p.path) for p in infos],
             "packing": packing_decisions,
         }
-        meta_path.write_text(__import__("json").dumps(meta, indent=2))
+        meta_path.write_text(__import__("json").dumps(meta, indent=2), encoding="utf-8")
         return PDFComposeResult(pdf_path=pdf_path, meta_path=meta_path)
 
     def _compute_cells(self, candidates: List[ImageInfo], margin: int):
