@@ -22,6 +22,9 @@ from .pdf_packer import PDFComposer, PDFComposeResult
 from .storage import Storage
 from .tasks import job_queue, workers
 
+# Transient store for pending yt-dlp choices per sender
+ytdl_pending: Dict[str, Dict[str, Any]] = {}
+
 try:
     from .gemini import GeminiResponder  # optional; only used if enabled
 except Exception:
@@ -344,6 +347,91 @@ async def _enqueue_batch_later(sender: str, db: Database):
         json_log("batch_enqueue_error", sender=sender, error=str(e))
 
 
+def _fmt_mb(nbytes: Optional[Union[int, float]]) -> str:
+    try:
+        if not nbytes or nbytes <= 0:
+            return "unknown"
+        return f"{int(round(nbytes / (1024*1024)))}MB"
+    except Exception:
+        return "unknown"
+
+
+async def _ytdl_prepare_choices(url: str) -> List[Dict[str, Any]]:
+    """
+    Inspect available formats with yt-dlp -J and pick reasonable 480p and 720p progressive formats.
+    Returns a list of dicts: [{"key":"1","label":"480p","format_id":"XXX","size_mb":80}, ...]
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "yt-dlp", "-J", url,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            json_log("ytdl_probe_error", url=url, stderr=stderr.decode("utf-8", "ignore")[:200])
+            return []
+        import json as _json
+        info = _json.loads(stdout.decode("utf-8", "ignore") or "{}")
+        formats = info.get("formats") or []
+        duration = info.get("duration") or None  # seconds
+
+        # helper to size estimation
+        def est_size_bytes(fmt: Dict[str, Any]) -> Optional[int]:
+            # direct size fields
+            for k in ("filesize", "filesize_approx"):
+                v = fmt.get(k)
+                if isinstance(v, (int, float)) and v > 0:
+                    return int(v)
+            # fallback via tbr (kbps) * duration
+            tbr = fmt.get("tbr") or fmt.get("abr") or fmt.get("vbr")
+            if duration and isinstance(tbr, (int, float)) and tbr > 0:
+                # tbr is in kbps → bytes = kbps * 1000/8 * seconds
+                return int((tbr * 1000 / 8) * float(duration))
+            return None
+
+        # filter progressive if possible (both audio and video present)
+        prog = [f for f in formats if (f.get("vcodec") != "none" and f.get("acodec") != "none")]
+        if not prog:
+            prog = formats
+
+        # choose closest heights
+        def pick_closest(target_h: int):
+            cand = None
+            best_delta = 10**9
+            for f in prog:
+                h = f.get("height")
+                if not isinstance(h, int):
+                    continue
+                delta = abs(h - target_h)
+                # prefer mp4 if tie
+                ext = (f.get("ext") or "").lower()
+                if (delta < best_delta) or (delta == best_delta and ext == "mp4"):
+                    cand = f
+                    best_delta = delta
+            return cand
+
+        c480 = pick_closest(480)
+        c720 = pick_closest(720)
+
+        choices: List[Dict[str, Any]] = []
+        idx = 1
+        for label, fmt in (("480p", c480), ("720p", c720)):
+            if fmt:
+                size_b = est_size_bytes(fmt)
+                choices.append({
+                    "key": str(idx),
+                    "label": label,
+                    "format_id": fmt.get("format_id"),
+                    "size_mb": None if size_b is None else int(round(size_b / (1024*1024))),
+                })
+                idx += 1
+        return choices
+    except Exception as e:
+        json_log("ytdl_prepare_exception", error=str(e))
+        return []
+
+
 async def _download_and_send_image(sender: str, query: str, prefer_ext: str, db: Database) -> bool:
     client = GreenAPIClient.from_env()
     tmp_dir = storage.base / "tmp"
@@ -461,27 +549,65 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
 
     text_msg = _extract_text_from_payload(payload) or ""
 
-    # If text contains a YouTube link
-    yt_url = find_youtube_url(text_msg or "")
-    if yt_url:
-        json_log("youtube_link_detected", sender=sender, url=yt_url)
-        # ask for confirmation
-        qa_state.set_pending_ytdl(sender, yt_url)
-        if _is_sender_allowed(sender, db) and sender != "unknown":
-            await client.send_message(chat_id=sender, message="You sent a YouTube link. Do you want me to download this video and send it back? Reply YES to confirm.")
-        return {"ok": True, "job_id": None}
-
-    # If awaiting yt-dlp confirmation
+    # If awaiting yt-dlp resolution choice or confirmation
     pending_url = qa_state.get_pending_ytdl(sender)
-    if pending_url and (text_msg or "").strip().lower() in {"yes", "y", "download", "ok"}:
+    if pending_url:
+        choice_text = (text_msg or "").strip().lower()
+        # Cancellation
+        if choice_text in {"cancel", "stop", "no"}:
+            qa_state.set_pending_ytdl(sender, None)
+            ytdl_pending.pop(sender, None)
+            if _is_sender_allowed(sender, db):
+                await client.send_message(chat_id=sender, message="Okay, canceled the download.")
+            return {"ok": True, "job_id": None}
+
+        # Resolve choice
+        entry = ytdl_pending.get(sender)
+        selected_fmt = None
+        if entry and isinstance(entry.get("choices"), list):
+            # numeric choice (1/2/...)
+            for c in entry["choices"]:
+                if choice_text == str(c.get("key")).strip().lower():
+                    selected_fmt = c
+                    break
+            # resolution text like "480" or "480p"
+            if not selected_fmt and any(tok in choice_text for tok in ("480", "480p")):
+                for c in entry["choices"]:
+                    if str(c.get("label", "")).lower().startswith("480"):
+                        selected_fmt = c
+                        break
+            if not selected_fmt and any(tok in choice_text for tok in ("720", "720p")):
+                for c in entry["choices"]:
+                    if str(c.get("label", "")).lower().startswith("720"):
+                        selected_fmt = c
+                        break
+
+        # Fallback: accept yes/ok -> first choice or best<=480
+        if not selected_fmt and choice_text in {"yes", "y", "download", "ok"}:
+            if entry and entry.get("choices"):
+                selected_fmt = entry["choices"][0]
+            else:
+                selected_fmt = {"format_id": "best[height<=480]", "label": "480p"}
+
+        if not selected_fmt:
+            # If we still don't understand, re-show menu if available
+            if entry and entry.get("choices") and _is_sender_allowed(sender, db):
+                items = []
+                for c in entry["choices"]:
+                    size_txt = f" (~{c['size_mb']}MB)" if c.get("size_mb") is not None else ""
+                    items.append(f"{c['key']}. {c['label']}{size_txt}")
+                await client.send_message(chat_id=sender, message="Please reply with one of the options:\n" + "\n".join(items))
+            return {"ok": True, "job_id": None}
+
         # download video, upload, send, delete
         try:
-            import subprocess
             import shlex
             tmp_dir = storage.base / "tmp"
             tmp_dir.mkdir(parents=True, exist_ok=True)
             out_tpl = str(tmp_dir / "yt_video.%(ext)s")
-            cmd = f"yt-dlp -f mp4 -o {shlex.quote(out_tpl)} {shlex.quote(pending_url)}"
+            fmt_selector = str(selected_fmt.get("format_id") or "best")
+            # If format_id looks like a selector (contains '[' or 'best'), pass as-is; else an exact id
+            cmd = f"yt-dlp -f {shlex.quote(fmt_selector)} -o {shlex.quote(out_tpl)} {shlex.quote(pending_url)}"
             proc = await asyncio.create_subprocess_shell(cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
             stdout, stderr = await proc.communicate()
             if proc.returncode != 0:
@@ -497,16 +623,45 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
                     video_path = candidates[0]
                     up = await client.upload_file(video_path)
                     if _is_sender_allowed(sender, db):
-                        await client.send_file_by_url(chat_id=sender, url_file=up.get("urlFile", ""), filename=video_path.name, caption="Here is your video.")
+                        cap = f"Here is your video ({selected_fmt.get('label','')})."
+                        await client.send_file_by_url(chat_id=sender, url_file=up.get("urlFile", ""), filename=video_path.name, caption=cap)
                     try:
                         video_path.unlink()
                     except Exception:
                         pass
+            # clear pending
             qa_state.set_pending_ytdl(sender, None)
+            ytdl_pending.pop(sender, None)
         except Exception as e:
             if _is_sender_allowed(sender, db):
                 await client.send_message(chat_id=sender, message=f"Error while downloading video: {e}")
             qa_state.set_pending_ytdl(sender, None)
+            ytdl_pending.pop(sender, None)
+        return {"ok": True, "job_id": None}
+
+    # If text contains a YouTube link
+    yt_url = find_youtube_url(text_msg or "")
+    if yt_url:
+        json_log("youtube_link_detected", sender=sender, url=yt_url)
+        # Prepare choices (480p/720p) and ask user to choose
+        choices = await _ytdl_prepare_choices(yt_url)
+        if not choices:
+            # fallback to a simple yes/no with default 480p
+            qa_state.set_pending_ytdl(sender, yt_url)
+            ytdl_pending[sender] = {"url": yt_url, "choices": [{"key": "1", "label": "480p", "format_id": "best[height<=480]"}]}
+            if _is_sender_allowed(sender, db) and sender != "unknown":
+                await client.send_message(chat_id=sender, message="You sent a YouTube link. Reply 1 to download at 480p.")
+            return {"ok": True, "job_id": None}
+        # Save pending menu
+        qa_state.set_pending_ytdl(sender, yt_url)
+        ytdl_pending[sender] = {"url": yt_url, "choices": choices}
+        if _is_sender_allowed(sender, db) and sender != "unknown":
+            items = []
+            for c in choices:
+                size_txt = f" (~{c['size_mb']}MB)" if c.get("size_mb") is not None else ""
+                items.append(f"{c['key']}. {c['label']}{size_txt}")
+            menu = "Choose a resolution to download:\n" + "\n".join(items)
+            await client.send_message(chat_id=sender, message=menu)
         return {"ok": True, "job_id": None}
 
     # Simple internet search command: "search: ..."
