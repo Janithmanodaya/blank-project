@@ -164,8 +164,12 @@ class GeminiFileQA:
             return f"Error while answering: {e}"
 
 
-YOUTUBE_RE = re.compile(r"https?://(?:www\\.)?(?:youtube\\.com/watch\\?v=[\\w-]+|youtu\\.be/[\\w-]+)[^\\s]*", re.IGNORECASE)
+# Broader YouTube URL matcher: supports watch, youtu.be, shorts, and mobile links with extra params
+YOUTUBE_RE = re.compile(
+    r"(https?://(?:www\.)?(?:m\.)?(?:youtube\.com/(?:watch\?[^ \n]+|shorts/[^ \n]+)|youtu\.be/[^ \n]+))",
+    re.IGNORECASE,
+)
 
 def find_youtube_url(text: str) -> Optional[str]:
     m = YOUTUBE_RE.search(text or "")
-    return m.group(0) if m else None
+    return m.group(1) if m else None

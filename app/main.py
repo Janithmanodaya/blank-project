@@ -599,6 +599,8 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
                 await client.send_message(chat_id=sender, message="Please reply with one of the options:\n" + "\n".join(items))
             return {"ok": True, "job_id": None}
 
+        json_log("ytdl_choice_selected", sender=sender, choice=selected_fmt.get("label"), fmt=selected_fmt.get("format_id"))
+
         # download video, upload, send, delete
         try:
             import shlex
@@ -655,6 +657,7 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
         # Save pending menu
         qa_state.set_pending_ytdl(sender, yt_url)
         ytdl_pending[sender] = {"url": yt_url, "choices": choices}
+        json_log("ytdl_menu_prepared", sender=sender, choices=[{"key": c["key"], "label": c["label"], "size_mb": c.get("size_mb")} for c in choices])
         if _is_sender_allowed(sender, db) and sender != "unknown":
             items = []
             for c in choices:
