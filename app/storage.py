@@ -25,7 +25,8 @@ class Storage:
 
     def save_incoming_payload(self, payload: Dict[str, Any], name: str) -> Path:
         p = self.base / "incoming_payloads" / name
-        p.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+        # Write as UTF-8 to support emojis and non-ASCII safely across platforms (Windows codepages).
+        p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         return p
 
     def raw_dir_for(self, sender: str, msg_id: str) -> Path:
@@ -81,7 +82,7 @@ class Storage:
         shutil.move(str(tmp), str(target))
         # write meta next to file
         meta = {"source_url": url, "saved_at": datetime.utcnow().isoformat() + "Z"}
-        (raw_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+        (raw_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
         return target
 
     def delete_files(self, paths: List[Path]):
