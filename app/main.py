@@ -944,6 +944,10 @@ async def webhook(request: Request, db: Database = Depends(get_db)):
 async def root():
     return RedirectResponse(url="/ui")
 
+@app.head("/")
+async def root_head():
+    return RedirectResponse(url="/ui")
+
 
 async def _web_search_links(query: str) -> List[str]:
     # Minimal search via DuckDuckGo html
