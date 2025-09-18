@@ -3,9 +3,10 @@ import json
 import logging
 import os
 import sys
+import io
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union, TextIO
 
 import httpx
 from fastapi import Depends, FastAPI, Request
@@ -26,14 +27,28 @@ except Exception:
 APP_TITLE = "GreenAPI Image→PDF Relay"
 VERSION = "0.4.0"
 
-# Ensure stdout uses UTF-8 so emojis and non-ASCII don't crash logging on Windows
-try:
-    if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    if hasattr(sys.stderr, "reconfigure"):
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-except Exception:
-    pass
+# Predeclare stream so type checkers (Pylance) see it before first use
+_stdout_utf8: TextIO = sys.stdout
+
+# Force a UTF-8 text stream for logging to avoid 'charmap' errors on Windows consoles
+def _utf8_stream_for_stdout() -> TextIO:
+    try:
+        # If possible, wrap the underlying buffer with UTF-8 encoding and replacement on errors
+        if hasattr(sys.stdout, "buffer"):
+            return io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+    # Fallback: try reconfigure on Py3.7+
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+            return sys.stdout
+    except Exception:
+        pass
+    # Last resort: return original
+    return sys.stdout
+
+_stdout_utf8 = _utf8_stream_for_stdout()
 
 logging.basicConfig(
     level=logging.INFO,
