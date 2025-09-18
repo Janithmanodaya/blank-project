@@ -38,13 +38,20 @@ except Exception:
 logging.basicConfig(
     level=logging.INFO,
     format="%(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
+    handlers=[logging.StreamHandler(_stdout_utf8)],
+    force=True,  # override any existing handlers (e.g., added by uvicorn) to enforce UTF-8 stream
 )
 
 
 def json_log(event: str, **kwargs):
+    # Write JSON log directly to a UTF-8 wrapped stdout to avoid Windows 'charmap' encoding errors
     payload = {"ts": datetime.utcnow().isoformat() + "Z", "event": event, **kwargs}
-    logging.info(json.dumps(payload, ensure_ascii=False))
+    try:
+        _stdout_utf8.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        _stdout_utf8.flush()
+    except Exception:
+        # As a last resort, fall back to logging (may escape unicode) to avoid crashing
+        logging.info(json.dumps(payload, ensure_ascii=True))
 
 
 app = FastAPI(title=APP_TITLE, version=VERSION)
