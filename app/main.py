@@ -4,6 +4,8 @@ import logging
 import os
 import sys
 import io
+import re
+import random
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union, TextIO
@@ -12,6 +14,7 @@ import httpx
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from urllib.parse import quote_plus, urlparse, parse_qs
 
 from .db import Database, get_db
 from .green_api import GreenAPIClient
@@ -19,13 +22,16 @@ from .pdf_packer import PDFComposer, PDFComposeResult
 from .storage import Storage
 from .tasks import job_queue, workers
 
+# Transient store for pending yt-dlp choices per sender
+ytdl_pending: Dict[str, Dict[str, Any]] = {}
+
 try:
     from .gemini import GeminiResponder  # optional; only used if enabled
 except Exception:
     GeminiResponder = None  # type: ignore
 
 APP_TITLE = "GreenAPI Image→PDF Relay"
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 # Predeclare stream so type checkers (Pylance) see it before first use
 _stdout_utf8: TextIO = sys.stdout
@@ -198,16 +204,42 @@ async def worker_loop(worker_id: int):
 
 
 def _extract_text_from_payload(payload: Dict[str, Any]) -> Optional[str]:
+    """
+    Extract human text from common Green-API payload shapes.
+    Handles:
+      - textMessageData.textMessage (typeMessage == textMessage)
+      - extendedTextMessageData.text (typeMessage == extendedTextMessage)
+      - captions for image/file/document
+    Fallback: None
+    """
     md = payload.get("messageData") or {}
     if not md:
         return None
-    # Green-API text messages carry typeMessage == "textMessage"
-    if md.get("typeMessage") == "textMessage":
+
+    t = (md.get("typeMessage") or "").lower()
+
+    # Standard text
+    if t == "textmessage":
         tmd = md.get("textMessageData") or {}
-        return tmd.get("textMessage") or None
-    # Some media messages may include caption; optionally reply on caption too
-    if "imageMessageData" in md:
-        return md.get("imageMessageData", {}).get("caption")
+        if tmd.get("textMessage"):
+            return tmd.get("textMessage")
+
+    # Extended text (links often live here)
+    if t == "extendedtextmessage":
+        etd = md.get("extendedTextMessageData") or {}
+        # Green-API usually uses 'text'
+        for k in ("text", "description", "title"):
+            v = etd.get(k)
+            if isinstance(v, str) and v.strip():
+                return v
+
+    # Captions on images/documents
+    for k in ("imageMessageData", "fileMessageData", "documentMessageData"):
+        if k in md:
+            cap = (md.get(k) or {}).get("caption")
+            if isinstance(cap, str) and cap.strip():
+                return cap
+
     return None
 
 
@@ -286,7 +318,8 @@ async def maybe_auto_reply(payload: Dict[str, Any], db: Database):
 
     try:
         responder = GeminiResponder()
-        reply = responder.generate(text, system_prompt)
+        # Offload blocking SDK call to a thread to avoid event loop stalls
+        reply = await asyncio.to_thread(responder.generate, text, system_prompt)
         client = GreenAPIClient.from_env()
         await client.send_message(chat_id=chat_id, message=reply)
         json_log("auto_reply_sent", chat_id=chat_id)
@@ -315,6 +348,166 @@ async def _enqueue_batch_later(sender: str, db: Database):
         json_log("batch_enqueue_error", sender=sender, error=str(e))
 
 
+def _fmt_mb(nbytes: Optional[Union[int, float]]) -> str:
+    try:
+        if not nbytes or nbytes <= 0:
+            return "unknown"
+        return f"{int(round(nbytes / (1024*1024)))}MB"
+    except Exception:
+        return "unknown"
+
+
+def _normalize_youtube_url(url: str) -> str:
+    """
+    Convert youtu.be and shorts URLs to canonical watch?v= form where possible.
+    """
+    try:
+        u = urlparse(url)
+        host = (u.netloc or "").lower()
+        path = u.path or ""
+        if "youtu.be" in host:
+            vid = path.strip("/").split("/")[0]
+            if vid:
+                return f"https://www.youtube.com/watch?v={vid}"
+        if "youtube.com" in host and "/shorts/" in path:
+            vid = path.split("/shorts/")[1].split("/")[0]
+            if vid:
+                return f"https://www.youtube.com/watch?v={vid}"
+        return url
+    except Exception:
+        return url
+
+
+async def _ytdl_prepare_choices(url: str) -> List[Dict[str, Any]]:
+    """
+    Inspect available formats with yt-dlp -J and pick reasonable 480p and 720p progressive formats.
+    Returns a list of dicts: [{"key":"1","label":"480p","format_id":"XXX","size_mb":80}, ...]
+    """
+    try:
+        norm_url = _normalize_youtube_url(url)
+        proc = await asyncio.create_subprocess_exec(
+            "yt-dlp", "-J", "--no-playlist", "--force-ipv4",
+            "--extractor-args", "youtube:player_client=android",
+            norm_url,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            json_log("ytdl_probe_error", url=norm_url, stderr=stderr.decode("utf-8", "ignore")[:200])
+            return []
+        import json as _json
+        info = _json.loads(stdout.decode("utf-8", "ignore") or "{}")
+        formats = info.get("formats") or []
+        duration = info.get("duration") or None  # seconds
+
+        # helper to size estimation
+        def est_size_bytes(fmt: Dict[str, Any]) -> Optional[int]:
+            # direct size fields
+            for k in ("filesize", "filesize_approx"):
+                v = fmt.get(k)
+                if isinstance(v, (int, float)) and v > 0:
+                    return int(v)
+            # fallback via tbr (kbps) * duration
+            tbr = fmt.get("tbr") or fmt.get("abr") or fmt.get("vbr")
+            if duration and isinstance(tbr, (int, float)) and tbr > 0:
+                # tbr is in kbps → bytes = kbps * 1000/8 * seconds
+                return int((tbr * 1000 / 8) * float(duration))
+            return None
+
+        # filter progressive if possible (both audio and video present)
+        prog = [f for f in formats if (f.get("vcodec") != "none" and f.get("acodec") != "none")]
+        if not prog:
+            prog = formats
+
+        # choose closest heights
+        def pick_closest(target_h: int):
+            cand = None
+            best_delta = 10**9
+            for f in prog:
+                h = f.get("height")
+                if not isinstance(h, int):
+                    continue
+                delta = abs(h - target_h)
+                # prefer mp4 if tie
+                ext = (f.get("ext") or "").lower()
+                if (delta < best_delta) or (delta == best_delta and ext == "mp4"):
+                    cand = f
+                    best_delta = delta
+            return cand
+
+        c480 = pick_closest(480)
+        c720 = pick_closest(720)
+
+        choices: List[Dict[str, Any]] = []
+        idx = 1
+        for label, fmt in (("480p", c480), ("720p", c720)):
+            if fmt:
+                size_b = est_size_bytes(fmt)
+                choices.append({
+                    "key": str(idx),
+                    "label": label,
+                    "format_id": fmt.get("format_id"),
+                    "size_mb": None if size_b is None else int(round(size_b / (1024*1024))),
+                })
+                idx += 1
+        return choices
+    except Exception as e:
+        json_log("ytdl_prepare_exception", error=str(e))
+        return []
+
+
+async def _download_and_send_image(sender: str, query: str, prefer_ext: str, db: Database) -> bool:
+    client = GreenAPIClient.from_env()
+    tmp_dir = storage.base / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    ext = ".jpg" if prefer_ext.lower() in {"jpg", "jpeg"} else ".png"
+    name = f"img_{int(datetime.utcnow().timestamp())}_{random.randint(1000,9999)}{ext}"
+    out_path = tmp_dir / name
+
+    # Select a reliable source
+    url = ""
+    qlow = (query or "").strip().lower()
+    if "cat" in qlow and ("image" in qlow or "photo" in qlow or "jpg" in qlow or "jpeg" in qlow):
+        # Deterministic cute cat
+        w, h = 800, 600
+        seed = random.randint(1, 1_000_000)
+        url = f"https://placekitten.com/seed/{seed}/{w}/{h}"
+        ext = ".jpg"
+        out_path = tmp_dir / (out_path.stem + ".jpg")
+    else:
+        # Unsplash Source supports keyword without API key
+        url = f"https://source.unsplash.com/800x600/?{quote_plus(query)}"
+
+    try:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as hc:
+            r = await hc.get(url, headers={"User-Agent": "Mozilla/5.0"})
+            if r.status_code != 200 or not r.content:
+                return False
+            with out_path.open("wb") as f:
+                f.write(r.content)
+        up = await client.upload_file(out_path)
+        if _is_sender_allowed(sender, db):
+            await client.send_file_by_url(chat_id=sender, url_file=up.get("urlFile", ""), filename=out_path.name, caption=f"Image for: {query}")
+        try:
+            out_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return True
+    except Exception as e:
+        json_log("image_fetch_error", error=str(e), query=query)
+        try:
+            out_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        if _is_sender_allowed(sender, db):
+            try:
+                await client.send_message(chat_id=sender, message="I couldn't fetch an image right now.")
+            except Exception:
+                pass
+        return False
+
+
 async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict[str, Any]:
     # Persist raw payload
     ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
@@ -325,12 +518,24 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
     if not webhook_type:
         json_log("webhook_ignored", reason="missing_typeWebhook")
         return {"ok": True, "ignored": True}
+    # Only process incoming messages; ignore outgoing echoes to avoid replying to ourselves
+    if str(webhook_type).lower() not in {"incomingmessagereceived"}:
+        json_log("webhook_ignored", reason="not_incoming", type=str(webhook_type))
+        return {"ok": True, "ignored": True}
 
     # Extract sender, message id, media list heuristically
     instance_id = payload.get("instanceData", {}).get("idInstance") or os.getenv("GREEN_API_INSTANCE_ID", "")
-    sender = payload.get("senderData", {}).get("chatId") or payload.get("senderData", {}).get("sender") or "unknown"
-    msg_id = payload.get("idMessage") or payload.get("messageData", {}).get("idMessage") or payload.get("receiptId") or ts
+    # Try multiple locations for sender/chat id; some notifications omit senderData
     message_data = payload.get("messageData") or {}
+    sender = (
+        payload.get("senderData", {}).get("chatId")
+        or payload.get("senderData", {}).get("sender")
+        or payload.get("chatId")
+        or message_data.get("chatId")
+        or payload.get("author")
+        or "unknown"
+    )
+    msg_id = payload.get("idMessage") or message_data.get("idMessage") or payload.get("receiptId") or ts
 
     # Time window filter (3 minutes)
     now = datetime.now(tz=timezone.utc)
@@ -373,51 +578,148 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
 
     text_msg = _extract_text_from_payload(payload) or ""
 
-    # If text contains a YouTube link
-    yt_url = find_youtube_url(text_msg or "")
-    if yt_url:
-        # ask for confirmation
-        qa_state.set_pending_ytdl(sender, yt_url)
-        if _is_sender_allowed(sender, db):
-            await client.send_message(chat_id=sender, message="You sent a YouTube link. Do you want me to download this video and send it back? Reply YES to confirm.")
-        return {"ok": True, "job_id": None}
-
-    # If awaiting yt-dlp confirmation
+    # If awaiting yt-dlp resolution choice or confirmation
     pending_url = qa_state.get_pending_ytdl(sender)
-    if pending_url and (text_msg or "").strip().lower() in {"yes", "y", "download", "ok"}:
+    if pending_url:
+        choice_text = (text_msg or "").strip().lower()
+        # Cancellation
+        if choice_text in {"cancel", "stop", "no"}:
+            qa_state.set_pending_ytdl(sender, None)
+            ytdl_pending.pop(sender, None)
+            if _is_sender_allowed(sender, db):
+                await client.send_message(chat_id=sender, message="Okay, canceled the download.")
+            return {"ok": True, "job_id": None}
+
+        # Resolve choice
+        entry = ytdl_pending.get(sender)
+        selected_fmt = None
+        if entry and isinstance(entry.get("choices"), list):
+            # numeric choice (1/2/...)
+            for c in entry["choices"]:
+                if choice_text == str(c.get("key")).strip().lower():
+                    selected_fmt = c
+                    break
+            # resolution text like "480" or "480p"
+            if not selected_fmt and any(tok in choice_text for tok in ("480", "480p")):
+                for c in entry["choices"]:
+                    if str(c.get("label", "")).lower().startswith("480"):
+                        selected_fmt = c
+                        break
+            if not selected_fmt and any(tok in choice_text for tok in ("720", "720p")):
+                for c in entry["choices"]:
+                    if str(c.get("label", "")).lower().startswith("720"):
+                        selected_fmt = c
+                        break
+
+        # Fallback: accept yes/ok -> first choice or best<=480
+        if not selected_fmt and choice_text in {"yes", "y", "download", "ok"}:
+            if entry and entry.get("choices"):
+                selected_fmt = entry["choices"][0]
+            else:
+                selected_fmt = {"format_id": "best[height<=480]", "label": "480p"}
+
+        if not selected_fmt:
+            # If we still don't understand, re-show menu if available
+            if entry and entry.get("choices") and _is_sender_allowed(sender, db):
+                items = []
+                for c in entry["choices"]:
+                    size_txt = f" (~{c['size_mb']}MB)" if c.get("size_mb") is not None else ""
+                    items.append(f"{c['key']}. {c['label']}{size_txt}")
+                await client.send_message(chat_id=sender, message="Please reply with one of the options:\n" + "\n".join(items))
+            return {"ok": True, "job_id": None}
+
+        json_log("ytdl_choice_selected", sender=sender, choice=selected_fmt.get("label"), fmt=selected_fmt.get("format_id"))
+
         # download video, upload, send, delete
         try:
-            import subprocess
-            import shlex
             tmp_dir = storage.base / "tmp"
             tmp_dir.mkdir(parents=True, exist_ok=True)
             out_tpl = str(tmp_dir / "yt_video.%(ext)s")
-            cmd = f"yt-dlp -f mp4 -o {shlex.quote(out_tpl)} {shlex.quote(pending_url)}"
-            proc = await asyncio.create_subprocess_shell(cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            fmt_selector = str(selected_fmt.get("format_id") or "best")
+            url_norm = _normalize_youtube_url(pending_url)
+            # Build exec args to avoid shell quoting issues on Windows
+            args = [
+                "yt-dlp",
+                "--no-playlist",
+                "--force-ipv4",
+                "--extractor-args", "youtube:player_client=android",
+                "--no-part",
+                "--retries", "3",
+                "--fragment-retries", "3",
+                "-f", fmt_selector,
+                "-o", out_tpl,
+                url_norm,
+            ]
+            json_log("ytdl_download_started", sender=sender, cmd=" ".join(args))
+            proc = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
             stdout, stderr = await proc.communicate()
+            err_txt = stderr.decode('utf-8', 'ignore')
             if proc.returncode != 0:
+                json_log("ytdl_download_failed", sender=sender, code=proc.returncode, stderr=err_txt[:300])
                 if _is_sender_allowed(sender, db):
-                    await client.send_message(chat_id=sender, message=f"Failed to download video. Error: {stderr.decode('utf-8', 'ignore')[:200]}")
+                    # Common hint if ffmpeg missing or geo/consent restricted
+                    hint = ""
+                    if "ffmpeg" in err_txt.lower():
+                        hint = " (converter missing on server)"
+                    elif "Sign in to confirm" in err_txt or "This video is only available" in err_txt:
+                        hint = " (video requires login/consent; cannot fetch without cookies)"
+                    await client.send_message(chat_id=sender, message=f"Failed to download video{hint}.")
             else:
-                # find the produced file (mp4 preferred)
-                candidates = sorted(tmp_dir.glob("yt_video.*"), key=lambda p: p.stat().st_mtime, reverse=True)
+                # find the produced file (prefer non-part, newest)
+                exts = (".mp4", ".mkv", ".webm", ".mov", ".m4v")
+                candidates = [p for p in tmp_dir.glob("yt_video.*") if p.suffix.lower() in exts and not str(p).endswith(".part")]
+                candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
                 if not candidates:
+                    json_log("ytdl_download_no_output", sender=sender)
                     if _is_sender_allowed(sender, db):
                         await client.send_message(chat_id=sender, message="Download finished but no file was produced.")
                 else:
                     video_path = candidates[0]
+                    json_log("ytdl_download_succeeded", sender=sender, file=str(video_path))
                     up = await client.upload_file(video_path)
                     if _is_sender_allowed(sender, db):
-                        await client.send_file_by_url(chat_id=sender, url_file=up.get("urlFile", ""), filename=video_path.name, caption="Here is your video.")
+                        cap = f"Here is your video ({selected_fmt.get('label','')})."
+                        await client.send_file_by_url(chat_id=sender, url_file=up.get("urlFile", ""), filename=video_path.name, caption=cap)
                     try:
                         video_path.unlink()
                     except Exception:
                         pass
+            # clear pending
             qa_state.set_pending_ytdl(sender, None)
+            ytdl_pending.pop(sender, None)
         except Exception as e:
+            json_log("ytdl_download_exception", sender=sender, error=str(e))
             if _is_sender_allowed(sender, db):
                 await client.send_message(chat_id=sender, message=f"Error while downloading video: {e}")
             qa_state.set_pending_ytdl(sender, None)
+            ytdl_pending.pop(sender, None)
+        return {"ok": True, "job_id": None}
+
+    # If text contains a YouTube link
+    yt_url = find_youtube_url(text_msg or "")
+    if yt_url:
+        yt_norm = _normalize_youtube_url(yt_url)
+        json_log("youtube_link_detected", sender=sender, url=yt_norm)
+        # Prepare choices (480p/720p) and ask user to choose
+        choices = await _ytdl_prepare_choices(yt_norm)
+        if not choices:
+            # fallback to a simple yes/no with default 480p
+            qa_state.set_pending_ytdl(sender, yt_norm)
+            ytdl_pending[sender] = {"url": yt_norm, "choices": [{"key": "1", "label": "480p", "format_id": "best[height<=480]/best"}]}
+            if _is_sender_allowed(sender, db) and sender != "unknown":
+                await client.send_message(chat_id=sender, message="You sent a YouTube link. Reply 1 to download at 480p.")
+            return {"ok": True, "job_id": None}
+        # Save pending menu
+        qa_state.set_pending_ytdl(sender, yt_norm)
+        ytdl_pending[sender] = {"url": yt_norm, "choices": choices}
+        json_log("ytdl_menu_prepared", sender=sender, choices=[{"key": c["key"], "label": c["label"], "size_mb": c.get("size_mb")} for c in choices])
+        if _is_sender_allowed(sender, db) and sender != "unknown":
+            items = []
+            for c in choices:
+                size_txt = f" (~{c['size_mb']}MB)" if c.get("size_mb") is not None else ""
+                items.append(f"{c['key']}. {c['label']}{size_txt}")
+            menu = "Choose a resolution to download:\n" + "\n".join(items)
+            await client.send_message(chat_id=sender, message=menu)
         return {"ok": True, "job_id": None}
 
     # Simple internet search command: "search: ..."
@@ -431,6 +733,20 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
                 head = "\n".join(links[:8])
                 await client.send_message(chat_id=sender, message=f"Top results for \"{query}\":\n{head}")
         return {"ok": True, "job_id": None}
+
+    # Image fetch command: "image: cats jpg" or "img: cat"
+    low = (text_msg or "").strip().lower()
+    if low.startswith("image:") or low.startswith("img:") or (("image" in low or "photo" in low or "picture" in low) and ("jpg" in low or "jpeg" in low or "png" in low or "cat" in low)):
+        body = text_msg.split(":", 1)[1].strip() if ":" in text_msg[:6] else text_msg
+        prefer_ext = "jpg"
+        if "png" in low:
+            prefer_ext = "png"
+        elif "jpeg" in low or "jpg" in low:
+            prefer_ext = "jpg"
+        ok_img = await _download_and_send_image(sender, body, prefer_ext, db)
+        if ok_img:
+            return {"ok": True, "job_id": None}
+        # if failed, fall through to other handlers
 
     # Toggle: if pdf_packer_enabled -> existing batching to PDF, else switch to QA mode
     pdf_packer_enabled = (db.get_setting("pdf_packer_enabled", "1") or "1") == "1"
@@ -554,7 +870,8 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
                     "GEMINI_SYSTEM_PROMPT", "You are a helpful assistant. Identify the user's intent and respond concisely."
                 )
                 responder = GeminiResponder()
-                reply = responder.generate(text_msg, system_prompt)
+                # Offload blocking SDK call to a thread to keep loop responsive
+                reply = await asyncio.to_thread(responder.generate, text_msg, system_prompt)
                 await client.send_message(chat_id=sender, message=reply)
                 json_log("fallback_gemini_reply_sent", chat_id=sender)
             except Exception as e:
