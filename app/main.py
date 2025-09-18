@@ -632,21 +632,26 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
 
         # download video, upload, send, delete
         try:
-            import shlex
             tmp_dir = storage.base / "tmp"
             tmp_dir.mkdir(parents=True, exist_ok=True)
             out_tpl = str(tmp_dir / "yt_video.%(ext)s")
             fmt_selector = str(selected_fmt.get("format_id") or "best")
             url_norm = _normalize_youtube_url(pending_url)
-            # More resilient flags for YouTube (ipv4, android client); avoid playlists; avoid .part files; retry a bit
-            cmd = (
-                f"yt-dlp --no-playlist --force-ipv4 "
-                f"--extractor-args youtube:player_client=android "
-                f"--no-part --retries 3 --fragment-retries 3 "
-                f"-f {shlex.quote(fmt_selector)} -o {shlex.quote(out_tpl)} {shlex.quote(url_norm)}"
-            )
-            json_log("ytdl_download_started", sender=sender, cmd=cmd)
-            proc = await asyncio.create_subprocess_shell(cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            # Build exec args to avoid shell quoting issues on Windows
+            args = [
+                "yt-dlp",
+                "--no-playlist",
+                "--force-ipv4",
+                "--extractor-args", "youtube:player_client=android",
+                "--no-part",
+                "--retries", "3",
+                "--fragment-retries", "3",
+                "-f", fmt_selector,
+                "-o", out_tpl,
+                url_norm,
+            ]
+            json_log("ytdl_download_started", sender=sender, cmd=" ".join(args))
+            proc = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
             stdout, stderr = await proc.communicate()
             err_txt = stderr.decode('utf-8', 'ignore')
             if proc.returncode != 0:
