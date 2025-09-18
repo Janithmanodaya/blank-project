@@ -105,8 +105,13 @@ class GeminiFileQA:
         api_key = db.get_setting("GEMINI_API_KEY", None) or os.getenv("GEMINI_API_KEY")
         if not api_key:
             raise RuntimeError("GEMINI_API_KEY is not set")
-        # For document answers, use the model selected in UI; default to Gemma 3n if not set
-        model = model_name or db.get_setting("GEMINI_MODEL", None) or os.getenv("GEMINI_MODEL") or "gemma-3n"
+        # Prefer explicit parameter, then DB/env, then sane default
+        configured = (
+            model_name
+            or db.get_setting("GEMINI_MODEL", None)
+            or os.getenv("GEMINI_MODEL")
+        )
+        model = configured or "gemma-3n-E4B-it"
         genai.configure(api_key=api_key)
         self.model = genai.GenerativeModel(model)
 
@@ -136,7 +141,8 @@ class GeminiFileQA:
         if not handles:
             return "Couldn't read the file(s). Please try sending them again."
         instructions = system_prompt or "Answer strictly and only using the provided files. If the information is not present, say you don't know."
-        parts = [{"text": instructions}]
+        # Use list-of-parts; google-generativeai supports passing a list
+        parts: List[object] = [{"text": instructions}]
         parts.extend(handles)
         parts.append({"text": f"User question: {question}"})
         try:
@@ -152,7 +158,6 @@ class GeminiFileQA:
 
 
 YOUTUBE_RE = re.compile(r"https?://(?:www\\.)?(?:youtube\\.com/watch\\?v=[\\w-]+|youtu\\.be/[\\w-]+)[^\\s]*", re.IGNORECASE)
-
 
 def find_youtube_url(text: str) -> Optional[str]:
     m = YOUTUBE_RE.search(text or "")

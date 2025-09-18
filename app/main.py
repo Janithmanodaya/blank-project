@@ -3,9 +3,10 @@ import json
 import logging
 import os
 import sys
+import io
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union, TextIO
 
 import httpx
 from fastapi import Depends, FastAPI, Request
@@ -26,16 +27,53 @@ except Exception:
 APP_TITLE = "GreenAPI Image→PDF Relay"
 VERSION = "0.4.0"
 
+# Predeclare stream so type checkers (Pylance) see it before first use
+_stdout_utf8: TextIO = sys.stdout
+
+# Force a UTF-8 text stream for logging to avoid 'charmap' errors on Windows consoles
+def _utf8_stream_for_stdout() -> TextIO:
+    try:
+        # If possible, wrap the underlying buffer with UTF-8 encoding and replacement on errors
+        if hasattr(sys.stdout, "buffer"):
+            return io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+    # Fallback: try reconfigure on Py3.7+
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+            return sys.stdout
+    except Exception:
+        pass
+    # Last resort: return original
+    return sys.stdout
+
+_stdout_utf8 = _utf8_stream_for_stdout()
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
+    handlers=[logging.StreamHandler(_stdout_utf8)],
+    force=True,  # override any existing handlers (e.g., added by uvicorn) to enforce UTF-8 stream
 )
 
 
 def json_log(event: str, **kwargs):
+    """
+    Emit an ASCII-only JSON log line so Windows consoles with legacy codepages don't crash
+    when messages contain emojis or non-ASCII characters.
+    """
     payload = {"ts": datetime.utcnow().isoformat() + "Z", "event": event, **kwargs}
-    logging.info(json.dumps(payload))
+    line = json.dumps(payload, ensure_ascii=True)
+    try:
+        logging.info(line)
+    except Exception:
+        # Last resort: strip any non-ascii that slipped through
+        try:
+            safe_line = line.encode("ascii", "ignore").decode("ascii")
+            logging.info(safe_line)
+        except Exception:
+            pass
 
 
 app = FastAPI(title=APP_TITLE, version=VERSION)

@@ -9,7 +9,7 @@ from .db import Database
 class GeminiResponder:
     """
     Responder for general intents, classification, and non-document answers.
-    Always uses Gemma 3n by default regardless of the UI model selection, per requirements.
+    Uses a configurable Gemini/Gemma model; defaults to 'gemma-3n-E4B-it'.
     """
     def __init__(self, api_key: Optional[str] = None, model_name: Optional[str] = None):
         db = Database()
@@ -17,13 +17,18 @@ class GeminiResponder:
             api_key = db.get_setting("GEMINI_API_KEY", None) or os.getenv("GEMINI_API_KEY")
         if not api_key:
             raise RuntimeError("GEMINI_API_KEY is not set")
-        # Force default to Gemma 3n unless explicitly overridden by parameter
-        model = model_name or "gemma-3n"
+        # Prefer explicit parameter, then DB/env, then sane default
+        configured = (
+            model_name
+            or db.get_setting("GEMINI_MODEL", None)
+            or os.getenv("GEMINI_MODEL")
+        )
+        model = configured or "gemma-3n-E4B-it"
         genai.configure(api_key=api_key)
         self.model = genai.GenerativeModel(model)
 
     def generate(self, user_text: str, system_prompt: Optional[str] = None) -> str:
-        # Use multimodal-capable path; keep simple text for now
+        # Simple text generation path
         prompt = ""
         if system_prompt:
             prompt += f"{system_prompt.strip()}\\n\\n"
