@@ -546,7 +546,9 @@ async def _wiki_image_candidates(query: str) -> List[str]:
 async def _search_verify_send_image(sender: str, query: str, prefer_ext: str, db: Database) -> bool:
     """
     Search for an image, download the best candidate, verify it with Gemini, then send.
-    The image is downscaled and re-encoded to fit WhatsApp limits (e.g., < 5 MB).
+    - Only accept real image content-types.
+    - Always re-encode to a WhatsApp-friendly format (JPEG/PNG) and size (<5MB).
+    - Avoid TIFF/SVG/HEIC and other unsupported formats before sending.
     Sends a short 'please wait' message to the user up-front.
     """
     client = GreenAPIClient.from_env()
@@ -559,7 +561,8 @@ async def _search_verify_send_image(sender: str, query: str, prefer_ext: str, db
 
     tmp_dir = storage.base / "tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    ext = ".jpg" if prefer_ext.lower() in {"jpg", "jpeg"} else ".png"
+    # Normalize requested extension
+    prefer_ext_norm = "jpg" if prefer_ext.lower() in {"jpg", "jpeg"} else "png"
 
     # Try sharpening the query with Gemini
     try:
@@ -576,42 +579,75 @@ async def _search_verify_send_image(sender: str, query: str, prefer_ext: str, db
     if not candidates:
         candidates = [f"https://source.unsplash.com/1280x800/?{quote_plus(query)}"]
 
-    # Helper: downscale and re-encode to keep file small
-    def _downscale_if_needed(path: Path) -> Path:
+    # Helper: open, downscale and re-encode to guaranteed-supported format
+    def _reencode_supported(src_path: Path, prefer: str = "jpg") -> Path:
+        """
+        Returns a path to a re-encoded image:
+          - JPEG if prefer == 'jpg' (RGB, quality sweep to keep under 5MB)
+          - PNG if prefer == 'png' or if image has alpha
+        Falls back to original if Pillow cannot process.
+        """
         try:
-            from PIL import Image  # pillow
+            from PIL import Image
             Image.MAX_IMAGE_PIXELS = 50_000_000
-            with Image.open(path) as im:
-                im = im.convert("RGB")
+            with Image.open(src_path) as im:
+                # Decide output format and mode
+                has_alpha = (im.mode in ("RGBA", "LA")) or ("transparency" in im.info)
+                target_fmt = "PNG" if (prefer == "png" or has_alpha) else "JPEG"
+                # Ensure mode compatible with target
+                if target_fmt == "JPEG":
+                    im = im.convert("RGB")
+                # Resize if very large
                 max_side = 1600
                 w, h = im.size
                 scale = min(1.0, max_side / max(w, h))
                 if scale < 1.0:
-                    nw, nh = int(w * scale), int(h * scale)
-                    im = im.resize((max(1, nw), max(1, nh)))
-                # Try quality sweep to get under ~5 MB
-                tmp_jpg = path.with_suffix(".jpg")
-                for q in (85, 80, 75, 70, 65):
-                    im.save(tmp_jpg, format="JPEG", quality=q, optimize=True)
-                    if tmp_jpg.stat().st_size <= 5 * 1024 * 1024:
-                        return tmp_jpg
-                return tmp_jpg
+                    im = im.resize((max(1, int(w * scale)), max(1, int(h * scale))))
+                # Output file path
+                out_path = src_path.with_suffix(".png" if target_fmt == "PNG" else ".jpg")
+                if target_fmt == "PNG":
+                    # PNG compress level; try to keep reasonable size (<5MB) but PNG may be larger
+                    im.save(out_path, format="PNG", optimize=True)
+                    # If PNG still huge and no alpha, fallback to JPEG
+                    if out_path.stat().st_size > 5 * 1024 * 1024 and not has_alpha:
+                        out_path.unlink(missing_ok=True)
+                        target_fmt = "JPEG"
+                        im = im.convert("RGB")
+                if target_fmt == "JPEG":
+                    for q in (85, 80, 75, 70, 65, 60):
+                        im.save(out_path, format="JPEG", quality=q, optimize=True)
+                        if out_path.stat().st_size <= 5 * 1024 * 1024:
+                            break
+                return out_path
         except Exception:
-            return path
+            return src_path
+
+    # Content types we consider acceptable to try to decode
+    acceptable_ct_prefix = ("image/",)
+    unacceptable_ct = {
+        "image/tiff", "image/x-tiff", "image/svg+xml", "image/heic", "image/heif",
+        "image/x-icon", "image/vnd.microsoft.icon",
+    }
 
     for idx, url in enumerate(candidates, start=1):
-        name = f"img_{int(datetime.utcnow().timestamp())}_{random.randint(1000,9999)}_{idx}{ext}"
-        out_path = tmp_dir / name
+        # Use a neutral temporary name first; we'll re-encode to final extension later
+        tmp_name = f"img_{int(datetime.utcnow().timestamp())}_{random.randint(1000,9999)}_{idx}.bin"
+        bin_path = tmp_dir / tmp_name
         try:
             async with httpx.AsyncClient(timeout=30, follow_redirects=True) as hc:
                 r = await hc.get(url, headers={"User-Agent": "Mozilla/5.0"})
                 if r.status_code != 200 or not r.content:
                     continue
-                with out_path.open("wb") as f:
+                ct = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+                # Skip obvious non-image or unsupported types before writing
+                if not any(ct.startswith(p) for p in acceptable_ct_prefix) or ct in unacceptable_ct:
+                    json_log("image_candidate_skipped", url=url, content_type=ct or "unknown")
+                    continue
+                with bin_path.open("wb") as f:
                     f.write(r.content)
 
-            # Convert if huge or non-jpg
-            out_proc = _downscale_if_needed(out_path)
+            # Always re-encode to supported format/size
+            out_proc = _reencode_supported(bin_path, prefer=prefer_ext_norm)
 
             # Verify with Gemini if available
             verified = True
@@ -621,26 +657,33 @@ async def _search_verify_send_image(sender: str, query: str, prefer_ext: str, db
                     gr = GeminiResponder()
                     verified, reason = await asyncio.to_thread(gr.verify_image_against_query, str(out_proc), query)
                 except Exception as e:
-                    verified = False
-                    reason = f"verify_error: {e}"
+                    # If verification fails due to model issues, don't block sending a valid image
+                    verified = True
+                    reason = f"verify_error_ignored: {e}"
 
             if not verified:
                 json_log("image_candidate_rejected", url=url, reason=reason)
                 try:
-                    out_path.unlink(missing_ok=True)
-                    if out_proc != out_path:
+                    bin_path.unlink(missing_ok=True)
+                    if out_proc != bin_path:
                         out_proc.unlink(missing_ok=True)
                 except Exception:
                     pass
                 continue
 
+            # Upload and send
             up = await client.upload_file(out_proc)
             if _is_sender_allowed(sender, db):
                 cap = f"Image for: {query}"
-                await client.send_file_by_url(chat_id=sender, url_file=up.get("urlFile", ""), filename=out_proc.name, caption=cap)
+                await client.send_file_by_url(
+                    chat_id=sender,
+                    url_file=up.get("urlFile", ""),
+                    filename=out_proc.name,
+                    caption=cap,
+                )
             try:
-                out_path.unlink(missing_ok=True)
-                if out_proc != out_path:
+                bin_path.unlink(missing_ok=True)
+                if out_proc != bin_path:
                     out_proc.unlink(missing_ok=True)
             except Exception:
                 pass
@@ -648,7 +691,7 @@ async def _search_verify_send_image(sender: str, query: str, prefer_ext: str, db
         except Exception as e:
             json_log("image_fetch_error", error=str(e), query=query, source=url)
             try:
-                out_path.unlink(missing_ok=True)
+                bin_path.unlink(missing_ok=True)
             except Exception:
                 pass
             continue
