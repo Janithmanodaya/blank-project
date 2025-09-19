@@ -35,6 +35,26 @@ class GreenAPIClient:
         # Official: POST /waInstance{id}/DeleteNotification/{token} with {\"receiptId\": ...}
         return f"{self.base_url}/waInstance{self.id_instance}/DeleteNotification/{self.api_token}"
 
+    def _chat_destination_fields(self, chat_id: Optional[str]) -> Dict[str, str]:
+        """
+        Green API accepts either chatId (e.g., '1234567890@c.us' or group '@g.us')
+        or phoneNumber (digits only). Build the appropriate field(s) based on input.
+        """
+        out: Dict[str, str] = {}
+        s = (chat_id or "").strip()
+        if "@c.us" in s or "@g.us" in s:
+            out["chatId"] = s
+            return out
+        # Otherwise treat as phone number: keep only digits
+        digits = "".join(ch for ch in s if ch.isdigit())
+        if digits:
+            out["phoneNumber"] = digits
+        else:
+            # Fallback (may still 400, but avoids dropping destination entirely)
+            if s:
+                out["chatId"] = s
+        return out
+
     async def upload_file(self, file_path: Path) -> Dict[str, Any]:
         """
         Upload any file. Content type is guessed from extension.
@@ -50,21 +70,14 @@ class GreenAPIClient:
             return resp.json()
 
     async def send_file_by_url(self, chat_id: str, url_file: str, filename: str, caption: Optional[str] = None) -> Dict[str, Any]:
+        if not url_file:
+            raise ValueError("send_file_by_url: url_file is empty")
         url = self._url("sendFileByUrl")
-        # Some accounts require phoneNumber instead of chatId for direct messages.
-        payload = {
+        payload: Dict[str, Any] = {
             "urlFile": url_file,
             "fileName": filename or "file",
         }
-        if "@c.us" in (chat_id or "") or "@g.us" in (chat_id or ""):
-            payload["chatId"] = chat_id
-        else:
-            # Strip non-digits just in case and use phoneNumber
-            digits = "".join(ch for ch in (chat_id or "") if ch.isdigit())
-            if digits:
-                payload["phoneNumber"] = digits
-            else:
-                payload["chatId"] = chat_id  # fallback
+        payload.update(self._chat_destination_fields(chat_id))
         if caption:
             payload["caption"] = caption
         async with httpx.AsyncClient(timeout=60) as client:
@@ -78,10 +91,8 @@ class GreenAPIClient:
         If the plan/instance forbids sendImageByUrl (403), gracefully fall back to sendFileByUrl.
         """
         url = self._url("sendImageByUrl")
-        payload = {
-            "chatId": chat_id,
-            "urlFile": url_file,
-        }
+        payload: Dict[str, Any] = {"urlFile": url_file}
+        payload.update(self._chat_destination_fields(chat_id))
         if caption:
             payload["caption"] = caption
         try:
@@ -102,11 +113,10 @@ class GreenAPIClient:
         Alternative to send by URL: some deployments prefer sending by previously uploaded file id.
         """
         url = self._url("sendFileById")
-        payload = {
-            "chatId": chat_id,
-            "idMessage": file_id,  # some docs use 'idFile' or 'fileId', Green API expects idMessage for upload id
-            "fileName": filename,
-        }
+        payload: Dict[str, Any] = {"fileName": filename}
+        payload.update(self._chat_destination_fields(chat_id))
+        # Green API docs: field name varies across examples; many expect 'idMessage' for uploaded file id.
+        payload["idMessage"] = file_id
         if caption:
             payload["caption"] = caption
         async with httpx.AsyncClient(timeout=60) as client:
@@ -122,7 +132,8 @@ class GreenAPIClient:
         """
         url = f"{self.media_base_url}/waInstance{self.id_instance}/SendFileByUpload/{self.api_token}"
         ctype = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
-        data = {"chatId": chat_id, "fileName": file_path.name}
+        data: Dict[str, Any] = {"fileName": file_path.name}
+        data.update(self._chat_destination_fields(chat_id))
         if caption:
             data["caption"] = caption
         async with httpx.AsyncClient(timeout=300) as client:
@@ -137,7 +148,8 @@ class GreenAPIClient:
         Send a text message to a chat.
         """
         url = self._url("sendMessage")
-        payload = {"chatId": chat_id, "message": message}
+        payload = {"message": message}
+        payload.update(self._chat_destination_fields(chat_id))
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(url, json=payload)
             resp.raise_for_status()
