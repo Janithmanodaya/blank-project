@@ -190,19 +190,30 @@ async def worker_loop(worker_id: int):
                         pass
                     raise
 
-                # Upload and send
-                upload = await client.upload_file(pdf_result.pdf_path)
-                db.update_job_upload(job_id, upload)
-                # Choose destination chat: ADMIN_CHAT_ID if set, otherwise original sender
+                # Send the PDF back to the destination chat.
+                # Prefer direct upload-and-send to avoid 400s from sendFileByUrl on some tariffs.
                 dest_chat = os.getenv("ADMIN_CHAT_ID", "") or (job.get("sender") or "")
-                send_resp = await client.send_file_by_url(
-                    chat_id=dest_chat,
-                    url_file=upload.get("urlFile", ""),
-                    filename=pdf_result.pdf_path.name,
-                    caption=f"PDF from {job['sender']} message {job['msg_id']}",
-                )
+                caption = f"PDF from {job['sender']} message {job['msg_id']}"
+                try:
+                    send_resp = await client.send_file_by_upload(
+                        chat_id=dest_chat,
+                        file_path=pdf_result.pdf_path,
+                        caption=caption,
+                    )
+                    # store minimal upload info consistent with previous schema
+                    db.update_job_upload(job_id, {"sentBy": "upload", "file": str(pdf_result.pdf_path)})
+                except Exception:
+                    # Fallback: upload to Green API storage then send by URL
+                    upload = await client.upload_file(pdf_result.pdf_path)
+                    db.update_job_upload(job_id, upload)
+                    send_resp = await client.send_file_by_url(
+                        chat_id=dest_chat,
+                        url_file=upload.get("urlFile", ""),
+                        filename=pdf_result.pdf_path.name,
+                        caption=caption,
+                    )
                 db.update_job_status(job_id, "SENT")
-                db.append_job_log(job_id, {"upload": upload, "send": send_resp, "dest_chat": dest_chat})
+                db.append_job_log(job_id, {"send": send_resp, "dest_chat": dest_chat})
 
                 json_log("job_sent", worker_id=worker_id, job_id=job_id)
             except asyncio.CancelledError:
