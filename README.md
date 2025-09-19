@@ -5,15 +5,18 @@ A local service that:
 - Receives Green-API webhooks for incoming messages/media
 - Downloads media promptly
 - Packs images into A4-aware PDFs using deterministic rules
-- Uploads the PDF to Green-API storage and sends it to an admin chat via uploadFile + sendFileByUrl
+- Uploads the PDF and sends it back
 - Provides a localhost WebUI to monitor jobs, files, and manually resend
 - Persists jobs and metadata in SQLite
-- Can be packaged into a single runnable binary (PyInstaller)
+- Can run with either Green-API or a local WhatsApp Web gateway (no external API)
 
 Architecture
-- FastAPI server
-  - POST /webhook — Green-API webhook receiver
+- FastAPI server (Python)
+  - POST /webhook — Green-API-compatible webhook receiver
   - GET /ui — lightweight WebUI (requires token if ADMIN_PASSWORD is set)
+- Optional Node-based WhatsApp Web gateway (whatsapp-web.js)
+  - Mimics Green-API endpoints so the Python client works unchanged
+  - Exposes QR code for session pairing and sends/receives messages locally
 - SQLite persistence in storage/app.db
 - storage/ folder layout:
   storage/
@@ -26,46 +29,35 @@ Architecture
 
 Prerequisites
 - Python 3.10+
-- Green-API instance credentials (idInstance, apiToken)
-- Admin chatId (e.g., 1234567890@c.us)
+- For local WhatsApp mode (no external API): Node.js 18+ and Chrome/Chromium dependencies for puppeteer
+- Admin chatId (e.g., 1234567890@c.us) for where PDFs are sent (or reply to sender)
 
-Setup
-1) Clone and install:
+Setup (Python app)
+1) Install:
    pip install -r requirements.txt
 
-2) Configure environment:
-   cp .env.example .env
-   # edit .env and fill in values
-
-   The app reads env vars from the environment. If you use a .env loader, add python-dotenv or export manually:
-   export GREEN_API_INSTANCE_ID=...
-   export GREEN_API_API_TOKEN=...
-   export ADMIN_CHAT_ID=...
-   export GEMINI_API_KEY=...           # required for auto-replies and file QA
-   export GEMINI_MODEL=gemma-3n-E4B-it   # optional, override default model
-
-3) Run the server:
+2) Run:
    python run.py
 
    - WebUI: http://127.0.0.1:8080/ui?token=YOUR_ADMIN_PASSWORD (if set)
    - Webhook endpoint: POST http://YOUR_PUBLIC_TUNNEL/webhook
 
-4) Expose webhook (local testing):
-   Use a tunneling tool (e.g., ngrok or cloudflared):
+3) Optional: expose webhook for remote testing
    ngrok http 8080
-   Then set your Green-API webhook URL to: https://YOUR-NGROK/webhook
+   Then set webhook URL to: https://YOUR-NGROK/webhook
 
-Environment variables
+Environment variables (Python)
 - GREEN_API_BASE_URL (default: https://api.green-api.com)
-- GREEN_API_INSTANCE_ID (required)
-- GREEN_API_API_TOKEN (required)
-- ADMIN_CHAT_ID (required) — chatId for admin/private chat to receive PDFs
+  - To use the local WhatsApp gateway, set GREEN_API_BASE_URL=http://127.0.0.1:3000
+- GREEN_API_INSTANCE_ID (required by Green-API, ignored by local gateway)
+- GREEN_API_API_TOKEN (required by Green-API, ignored by local gateway)
+- ADMIN_CHAT_ID (optional) — chatId to receive PDFs; if not set, replies go to sender where possible
 - ADMIN_PASSWORD (optional) — token to protect WebUI, pass as ?token=...
-- HOST (default: 127.0.0.1)
+- HOST (default: 0.0.0.0)
 - PORT (default: 8080)
 - WORKERS (default: 2)
 - GEMINI_API_KEY (required for LLM features)
-- GEMINI_MODEL (optional; defaults to gemma-3n-E4B-it)
+- GEMINI_MODEL (optional; defaults to gemini-1.5-flash)
 
 Deterministic A4 PDF rules
 - A4 @ 300 DPI → 2480 × 3508 px
@@ -79,29 +71,52 @@ Deterministic A4 PDF rules
 - Metadata saved in storage/pdf_meta/<name>.json
 
 Recommended send flow
-- uploadFile → returns urlFile
-- sendFileByUrl to ADMIN_CHAT_ID with the returned URL
-- This avoids re-uploading for re-sends
+- Direct upload and send when possible
+- Fallback: uploadFile → returns urlFile
+- Then sendFileByUrl to the destination with the returned URL
 
 WebUI
 - /ui: lists recent jobs and generated PDFs
 - Open PDF and Resend actions (resend re-queues the job)
 - Pass ?token=ADMIN_PASSWORD when configured
+- If GREEN_API_BASE_URL is non-Green (e.g., localhost:3000), a WhatsApp Session panel appears showing the QR (served by the local gateway)
 
-Local data retention
-- Raw media and payloads are saved under storage/
-- You can implement retention policies and purge from the WebUI in future iterations
+Local WhatsApp Web Gateway (no external API)
+- Based on whatsapp-web.js. Project located in whatsapp_gateway/
+- Mimics the subset of Green-API endpoints used by this app:
+  - GET  /qr                              → PNG QR code (204 if not needed)
+  - GET  /status                          → session status
+  - POST /waInstance:id/sendMessage/:token
+  - POST /waInstance:id/sendFileByUrl/:token
+  - POST /waInstance:id/SendFileByUpload/:token (multipart/form-data)
+  - POST /waInstance:id/uploadFile/:token (multipart → returns {urlFile})
+  - GET  /waInstance:id/ReceiveNotification/:token (poll)
+  - DELETE /waInstance:id/DeleteNotification/:token/:receiptId
+  - POST   /waInstance:id/DeleteNotification/:token {receiptId}
+- Files uploaded to the gateway are served under /files/...
 
-Packaging with PyInstaller
-- Create a single-file binary:
-  pip install pyinstaller
-  pyinstaller -F -n greenapi-relay run.py
+Run the gateway:
+1) Install Node dependencies:
+   cd whatsapp_gateway
+   npm install
 
-  The binary will be at dist/greenapi-relay (or .exe on Windows).
-  Run it with the same environment variables as above.
+2) Start gateway:
+   npm start
+   # Gateway listens on http://127.0.0.1:3000 by default (GATEWAY_PORT env overrides)
+   # First run will show a QR at http://127.0.0.1:3000/qr
+
+3) Configure Python app to use gateway:
+   export GREEN_API_BASE_URL=http://127.0.0.1:3000
+   # INSTANCE ID and TOKEN values are ignored by the gateway but must be non-empty for the client:
+   export GREEN_API_INSTANCE_ID=local
+   export GREEN_API_API_TOKEN=local
+
+4) Start Python app and open WebUI:
+   python run.py
+   # Visit http://127.0.0.1:8080/ui
+   # A “WhatsApp Session” panel with the QR should be visible (refresh if scanned recently)
 
 Notes and next steps
-- Webhook validation: add signature/origin checks if provided by Green-API
-- QR/status: expose a panel if using Green-API endpoints to fetch QR/status
-- Grouping: current implementation processes images within a single webhook job; extend to time-window grouping across messages from the same sender if needed
-- Circuit breaker and richer retry strategies can be added around upload/send depending on observed errors
+- The gateway runs headless Chrome via puppeteer (inside whatsapp-web.js). Ensure your environment supports it.
+- This is intended for local development and self-hosting; respect WhatsApp terms of service.
+- Green-API mode remains supported; just set GREEN_API_BASE_URL back to https://api.green-api.com.
