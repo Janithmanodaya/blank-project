@@ -567,12 +567,22 @@ async def _search_verify_send_image(sender: str, query: str, prefer_ext: str, db
     except Exception:
         pass
 
-    # Candidate sources: Prefer Wikimedia (stable), then Unsplash, finally Google as best-effort.
-    candidates = await _wiki_image_candidates(query)
+    # Candidate sources:
+    # - Prefer Wikimedia (stable, permissive)
+    # - Also try Google Images scrape (best-effort)
+    # - Finally, fall back to Unsplash random endpoint as a last resort
+    wiki_candidates = await _wiki_image_candidates(query)
+    google_candidates = await _google_images_candidates(query)
+    candidates: List[str] = []
+    # Combine with de-dup keeping order
+    seen: set = set()
+    for u in (wiki_candidates + google_candidates):
+        if isinstance(u, str) and u and u not in seen:
+            seen.add(u)
+            candidates.append(u)
+    # If still nothing, use Unsplash last (rate-limited and may 503)
     if not candidates:
         candidates = [f"https://source.unsplash.com/1280x800/?{quote_plus(query)}"]
-    if not candidates:
-        candidates = await _google_images_candidates(query)
     json_log("image_search_candidates", query=query, count=len(candidates))
 
     # Helper: open, downscale and re-encode to guaranteed-supported format
