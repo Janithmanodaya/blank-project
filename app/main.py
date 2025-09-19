@@ -160,6 +160,23 @@ async def worker_loop(worker_id: int):
                         json_log("media_download_error", error=str(e), media=m, job_id=job_id)
                         raise
 
+                # Look for per-job PDF settings in logs (e.g., images_per_page from "PDF:N" command)
+                try:
+                    logs = db.get_job_logs(job_id)
+                    imgs_per_page = None
+                    for entry in logs:
+                        data = entry.get("entry") or {}
+                        if isinstance(data, dict) and "pdf_images_per_page" in data:
+                            val = data.get("pdf_images_per_page")
+                            try:
+                                imgs_per_page = int(val)
+                            except Exception:
+                                pass
+                    if imgs_per_page:
+                        job["images_per_page"] = imgs_per_page
+                except Exception:
+                    pass
+
                 # Compose PDF
                 try:
                     pdf_result: PDFComposeResult = composer.compose(job, downloaded_files)
@@ -346,6 +363,31 @@ async def _enqueue_batch_later(sender: str, db: Database):
         raise
     except Exception as e:
         json_log("batch_enqueue_error", sender=sender, error=str(e))
+
+async def _enqueue_pdf_once_later(sender: str, db: Database, window: int = 60):
+    client = GreenAPIClient.from_env()
+    try:
+        await asyncio.sleep(window)
+        async with pending_lock:
+            b = pending_batches.get(sender)
+            if not b or b.get("mode") != "pdf_once":
+                return
+            job_id = b["job_id"]
+            # Notify time over
+            try:
+                if _is_sender_allowed(sender, db):
+                    await client.send_message(chat_id=sender, message="Time over. Creating your PDF now.")
+            except Exception:
+                pass
+            # Move to queue
+            db.update_job_status(job_id, "PENDING")
+            await job_queue.put(job_id)
+            json_log("pdf_once_enqueued", sender=sender, job_id=job_id)
+            pending_batches.pop(sender, None)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        json_log("pdf_once_enqueue_error", sender=sender, error=str(e))
 
 
 def _fmt_mb(nbytes: Optional[Union[int, float]]) -> str:
@@ -795,6 +837,46 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
 
     text_msg = _extract_text_from_payload(payload) or ""
 
+    # One-time PDF packer command: "PDF:N" where N = images per page
+    if text_msg:
+        m = re.match(r"^\s*pdf\s*:\s*(\d+)\s*$", text_msg, flags=re.IGNORECASE)
+        if m:
+            try:
+                per_page = max(1, min(12, int(m.group(1))))
+            except Exception:
+                per_page = 4
+            # Start a dedicated one-time PDF batch window (60s), independent of global setting
+            async with pending_lock:
+                # Cancel existing batch for this sender if any
+                prev = pending_batches.get(sender)
+                if prev:
+                    try:
+                        t = prev.get("task")
+                        if t:
+                            t.cancel()
+                    except Exception:
+                        pass
+                    pending_batches.pop(sender, None)
+                # Create a new job and store per-page setting in job logs
+                job_id = db.create_job(sender=sender, msg_id=str(msg_id), payload=payload, instance_id=str(instance_id))
+                db.append_job_log(job_id, {"pdf_images_per_page": per_page})
+                db.update_job_status(job_id, "NEW")
+                task = asyncio.create_task(_enqueue_pdf_once_later(sender, db, window=60))
+                pending_batches[sender] = {
+                    "job_id": job_id,
+                    "started_at": now.isoformat(),
+                    "task": task,
+                    "mode": "pdf_once",
+                    "per_page": per_page,
+                    "window": 60,
+                }
+            if _is_sender_allowed(sender, db) and sender != "unknown":
+                await client.send_message(
+                    chat_id=sender,
+                    message=f"PDF mode enabled for one job. Send images within 1 minute.\nI'll pack {per_page} image(s) per page."
+                )
+            return {"ok": True, "job_id": job_id}
+
     # If awaiting yt-dlp resolution choice or confirmation
     pending_url = qa_state.get_pending_ytdl(sender)
     if pending_url:
@@ -999,7 +1081,8 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
         # if failed, fall through to other handlers
 
     # Toggle: if pdf_packer_enabled -> existing batching to PDF, else switch to QA mode
-    pdf_packer_enabled = (db.get_setting("pdf_packer_enabled", "1") or "1") == "1"
+    # Default disabled; can be enabled per-chat via a one-time "PDF:N" command
+    pdf_packer_enabled = (db.get_setting("pdf_packer_enabled", "0") or "0") == "1"
 
     # Split media into images vs others (audio/voice/pdf/etc.)
     def _is_image_media(m: Dict[str, Any]) -> bool:
@@ -1011,6 +1094,23 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
 
     image_media = [m for m in media_list if _is_image_media(m)]
     other_media = [m for m in media_list if not _is_image_media(m)]
+
+    # If we have image media and a one-time PDF batch is active, always append to that batch
+    if image_media:
+        async with pending_lock:
+            b = pending_batches.get(sender)
+            if b and b.get("mode") == "pdf_once":
+                job_id = b["job_id"]
+                for m in image_media:
+                    db.add_media(job_id, m)
+                json_log("pdf_once_batch_appended", sender=sender, job_id=job_id, added=len(image_media))
+                if not other_media:
+                    if _is_sender_allowed(sender, db):
+                        try:
+                            await client.send_message(chat_id=sender, message=f"Added {len(image_media)} image(s). I'll start in about {b.get('window',60)}s.")
+                        except Exception:
+                            pass
+                    return {"ok": True, "job_id": job_id}
 
     # If we have image media and packer is enabled, batch only images for PDF
     if image_media and pdf_packer_enabled:

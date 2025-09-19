@@ -286,6 +286,71 @@ class PDFComposer:
 
         packing_decisions: List[Dict] = []
 
+        # One-time override: fixed images-per-page grid
+        ipp = None
+        try:
+            v = job.get("images_per_page")
+            if isinstance(v, (int, float, str)):
+                ipp = int(v)
+        except Exception:
+            ipp = None
+        if ipp and ipp > 0:
+            # Compute grid
+            from math import ceil, sqrt
+            cols = max(1, int(ceil(sqrt(ipp))))
+            rows = max(1, int(ceil(ipp / cols)))
+            # Content box
+            W, H = self.A4_W - 2 * margin, self.A4_H - 2 * margin
+            x0, y0 = margin, margin
+            cell_w = W // cols
+            cell_h = H // rows
+            idx = 0
+            while idx < len(infos):
+                c.setPageSize((self.A4_W, self.A4_H))
+                page_meta = {"items": [], "orientation": "portrait"}
+                # place up to ipp per page
+                placed = 0
+                for r in range(rows):
+                    for ccol in range(cols):
+                        if placed >= ipp or idx >= len(infos):
+                            break
+                        info = infos[idx]
+                        x = x0 + ccol * cell_w
+                        y = y0 + (rows - 1 - r) * cell_h
+                        # center-fit preserving aspect, no upscale
+                        scale = min(cell_w / info.width, cell_h / info.height, 1.0)
+                        rw, rh = int(info.width * scale), int(info.height * scale)
+                        ox = int(x + (cell_w - rw) // 2)
+                        oy = int(y + (cell_h - rh) // 2)
+                        c.drawImage(str(info.path), ox, oy, width=rw, height=rh, preserveAspectRatio=True, anchor='c')
+                        page_meta["items"].append({
+                            "file": str(info.path),
+                            "orig": [info.width, info.height],
+                            "placed": [ox, oy, rw, rh],
+                            "cls": info.cls,
+                        })
+                        idx += 1
+                        placed += 1
+                border_inset = self._mm_to_px(5.0)
+                c.setLineWidth(1)
+                pw, ph = c._pagesize
+                c.rect(border_inset, border_inset, int(pw) - 2 * border_inset, int(ph) - 2 * border_inset, stroke=1, fill=0)
+                packing_decisions.append(page_meta)
+                c.showPage()
+            c.save()
+            meta = {
+                "sender": job.get("sender"),
+                "msg_id": job.get("msg_id"),
+                "dpi": self.dpi,
+                "page_size_px": [self.A4_W, self.A4_H],
+                "margin_px": margin,
+                "files": [str(p.path) for p in infos],
+                "packing": packing_decisions,
+                "images_per_page": ipp,
+            }
+            meta_path.write_text(__import__("json").dumps(meta, indent=2), encoding="utf-8")
+            return PDFComposeResult(pdf_path=pdf_path, meta_path=meta_path)
+
         i = 0
         while i < len(infos):
             # Try A5 rules first. This may select non-consecutive indices; if so, we'll remove them explicitly.
