@@ -845,7 +845,7 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
                 per_page = max(1, min(12, int(m.group(1))))
             except Exception:
                 per_page = 4
-            # Start a dedicated one-time PDF batch window (60s), independent of global setting
+            # Prepare a dedicated one-time PDF batch; timer will start after first image is received
             async with pending_lock:
                 # Cancel existing batch for this sender if any
                 prev = pending_batches.get(sender)
@@ -861,11 +861,11 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
                 job_id = db.create_job(sender=sender, msg_id=str(msg_id), payload=payload, instance_id=str(instance_id))
                 db.append_job_log(job_id, {"pdf_images_per_page": per_page})
                 db.update_job_status(job_id, "NEW")
-                task = asyncio.create_task(_enqueue_pdf_once_later(sender, db, window=60))
+                # Don't start the timer yet; wait for first image
                 pending_batches[sender] = {
                     "job_id": job_id,
                     "started_at": now.isoformat(),
-                    "task": task,
+                    "task": None,
                     "mode": "pdf_once",
                     "per_page": per_page,
                     "window": 60,
@@ -873,9 +873,37 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
             if _is_sender_allowed(sender, db) and sender != "unknown":
                 await client.send_message(
                     chat_id=sender,
-                    message=f"PDF mode enabled for one job. Send images within 1 minute.\nI'll pack {per_page} image(s) per page."
+                    message=f"PDF mode enabled for one job. Send images within 1 minute after your first image.\nI'll pack {per_page} image(s) per page."
                 )
             return {"ok": True, "job_id": job_id}
+
+    # If user sends any text (without images) while a one-time PDF batch is active -> cancel that batch
+    try:
+        if text_msg:
+            md0 = payload.get("messageData") or {}
+            has_image_in_msg = bool(md0.get("imageMessageData")) or (isinstance(md0.get("medias"), list) and any(isinstance(x, dict) and str((x.get("mimeType") or x.get("mimetype") or "")).lower().startswith("image/") for x in md0.get("medias") or []))
+            if not has_image_in_msg:
+                async with pending_lock:
+                    b = pending_batches.get(sender)
+                    if b and b.get("mode") == "pdf_once":
+                        # Cancel timer if any
+                        try:
+                            t = b.get("task")
+                            if t:
+                                t.cancel()
+                        except Exception:
+                            pass
+                        # Mark job cancelled and drop batch
+                        try:
+                            db.update_job_status(b["job_id"], "CANCELLED")
+                        except Exception:
+                            pass
+                        pending_batches.pop(sender, None)
+                        if _is_sender_allowed(sender, db):
+                            await client.send_message(chat_id=sender, message="Okay, canceled the PDF packer.")
+                        return {"ok": True, "job_id": None}
+    except Exception:
+        pass
 
     # If awaiting yt-dlp resolution choice or confirmation
     pending_url = qa_state.get_pending_ytdl(sender)
@@ -1103,11 +1131,25 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
                 job_id = b["job_id"]
                 for m in image_media:
                     db.add_media(job_id, m)
+                # Start countdown timer on first image if not already started
+                if not b.get("task"):
+                    try:
+                        t = asyncio.create_task(_enqueue_pdf_once_later(sender, db, window=int(b.get("window", 60))))
+                        b["task"] = t
+                        pending_batches[sender] = b
+                    except Exception:
+                        pass
+                    # Notify timer started
+                    if _is_sender_allowed(sender, db):
+                        try:
+                            await client.send_message(chat_id=sender, message="Timer started. I'll create the PDF in 1 minute.")
+                        except Exception:
+                            pass
                 json_log("pdf_once_batch_appended", sender=sender, job_id=job_id, added=len(image_media))
                 if not other_media:
                     if _is_sender_allowed(sender, db):
                         try:
-                            await client.send_message(chat_id=sender, message=f"Added {len(image_media)} image(s). I'll start in about {b.get('window',60)}s.")
+                            await client.send_message(chat_id=sender, message=f"Added {len(image_media)} image(s).")
                         except Exception:
                             pass
                     return {"ok": True, "job_id": job_id}

@@ -286,7 +286,7 @@ class PDFComposer:
 
         packing_decisions: List[Dict] = []
 
-        # One-time override: fixed images-per-page grid
+        # One-time override: custom images-per-page using advanced packing (portrait only, no A5 landscape)
         ipp = None
         try:
             v = job.get("images_per_page")
@@ -294,49 +294,36 @@ class PDFComposer:
                 ipp = int(v)
         except Exception:
             ipp = None
+
         if ipp and ipp > 0:
-            # Compute grid
-            from math import ceil, sqrt
-            cols = max(1, int(ceil(sqrt(ipp))))
-            rows = max(1, int(ceil(ipp / cols)))
-            # Content box
-            W, H = self.A4_W - 2 * margin, self.A4_H - 2 * margin
-            x0, y0 = margin, margin
-            cell_w = W // cols
-            cell_h = H // rows
-            idx = 0
-            while idx < len(infos):
-                c.setPageSize((self.A4_W, self.A4_H))
-                page_meta = {"items": [], "orientation": "portrait"}
-                # place up to ipp per page
-                placed = 0
-                for r in range(rows):
-                    for ccol in range(cols):
-                        if placed >= ipp or idx >= len(infos):
-                            break
-                        info = infos[idx]
-                        x = x0 + ccol * cell_w
-                        y = y0 + (rows - 1 - r) * cell_h
-                        # center-fit preserving aspect, no upscale
-                        scale = min(cell_w / info.width, cell_h / info.height, 1.0)
-                        rw, rh = int(info.width * scale), int(info.height * scale)
-                        ox = int(x + (cell_w - rw) // 2)
-                        oy = int(y + (cell_h - rh) // 2)
-                        c.drawImage(str(info.path), ox, oy, width=rw, height=rh, preserveAspectRatio=True, anchor='c')
-                        page_meta["items"].append({
-                            "file": str(info.path),
-                            "orig": [info.width, info.height],
-                            "placed": [ox, oy, rw, rh],
-                            "cls": info.cls,
-                        })
-                        idx += 1
-                        placed += 1
+            i = 0
+            while i < len(infos):
+                c.setPageSize((self.A4_W, self.A4_H))  # portrait only
+                cells, used, allow_upscale, stretch = self._pack_page_advanced(infos[i:], margin, limit=ipp)
+                page_meta = {"items": [], "orientation": "portrait", "images_per_page": ipp}
+                for info, (x, y, w, h) in cells:
+                    scale = min(w / info.width, h / info.height)
+                    if not allow_upscale:
+                        scale = min(scale, 1.0)
+                    rw, rh = int(info.width * scale), int(info.height * scale)
+                    ox = int(x + (w - rw) // 2)
+                    oy = int(y + (h - rh) // 2)
+                    canvas_draw_path = str(info.path)
+                    c.drawImage(canvas_draw_path, ox, oy, width=rw, height=rh, preserveAspectRatio=True, anchor='c')
+                    page_meta["items"].append({
+                        "file": str(info.path),
+                        "orig": [info.width, info.height],
+                        "placed": [ox, oy, rw, rh],
+                        "cls": info.cls,
+                    })
                 border_inset = self._mm_to_px(5.0)
                 c.setLineWidth(1)
                 pw, ph = c._pagesize
                 c.rect(border_inset, border_inset, int(pw) - 2 * border_inset, int(ph) - 2 * border_inset, stroke=1, fill=0)
                 packing_decisions.append(page_meta)
                 c.showPage()
+                i += used
+
             c.save()
             meta = {
                 "sender": job.get("sender"),
@@ -484,11 +471,11 @@ class PDFComposer:
         cells, used, allow_upscale, _ = self._pack_page_advanced(remaining, margin)
         return cells, used, allow_upscale
 
-    def _pack_page_advanced(self, remaining: List[ImageInfo], margin: int) -> Tuple[List[Tuple[ImageInfo, Tuple[int,int,int,int]]], int, bool, bool]:
+    def _pack_page_advanced(self, remaining: List[ImageInfo], margin: int, limit: Optional[int] = None) -> Tuple[List[Tuple[ImageInfo, Tuple[int,int,int,int]]], int, bool, bool]:
         """
         Advanced packing based on target area fill with guillotine bin packing and shape selection.
         - Target total area per page: ~62,370 mm^2.
-        - Aim to place up to 8 images; choose shapes (square, portrait, landscape) to fit free spaces.
+        - Aim to place up to `limit` images (default 8); choose shapes (square, portrait, landscape) to fit free spaces.
         - Adds 0.5 cm gaps between items by shrinking split rectangles.
         Returns (cells, used_count, allow_upscale, stretch).
         """
@@ -497,7 +484,8 @@ class PDFComposer:
         target_area_mm2 = 62370.0
         gap_mm = 5.0  # 0.5 cm gap
         gap_px = self._mm_to_px(gap_mm)
-        target_n = min(8, len(remaining))
+        max_per_page = 8 if (limit is None or limit <= 0) else int(max(1, limit))
+        target_n = min(max_per_page, len(remaining))
         batch = remaining[:target_n]
 
         # Candidate aspect options per image (orig, square, common ratios)
