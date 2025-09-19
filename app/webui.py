@@ -242,6 +242,9 @@ def ui(db: Database = Depends(get_db), token: Optional[str] = Query(default=None
     allow_numbers = db.get_setting("ALLOW_NUMBERS", os.getenv("ALLOW_NUMBERS", "")) or ""
     block_numbers = db.get_setting("BLOCK_NUMBERS", os.getenv("BLOCK_NUMBERS", "")) or ""
 
+    # WhatsApp mode selection: 'green' (Green API) or 'local' (local whatsapp-web.js gateway)
+    whatsapp_mode = db.get_setting("WHATSAPP_MODE", os.getenv("WHATSAPP_MODE", "green")) or "green"
+
     # model select options
     def option(val: str, label: str) -> str:
         sel = " selected" if gemini_model == val else ""
@@ -265,6 +268,18 @@ def ui(db: Database = Depends(get_db), token: Optional[str] = Query(default=None
         f"</select>"
     )
 
+    # WhatsApp mode selector
+    def mode_option(val: str, label: str) -> str:
+        sel = " selected" if whatsapp_mode == val else ""
+        return f'<option value="{val}"{sel}>{label}</option>'
+
+    mode_select = (
+        f'<select id="WHATSAPP_MODE" name="WHATSAPP_MODE">'
+        f'{mode_option("green", "Green API (cloud)")}'
+        f'{mode_option("local", "Local WhatsApp (whatsapp-web.js)")}'
+        f"</select>"
+    )
+
     settings_html = f"""
     <div class="card">
       <h3>Settings</h3>
@@ -274,6 +289,12 @@ def ui(db: Database = Depends(get_db), token: Optional[str] = Query(default=None
         <div class="hint">Assistant behavior for auto replies.</div>
 
         <div class="grid-2">
+          <div>
+            <label for="WHATSAPP_MODE">WhatsApp Mode</label>
+            {mode_select}
+            <div class="hint">Choose Green API (cloud) or Local WhatsApp (runs on your machine using whatsapp-web.js).</div>
+          </div>
+
           <div>
             <label for="GEMINI_API_KEY">Gemini API Key {gemini_set}</label>
             <input type="password" id="GEMINI_API_KEY" name="GEMINI_API_KEY" placeholder="Paste Gemini API key"/>
@@ -293,18 +314,19 @@ def ui(db: Database = Depends(get_db), token: Optional[str] = Query(default=None
           </div>
 
           <div>
-            <label for="GREEN_API_BASE_URL">Green API Base URL</label>
-            <input type="text" id="GREEN_API_BASE_URL" name="GREEN_API_BASE_URL" value="{green_base}" placeholder="https://api.green-api.com"/>
+            <label for="GREEN_API_BASE_URL">Base URL</label>
+            <input type="text" id="GREEN_API_BASE_URL" name="GREEN_API_BASE_URL" value="{green_base}" placeholder="https://api.green-api.com or http://127.0.0.1:3000"/>
+            <div class="hint">When using Local WhatsApp, set this to your gateway URL (default http://127.0.0.1:3000).</div>
           </div>
 
           <div>
-            <label for="GREEN_API_INSTANCE_ID">Green API Instance ID</label>
-            <input type="text" id="GREEN_API_INSTANCE_ID" name="GREEN_API_INSTANCE_ID" value="{green_id}" placeholder="e.g., 110100"/>
+            <label for="GREEN_API_INSTANCE_ID">Instance ID</label>
+            <input type="text" id="GREEN_API_INSTANCE_ID" name="GREEN_API_INSTANCE_ID" value="{green_id}" placeholder="e.g., 110100 or 'local'"/>
           </div>
 
           <div>
-            <label for="GREEN_API_API_TOKEN">Green API Token {green_token_set}</label>
-            <input type="password" id="GREEN_API_API_TOKEN" name="GREEN_API_API_TOKEN" placeholder="Paste Green-API token"/>
+            <label for="GREEN_API_API_TOKEN">API Token {green_token_set}</label>
+            <input type="password" id="GREEN_API_API_TOKEN" name="GREEN_API_API_TOKEN" placeholder="Paste token (ignored in local mode)"/>
             <div class="hint">Leave blank to keep current.</div>
           </div>
 
@@ -385,21 +407,20 @@ def ui(db: Database = Depends(get_db), token: Optional[str] = Query(default=None
     </div>
     """
 
-    # Optional WhatsApp Web gateway QR/status panel if base URL is not the official Green API host
-    gw = (green_base or "").lower()
-    show_gateway_panel = ("green-api.com" not in gw) and bool(gw)
+    # Optional WhatsApp Web gateway QR/status panel when mode == local
+    gw = (green_base or "").strip() or "http://127.0.0.1:3000"
+    show_gateway_panel = (whatsapp_mode.lower() == "local")
 
     gateway_panel = ""
     if show_gateway_panel:
-        # Use a simple iframe to the gateway's QR endpoint; auto-refresh every 5s via meta refresh
         gateway_panel = f"""
         <div class="card">
           <h3>WhatsApp Session</h3>
-          <div class="row muted">Scan the QR code with your WhatsApp to start the local session.</div>
+          <div class="row muted">Local mode is enabled. Run the gateway (cd whatsapp_gateway && npm install && npm start), then scan this QR in WhatsApp.</div>
           <div class="row">
             <img src="{gw.rstrip('/')}/qr" alt="QR" style="width:100%;max-width:320px;border-radius:12px;border:1px solid rgba(255,255,255,0.12);" />
           </div>
-          <div class="hint">Status: fetch <code>{gw.rstrip('/')}/status</code>. This panel assumes you run the local gateway.</div>
+          <div class="hint">Status endpoint: <code>{gw.rstrip('/')}/status</code>. Base URL: <code>{gw.rstrip('/')}</code>.</div>
         </div>
         """
 
@@ -577,6 +598,7 @@ async def save_settings(request: Request, db: Database = Depends(get_db), token:
         "REPLY_MODE",
         "ALLOW_NUMBERS",
         "BLOCK_NUMBERS",
+        "WHATSAPP_MODE",
     ]:
         val = (form.get(key) or "").strip()
         if val:
