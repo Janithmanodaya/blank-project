@@ -9,7 +9,7 @@ from .db import Database
 class GeminiResponder:
     """
     Responder for general intents, classification, and non-document answers.
-    Uses a configurable Gemini/Gemma model; defaults to 'gemma-3n-E4B-it'.
+    Uses a configurable Gemini model; defaults to a valid multimodal/text model.
     """
     def __init__(self, api_key: Optional[str] = None, model_name: Optional[str] = None):
         db = Database()
@@ -23,7 +23,8 @@ class GeminiResponder:
             or db.get_setting("GEMINI_MODEL", None)
             or os.getenv("GEMINI_MODEL")
         )
-        model = configured or "gemma-3n-E4B-it"
+        # Default to a valid Google Generative AI model
+        model = configured or "gemini-1.5-flash"
         genai.configure(api_key=api_key)
         self.model = genai.GenerativeModel(model)
 

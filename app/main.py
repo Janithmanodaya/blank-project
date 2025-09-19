@@ -510,7 +510,7 @@ async def _google_images_candidates(query: str) -> List[str]:
 async def _wiki_image_candidates(query: str) -> List[str]:
     """
     Fetch a few candidate image URLs from Wikimedia Commons for a query.
-    No API key required.
+    Prefer thumbnail (scaled) URLs to avoid huge TIFF originals.
     """
     try:
         params = {
@@ -535,23 +535,25 @@ async def _wiki_image_candidates(query: str) -> List[str]:
         for _, p in pages.items():
             ii = (p.get("imageinfo") or [])
             if ii and isinstance(ii, list):
-                url = ii[0].get("url")
-                if isinstance(url, str) and url.lower().startswith("http"):
-                    urls.append(url)
+                # Prefer thumburl (scaled) if available, fall back to original url
+                u = ii[0].get("thumburl") or ii[0].get("url")
+                if isinstance(u, str) and u.lower().startswith("http"):
+                    urls.append(u)
         return urls[:5]
     except Exception:
         return []
 
 async def _search_verify_send_image(sender: str, query: str, prefer_ext: str, db: Database) -> bool:
     """
-    Search for an image, download the best candidate, verify it with Gemma 3n, then send.
+    Search for an image, download the best candidate, verify it with Gemini, then send.
+    The image is downscaled and re-encoded to fit WhatsApp limits (e.g., < 5 MB).
     """
     client = GreenAPIClient.from_env()
     tmp_dir = storage.base / "tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
     ext = ".jpg" if prefer_ext.lower() in {"jpg", "jpeg"} else ".png"
 
-    # Try sharpening the query with Gemma (Gemma 3n via google-generativeai)
+    # Try sharpening the query with Gemini
     try:
         if GeminiResponder is not None:
             gr = GeminiResponder()
@@ -564,7 +566,30 @@ async def _search_verify_send_image(sender: str, query: str, prefer_ext: str, db
     if not candidates:
         candidates = await _wiki_image_candidates(query)
     if not candidates:
-        candidates = [f"https://source.unsplash.com/1000x700/?{quote_plus(query)}"]
+        candidates = [f"https://source.unsplash.com/1280x800/?{quote_plus(query)}"]
+
+    # Helper: downscale and re-encode to keep file small
+    def _downscale_if_needed(path: Path) -> Path:
+        try:
+            from PIL import Image  # pillow
+            Image.MAX_IMAGE_PIXELS = 50_000_000
+            with Image.open(path) as im:
+                im = im.convert("RGB")
+                max_side = 1600
+                w, h = im.size
+                scale = min(1.0, max_side / max(w, h))
+                if scale < 1.0:
+                    nw, nh = int(w * scale), int(h * scale)
+                    im = im.resize((max(1, nw), max(1, nh)))
+                # Try quality sweep to get under ~5 MB
+                tmp_jpg = path.with_suffix(".jpg")
+                for q in (85, 80, 75, 70, 65):
+                    im.save(tmp_jpg, format="JPEG", quality=q, optimize=True)
+                    if tmp_jpg.stat().st_size <= 5 * 1024 * 1024:
+                        return tmp_jpg
+                return tmp_jpg
+        except Exception:
+            return path
 
     for idx, url in enumerate(candidates, start=1):
         name = f"img_{int(datetime.utcnow().timestamp())}_{random.randint(1000,9999)}_{idx}{ext}"
@@ -577,13 +602,16 @@ async def _search_verify_send_image(sender: str, query: str, prefer_ext: str, db
                 with out_path.open("wb") as f:
                     f.write(r.content)
 
-            # Verify with Gemma 3n if available
+            # Convert if huge or non-jpg
+            out_proc = _downscale_if_needed(out_path)
+
+            # Verify with Gemini if available
             verified = True
             reason = "ok"
             if GeminiResponder is not None:
                 try:
                     gr = GeminiResponder()
-                    verified, reason = await asyncio.to_thread(gr.verify_image_against_query, str(out_path), query)
+                    verified, reason = await asyncio.to_thread(gr.verify_image_against_query, str(out_proc), query)
                 except Exception as e:
                     verified = False
                     reason = f"verify_error: {e}"
@@ -592,16 +620,20 @@ async def _search_verify_send_image(sender: str, query: str, prefer_ext: str, db
                 json_log("image_candidate_rejected", url=url, reason=reason)
                 try:
                     out_path.unlink(missing_ok=True)
+                    if out_proc != out_path:
+                        out_proc.unlink(missing_ok=True)
                 except Exception:
                     pass
                 continue
 
-            up = await client.upload_file(out_path)
+            up = await client.upload_file(out_proc)
             if _is_sender_allowed(sender, db):
                 cap = f"Image for: {query}"
-                await client.send_file_by_url(chat_id=sender, url_file=up.get("urlFile", ""), filename=out_path.name, caption=cap)
+                await client.send_file_by_url(chat_id=sender, url_file=up.get("urlFile", ""), filename=out_proc.name, caption=cap)
             try:
                 out_path.unlink(missing_ok=True)
+                if out_proc != out_path:
+                    out_proc.unlink(missing_ok=True)
             except Exception:
                 pass
             return True
@@ -894,38 +926,50 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
     # Toggle: if pdf_packer_enabled -> existing batching to PDF, else switch to QA mode
     pdf_packer_enabled = (db.get_setting("pdf_packer_enabled", "1") or "1") == "1"
 
-    if media_list and pdf_packer_enabled:
-        # Media batching logic: if images present, accumulate per sender for BATCH_WINDOW_SECONDS
+    # Split media into images vs others (audio/voice/pdf/etc.)
+    def _is_image_media(m: Dict[str, Any]) -> bool:
+        mt = (m.get("mimeType") or m.get("mimetype") or "").lower()
+        if mt.startswith("image/"):
+            return True
+        name = (m.get("fileName") or m.get("caption") or "").lower()
+        return any(name.endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff", ".bmp"))
+
+    image_media = [m for m in media_list if _is_image_media(m)]
+    other_media = [m for m in media_list if not _is_image_media(m)]
+
+    # If we have image media and packer is enabled, batch only images for PDF
+    if image_media and pdf_packer_enabled:
         async with pending_lock:
             batch = pending_batches.get(sender)
             if batch:
-                # Append to existing batch job
                 job_id = batch["job_id"]
-                for m in media_list:
+                for m in image_media:
                     db.add_media(job_id, m)
-                json_log("batch_appended", sender=sender, job_id=job_id, added=len(media_list))
+                json_log("batch_appended", sender=sender, job_id=job_id, added=len(image_media))
                 result_job_id = job_id
             else:
-                # Create new job and start timer
                 job_id = db.create_job(sender=sender, msg_id=str(msg_id), payload=payload, instance_id=str(instance_id))
-                for m in media_list:
+                for m in image_media:
                     db.add_media(job_id, m)
                 db.update_job_status(job_id, "NEW")
                 task = asyncio.create_task(_enqueue_batch_later(sender, db))
                 pending_batches[sender] = {"job_id": job_id, "started_at": now.isoformat(), "task": task}
-                json_log("batch_started", sender=sender, job_id=job_id, window_seconds=BATCH_WINDOW_SECONDS, medias=len(media_list))
+                json_log("batch_started", sender=sender, job_id=job_id, window_seconds=BATCH_WINDOW_SECONDS, medias=len(image_media))
                 result_job_id = job_id
-        # Try auto reply (non-blocking)
-        asyncio.create_task(maybe_auto_reply(payload, db))
-        return {"ok": True, "job_id": result_job_id}
+        # Continue processing any non-image media immediately below
+        if not other_media:
+            asyncio.create_task(maybe_auto_reply(payload, db))
+            return {"ok": True, "job_id": result_job_id}
 
-    if media_list and not pdf_packer_enabled:
+    # If we have any non-image media OR packer is disabled (process all media immediately)
+    if other_media or (media_list and not pdf_packer_enabled):
+        process_list = other_media if other_media else media_list
         # Immediate download and create a separate session for this message (no batching)
         async with httpx.AsyncClient(timeout=60) as http_client:
             job_id = db.create_job(sender=sender, msg_id=str(msg_id), payload=payload, instance_id=str(instance_id))
             db.update_job_status(job_id, "PROCESSING")
             downloaded: List[Path] = []
-            for m in media_list:
+            for m in process_list:
                 try:
                     fp = await storage.download_media(http_client, m, {"sender": sender, "msg_id": str(msg_id)})
                     db.add_media(job_id, m)
@@ -934,7 +978,7 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
                     json_log("media_download_error", error=str(e))
             db.update_job_status(job_id, "COMPLETED")
         # Filter to files Gemini can read (images, pdf, audio)
-        valid_ext = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp", ".mp3", ".wav", ".m4a", ".ogg", ".webm"}
+        valid_ext = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp", ".mp3", ".wav", ".m4a", ".ogg", ".oga", ".webm"}
         valid_files = [p for p in downloaded if p.suffix.lower() in valid_ext]
         from .ocr_qa import state as _state
         # Create a new session id from msg_id (short)
