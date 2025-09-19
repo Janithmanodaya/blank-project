@@ -457,6 +457,56 @@ async def _ytdl_prepare_choices(url: str) -> List[Dict[str, Any]]:
         return []
 
 
+async def _google_images_candidates(query: str) -> List[str]:
+    """
+    Scrape Google Images results page (tbm=isch) and extract original image URLs.
+    Note: This uses simple HTML parsing; may be brittle if Google changes markup.
+    """
+    try:
+        q = quote_plus(query)
+        url = f"https://www.google.com/search?tbm=isch&q={q}"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        async with httpx.AsyncClient(timeout=20) as hc:
+            r = await hc.get(url, headers=headers)
+            if r.status_code != 200:
+                return []
+            html = r.text
+
+        # Strategy 1: extract from /imgres?imgurl=... links
+        import re
+        from urllib.parse import unquote, urlparse, parse_qs
+        hrefs = re.findall(r'href="/imgres\\?([^"]+)"', html)
+        urls: List[str] = []
+        for h in hrefs:
+            qs = parse_qs(h)
+            iu = qs.get("imgurl", [None])[0]
+            if iu and iu.startswith("http"):
+                try:
+                    urls.append(unquote(iu))
+                except Exception:
+                    urls.append(iu)
+
+        # Strategy 2: fallback to direct img src attributes (thumbnails often, but sometimes originals)
+        if not urls:
+            srcs = re.findall(r'<img[^>]+src="(https?://[^"]+)"', html)
+            urls = [s for s in srcs if s.lower().startswith("http") and "gstatic" not in s.lower()]
+
+        # Dedup and limit
+        out: List[str] = []
+        seen = set()
+        for u in urls:
+            if u not in seen:
+                seen.add(u)
+                out.append(u)
+            if len(out) >= 8:
+                break
+        return out
+    except Exception:
+        return []
+
 async def _wiki_image_candidates(query: str) -> List[str]:
     """
     Fetch a few candidate image URLs from Wikimedia Commons for a query.
@@ -501,7 +551,7 @@ async def _search_verify_send_image(sender: str, query: str, prefer_ext: str, db
     tmp_dir.mkdir(parents=True, exist_ok=True)
     ext = ".jpg" if prefer_ext.lower() in {"jpg", "jpeg"} else ".png"
 
-    # Try sharpening the query with Gemma/Gemini
+    # Try sharpening the query with Gemma (Gemma 3n via google-generativeai)
     try:
         if GeminiResponder is not None:
             gr = GeminiResponder()
@@ -509,8 +559,10 @@ async def _search_verify_send_image(sender: str, query: str, prefer_ext: str, db
     except Exception:
         pass
 
-    # Candidate sources: Wikimedia first, then Unsplash fallback
-    candidates = await _wiki_image_candidates(query)
+    # Candidate sources: Google Images first, then Wikimedia, then Unsplash fallback
+    candidates = await _google_images_candidates(query)
+    if not candidates:
+        candidates = await _wiki_image_candidates(query)
     if not candidates:
         candidates = [f"https://source.unsplash.com/1000x700/?{quote_plus(query)}"]
 
