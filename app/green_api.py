@@ -51,11 +51,20 @@ class GreenAPIClient:
 
     async def send_file_by_url(self, chat_id: str, url_file: str, filename: str, caption: Optional[str] = None) -> Dict[str, Any]:
         url = self._url("sendFileByUrl")
+        # Some accounts require phoneNumber instead of chatId for direct messages.
         payload = {
-            "chatId": chat_id,
             "urlFile": url_file,
-            "fileName": filename,
+            "fileName": filename or "file",
         }
+        if "@c.us" in (chat_id or "") or "@g.us" in (chat_id or ""):
+            payload["chatId"] = chat_id
+        else:
+            # Strip non-digits just in case and use phoneNumber
+            digits = "".join(ch for ch in (chat_id or "") if ch.isdigit())
+            if digits:
+                payload["phoneNumber"] = digits
+            else:
+                payload["chatId"] = chat_id  # fallback
         if caption:
             payload["caption"] = caption
         async with httpx.AsyncClient(timeout=60) as client:
@@ -113,7 +122,7 @@ class GreenAPIClient:
         """
         url = f"{self.media_base_url}/waInstance{self.id_instance}/SendFileByUpload/{self.api_token}"
         ctype = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
-        data = {"chatId": chat_id}
+        data = {"chatId": chat_id, "fileName": file_path.name}
         if caption:
             data["caption"] = caption
         async with httpx.AsyncClient(timeout=300) as client:
