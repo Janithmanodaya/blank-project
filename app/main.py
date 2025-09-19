@@ -675,9 +675,11 @@ async def _search_verify_send_image(sender: str, query: str, prefer_ext: str, db
             up = await client.upload_file(out_proc)
             if _is_sender_allowed(sender, db):
                 cap = f"Image for: {query}"
-                await client.send_image_by_url(
+                # Some Green API plans forbid sendImageByUrl (403). Use generic sendFileByUrl instead.
+                await client.send_file_by_url(
                     chat_id=sender,
                     url_file=up.get("urlFile", ""),
+                    filename=out_proc.name,
                     caption=cap,
                 )
             try:
