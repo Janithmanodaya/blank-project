@@ -413,14 +413,39 @@ def ui(db: Database = Depends(get_db), token: Optional[str] = Query(default=None
 
     gateway_panel = ""
     if show_gateway_panel:
+        # Explain HTTPS mixed-content caveat and provide a direct link fallback
+        gbase = gw.rstrip("/")
         gateway_panel = f"""
         <div class="card">
           <h3>WhatsApp Session</h3>
-          <div class="row muted">Local mode is enabled. Run the gateway (cd whatsapp_gateway && npm install && npm start), then scan this QR in WhatsApp.</div>
-          <div class="row">
-            <img src="{gw.rstrip('/')}/qr" alt="QR" style="width:100%;max-width:320px;border-radius:12px;border:1px solid rgba(255,255,255,0.12);" />
+          <div class="row muted">
+            Local mode is enabled. Run the gateway
+            <code>cd whatsapp_gateway &amp;&amp; npm install &amp;&amp; npm start</code>,
+            then scan this QR in WhatsApp.
           </div>
-          <div class="hint">Status endpoint: <code>{gw.rstrip('/')}/status</code>. Base URL: <code>{gw.rstrip('/')}</code>.</div>
+          <div class="row">
+            <img id="waqr" src="{gbase}/qr" alt="QR code will appear when the gateway is running" style="width:100%;max-width:320px;border-radius:12px;border:1px solid rgba(255,255,255,0.12);" />
+          </div>
+          <div class="hint">
+            Note: This page is served over HTTPS. Browsers may block loading images from <code>http://127.0.0.1:3000</code>
+            (mixed content). If the QR does not appear, open it in a new tab:
+            <a class="button" href="{gbase}/qr" target="_blank" rel="noreferrer">Open QR</a>
+            &nbsp;|&nbsp;
+            <a class="button" href="{gbase}/status" target="_blank" rel="noreferrer">Gateway Status</a>
+          </div>
+          <div class="hint">Base URL currently set to: <code>{gbase}</code>. Consider using an HTTPS tunnel (e.g. ngrok) and set it in GREEN_API_BASE_URL.</div>
+          <script>
+            (function() {{
+              // Auto-refresh QR every 3s to avoid caching; ignore errors silently
+              var img = document.getElementById('waqr');
+              function refreshQR() {{
+                var base = {repr(gbase)};
+                img.src = base + '/qr?ts=' + Date.now();
+              }}
+              // Try periodic refresh; if gateway becomes ready it will return 204 and the image may clear
+              setInterval(refreshQR, 3000);
+            }})();
+          </script>
         </div>
         """
 
