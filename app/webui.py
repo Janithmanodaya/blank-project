@@ -6,7 +6,6 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, RedirectResponse
 import httpx
 import time
-import secrets
 
 from .db import Database, get_db
 from .tasks import job_queue
@@ -446,25 +445,6 @@ def ui(db: Database = Depends(get_db), token: Optional[str] = Query(default=None
               setInterval(refreshQR, 3000);
             }})();
           </script>
-        </div>
-        """
-
-    # One-line pairing helper for local mode: generate a short token and show a command
-    pair_ui = ""
-    if show_gateway_panel:
-        pair_token = secrets.token_hex(4)
-        # store token with expiry (epoch seconds)
-        import time as _t
-        db.set_setting(f"PAIR_TOKEN:{pair_token}", str(int(_t.time()) + 3600))
-        pair_url = f"/ui/local/register/{pair_token}"
-        full_pair_url = pair_url  # relative; backend receives it
-        pair_cmd = f'cd whatsapp_gateway && npm install && PAIR_URL="{full_pair_url}" npm run pair'
-        pair_ui = f"""
-        <div class="card">
-          <h3>One‑click Local Setup</h3>
-          <div class="row">Run this in your terminal to automatically create a secure URL and register it here:</div>
-          <div class="codebox"><code>{pair_cmd}</code></div>
-          <div class="hint">This will: (1) install deps, (2) open a secure tunnel to your gateway, (3) auto-register GREEN_API_BASE_URL.</div>
         </div>
         """
 
