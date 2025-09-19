@@ -573,6 +573,7 @@ async def _search_verify_send_image(sender: str, query: str, prefer_ext: str, db
         candidates = [f"https://source.unsplash.com/1280x800/?{quote_plus(query)}"]
     if not candidates:
         candidates = await _google_images_candidates(query)
+    json_log("image_search_candidates", query=query, count=len(candidates))
 
     # Helper: open, downscale and re-encode to guaranteed-supported format
     def _reencode_supported(src_path: Path, prefer: str = "jpg") -> Path:
@@ -632,8 +633,10 @@ async def _search_verify_send_image(sender: str, query: str, prefer_ext: str, db
             async with httpx.AsyncClient(timeout=30, follow_redirects=True) as hc:
                 r = await hc.get(url, headers={"User-Agent": "Mozilla/5.0"})
                 if r.status_code != 200 or not r.content:
+                    json_log("image_candidate_fetch_failed", url=url, status=r.status_code)
                     continue
                 ct = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+                json_log("image_candidate_content_type", url=url, content_type=ct or "unknown", size=len(r.content))
                 # Skip obvious non-image or unsupported types before writing
                 if not any(ct.startswith(p) for p in acceptable_ct_prefix) or ct in unacceptable_ct:
                     json_log("image_candidate_skipped", url=url, content_type=ct or "unknown")
@@ -959,18 +962,30 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
                 await client.send_message(chat_id=sender, message=f"{intro}\n{numbered}")
         return {"ok": True, "job_id": None}
 
-    # Image fetch command: "image: cats jpg" or "img: cat"
+    # Image fetch command: "image: cats jpg" or "img: cat" or any text mentioning image/photo/picture/img
     low = (text_msg or "").strip().lower()
-    if low.startswith("image:") or low.startswith("img:") or (("image" in low or "photo" in low or "picture" in low) and ("jpg" in low or "jpeg" in low or "png" in low or "cat" in low)):
-        body = text_msg.split(":", 1)[1].strip() if ":" in text_msg[:6] else text_msg
+    def _looks_like_image_intent(s: str) -> bool:
+        if s.startswith("image:") or s.startswith("img:"):
+            return True
+        keywords = ("image", "photo", "picture", "img")
+        return any(k in s for k in keywords)
+    if text_msg and _looks_like_image_intent(low):
+        # Extract the body/query
+        if ":" in text_msg[:10]:
+            body = text_msg.split(":", 1)[1].strip()
+        else:
+            body = text_msg.strip()
+        # Pick preferred extension (default jpg)
         prefer_ext = "jpg"
         if "png" in low:
             prefer_ext = "png"
         elif "jpeg" in low or "jpg" in low:
             prefer_ext = "jpg"
+        json_log("image_search_start", sender=sender, query=body, prefer_ext=prefer_ext)
         ok_img = await _search_verify_send_image(sender, body, prefer_ext, db)
         if ok_img:
             return {"ok": True, "job_id": None}
+        json_log("image_search_no_candidates", sender=sender, query=body)
         # if failed, fall through to other handlers
 
     # Toggle: if pdf_packer_enabled -> existing batching to PDF, else switch to QA mode
