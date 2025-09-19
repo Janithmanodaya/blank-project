@@ -469,7 +469,7 @@ async def _google_images_candidates(query: str) -> List[str]:
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
             "Accept-Language": "en-US,en;q=0.9",
         }
-        async with httpx.AsyncClient(timeout=20) as hc:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as hc:
             r = await hc.get(url, headers=headers)
             if r.status_code != 200:
                 return []
@@ -567,12 +567,12 @@ async def _search_verify_send_image(sender: str, query: str, prefer_ext: str, db
     except Exception:
         pass
 
-    # Candidate sources: Google Images first, then Wikimedia, then Unsplash fallback
-    candidates = await _google_images_candidates(query)
-    if not candidates:
-        candidates = await _wiki_image_candidates(query)
+    # Candidate sources: Prefer Wikimedia (stable), then Unsplash, finally Google as best-effort.
+    candidates = await _wiki_image_candidates(query)
     if not candidates:
         candidates = [f"https://source.unsplash.com/1280x800/?{quote_plus(query)}"]
+    if not candidates:
+        candidates = await _google_images_candidates(query)
 
     # Helper: open, downscale and re-encode to guaranteed-supported format
     def _reencode_supported(src_path: Path, prefer: str = "jpg") -> Path:
