@@ -62,6 +62,23 @@ class GreenAPIClient:
             resp.raise_for_status()
             return resp.json()
 
+    async def send_image_by_url(self, chat_id: str, url_file: str, caption: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Use dedicated image endpoint so WhatsApp treats the media as an image,
+        avoiding misclassification as a video/document.
+        """
+        url = self._url("sendImageByUrl")
+        payload = {
+            "chatId": chat_id,
+            "urlFile": url_file,
+        }
+        if caption:
+            payload["caption"] = caption
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(url, json=payload)
+            resp.raise_for_status()
+            return resp.json()
+
     async def send_file_by_id(self, chat_id: str, file_id: str, filename: str, caption: Optional[str] = None) -> Dict[str, Any]:
         """
         Alternative to send by URL: some deployments prefer sending by previously uploaded file id.
