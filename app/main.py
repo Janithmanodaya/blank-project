@@ -547,8 +547,16 @@ async def _search_verify_send_image(sender: str, query: str, prefer_ext: str, db
     """
     Search for an image, download the best candidate, verify it with Gemini, then send.
     The image is downscaled and re-encoded to fit WhatsApp limits (e.g., < 5 MB).
+    Sends a short 'please wait' message to the user up-front.
     """
     client = GreenAPIClient.from_env()
+    # Inform user that we're searching (non-blocking)
+    try:
+        if _is_sender_allowed(sender, db):
+            await client.send_message(chat_id=sender, message="Searching for an image… please wait a few seconds.")
+    except Exception:
+        pass
+
     tmp_dir = storage.base / "tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
     ext = ".jpg" if prefer_ext.lower() in {"jpg", "jpeg"} else ".png"
@@ -964,6 +972,14 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
     # If we have any non-image media OR packer is disabled (process all media immediately)
     if other_media or (media_list and not pdf_packer_enabled):
         process_list = other_media if other_media else media_list
+
+        # Inform user that we are processing/converting media (can take time)
+        try:
+            if _is_sender_allowed(sender, db):
+                await client.send_message(chat_id=sender, message="Processing your file(s)… converting formats if needed. Please wait.")
+        except Exception:
+            pass
+
         # Immediate download and create a separate session for this message (no batching)
         async with httpx.AsyncClient(timeout=60) as http_client:
             job_id = db.create_job(sender=sender, msg_id=str(msg_id), payload=payload, instance_id=str(instance_id))
@@ -977,9 +993,41 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
                 except Exception as e:
                     json_log("media_download_error", error=str(e))
             db.update_job_status(job_id, "COMPLETED")
+
+        # Optional conversion: convert audio to mp3 for better support
+        async def _convert_audio_to_mp3(path: Path) -> Path:
+            try:
+                if path.suffix.lower() == ".mp3":
+                    return path
+                # Use ffmpeg to convert to mono 64kbps mp3
+                out = path.with_suffix(".mp3")
+                proc = await asyncio.create_subprocess_exec(
+                    "ffmpeg", "-y", "-i", str(path), "-vn", "-ac", "1", "-b:a", "64k", str(out),
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                )
+                await proc.communicate()
+                if proc.returncode == 0 and out.exists():
+                    return out
+            except Exception:
+                pass
+            return path
+
+        # Detect audio files for conversion
+        audio_exts = {".oga", ".ogg", ".m4a", ".wav", ".webm", ".aac", ".flac", ".opus"}
+        converted: List[Path] = []
+        for p in downloaded:
+            if p.suffix.lower() in audio_exts:
+                try:
+                    newp = await _convert_audio_to_mp3(p)
+                    converted.append(newp)
+                except Exception:
+                    converted.append(p)
+            else:
+                converted.append(p)
+
         # Filter to files Gemini can read (images, pdf, audio)
         valid_ext = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp", ".mp3", ".wav", ".m4a", ".ogg", ".oga", ".webm"}
-        valid_files = [p for p in downloaded if p.suffix.lower() in valid_ext]
+        valid_files = [p for p in converted if p.suffix.lower() in valid_ext]
         from .ocr_qa import state as _state
         # Create a new session id from msg_id (short)
         session_id = str(msg_id)[-8:]
@@ -992,7 +1040,7 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
                 )
         else:
             # Delete any downloaded non-usable files
-            storage.delete_files(downloaded)
+            storage.delete_files(converted)
             if _is_sender_allowed(sender, db):
                 await client.send_message(chat_id=sender, message="I couldn't read the file(s) you sent. Please send images, audio, or PDFs.")
         return {"ok": True, "job_id": job_id}
