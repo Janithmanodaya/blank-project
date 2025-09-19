@@ -53,8 +53,8 @@ class PDFComposer:
         self.margin_mm = margin_mm
 
         # A4 at 300 DPI (inches: 8.27 x 11.69)
-        self.A4_W = int(8.27 * dpi)  # ~2480
-        self.A4_H = int(11.69 * dpi)  # ~3508
+        self.A4_W = int(8.27 * dpi)  # ~2480 px
+        self.A4_H = int(11.69 * dpi)  # ~3508 px
 
         # A5 size in pixels at given DPI (148 x 210 mm)
         self.A5_W = self._mm_to_px(148.0)
@@ -81,6 +81,10 @@ class PDFComposer:
     def _mm_to_pts(self, mm: float) -> float:
         """Convert millimeters to points (1 pt = 1/72 inch). Useful if switching to points."""
         return mm * 72.0 / 25.4
+
+    def _px_to_pt(self, px: int) -> float:
+        """Convert pixels at self.dpi to points."""
+        return (px * 72.0) / float(self.dpi)
 
     def _classify(self, w: int, h: int) -> str:
         a4w, a4h = self.A4_W, self.A4_H
@@ -282,7 +286,8 @@ class PDFComposer:
         margin = self._margin_px()
 
         pdf_path, meta_path = self.storage.pdf_output_paths(job["sender"], job["msg_id"])
-        c = canvas.Canvas(str(pdf_path), pagesize=(self.A4_W, self.A4_H))
+        # ReportLab expects points; our layout is in pixels at self.dpi. Convert page size to points.
+        c = canvas.Canvas(str(pdf_path), pagesize=(self._px_to_pt(self.A4_W), self._px_to_pt(self.A4_H)))
 
         packing_decisions: List[Dict] = []
 
@@ -301,8 +306,8 @@ class PDFComposer:
                 i = 0
                 gutter = max(self._mm_to_px(GUTTER_MM), 8)
                 while i < len(infos):
-                    # Landscape page: width=height of portrait, height=width of portrait
-                    c.setPageSize((self.A4_H, self.A4_W))
+                    # Landscape page: width=height of portrait, height=width of portrait (convert to points)
+                    c.setPageSize((self._px_to_pt(self.A4_H), self._px_to_pt(self.A4_W)))
                     page_w = self.A4_H - 2 * margin
                     page_h = self.A4_W - 2 * margin
                     x0, y0 = margin, margin
@@ -319,7 +324,12 @@ class PDFComposer:
                     rw, rh = int(info.width * scale), int(info.height * scale)
                     ox = int(x + (w - rw) // 2)
                     oy = int(y + (h - rh) // 2)
-                    c.drawImage(str(info.path), ox, oy, width=rw, height=rh, preserveAspectRatio=True, anchor='c')
+                    c.drawImage(
+                        str(info.path),
+                        self._px_to_pt(ox), self._px_to_pt(oy),
+                        width=self._px_to_pt(rw), height=self._px_to_pt(rh),
+                        preserveAspectRatio=True, anchor='c'
+                    )
                     page_meta["items"].append({
                         "file": str(info.path),
                         "orig": [info.width, info.height],
@@ -336,7 +346,12 @@ class PDFComposer:
                         rw, rh = int(info_r.width * scale), int(info_r.height * scale)
                         ox = int(x + (w - rw) // 2)
                         oy = int(y + (h - rh) // 2)
-                        c.drawImage(str(info_r.path), ox, oy, width=rw, height=rh, preserveAspectRatio=True, anchor='c')
+                        c.drawImage(
+                            str(info_r.path),
+                            self._px_to_pt(ox), self._px_to_pt(oy),
+                            width=self._px_to_pt(rw), height=self._px_to_pt(rh),
+                            preserveAspectRatio=True, anchor='c'
+                        )
                         page_meta["items"].append({
                             "file": str(info_r.path),
                             "orig": [info_r.width, info_r.height],
@@ -345,10 +360,11 @@ class PDFComposer:
                         })
                         i += 1
 
-                    border_inset = self._mm_to_px(5.0)
+                    border_inset_px = self._mm_to_px(5.0)
+                    border_inset = self._px_to_pt(border_inset_px)
                     c.setLineWidth(1)
-                    pw, ph = c._pagesize
-                    c.rect(border_inset, border_inset, int(pw) - 2 * border_inset, int(ph) - 2 * border_inset, stroke=1, fill=0)
+                    pw, ph = c._pagesize  # already points
+                    c.rect(border_inset, border_inset, pw - 2 * border_inset, ph - 2 * border_inset, stroke=1, fill=0)
                     packing_decisions.append(page_meta)
                     c.showPage()
 
@@ -369,7 +385,7 @@ class PDFComposer:
                 # General custom mode: use advanced packer capped to N images per (portrait) page for maximal fill
                 i = 0
                 while i < len(infos):
-                    c.setPageSize((self.A4_W, self.A4_H))  # portrait only
+                    c.setPageSize((self._px_to_pt(self.A4_W), self._px_to_pt(self.A4_H)))  # portrait only
                     cells, used, allow_upscale, stretch = self._pack_page_advanced(infos[i:], margin, limit=ipp)
                     page_meta = {"items": [], "orientation": "portrait", "images_per_page": ipp}
                     for info, (x, y, w, h) in cells:
@@ -380,17 +396,23 @@ class PDFComposer:
                         ox = int(x + (w - rw) // 2)
                         oy = int(y + (h - rh) // 2)
                         canvas_draw_path = str(info.path)
-                        c.drawImage(canvas_draw_path, ox, oy, width=rw, height=rh, preserveAspectRatio=True, anchor='c')
+                        c.drawImage(
+                            canvas_draw_path,
+                            self._px_to_pt(ox), self._px_to_pt(oy),
+                            width=self._px_to_pt(rw), height=self._px_to_pt(rh),
+                            preserveAspectRatio=True, anchor='c'
+                        )
                         page_meta["items"].append({
                             "file": str(info.path),
                             "orig": [info.width, info.height],
                             "placed": [ox, oy, rw, rh],
                             "cls": info.cls,
                         })
-                    border_inset = self._mm_to_px(5.0)
+                    border_inset_px = self._mm_to_px(5.0)
+                    border_inset = self._px_to_pt(border_inset_px)
                     c.setLineWidth(1)
                     pw, ph = c._pagesize
-                    c.rect(border_inset, border_inset, int(pw) - 2 * border_inset, int(ph) - 2 * border_inset, stroke=1, fill=0)
+                    c.rect(border_inset, border_inset, pw - 2 * border_inset, ph - 2 * border_inset, stroke=1, fill=0)
                     packing_decisions.append(page_meta)
                     c.showPage()
                     i += used
@@ -420,9 +442,9 @@ class PDFComposer:
 
                 # Set page size depending on orientation (landscape for A5 pair, portrait otherwise)
                 if landscape_page:
-                    c.setPageSize((self.A4_H, self.A4_W))
+                    c.setPageSize((self._px_to_pt(self.A4_H), self._px_to_pt(self.A4_W)))
                 else:
-                    c.setPageSize((self.A4_W, self.A4_H))
+                    c.setPageSize((self._px_to_pt(self.A4_W), self._px_to_pt(self.A4_H)))
 
                 # draw page with cells
                 page_meta = {"items": [], "orientation": "landscape" if landscape_page else "portrait"}
@@ -433,18 +455,24 @@ class PDFComposer:
                     rw, rh = int(info.width * scale), int(info.height * scale)
                     ox = int(x + (w - rw) // 2)
                     oy = int(y + (h - rh) // 2)
-                    c.drawImage(str(info.path), ox, oy, width=rw, height=rh, preserveAspectRatio=True, anchor='c')
+                    c.drawImage(
+                        str(info.path),
+                        self._px_to_pt(ox), self._px_to_pt(oy),
+                        width=self._px_to_pt(rw), height=self._px_to_pt(rh),
+                        preserveAspectRatio=True, anchor='c'
+                    )
                     page_meta["items"].append({
                         "file": str(info.path),
                         "orig": [info.width, info.height],
                         "placed": [ox, oy, rw, rh],
                         "cls": info.cls,
                     })
-                border_inset = self._mm_to_px(5.0)
+                border_inset_px = self._mm_to_px(5.0)
+                border_inset = self._px_to_pt(border_inset_px)
                 c.setLineWidth(1)
                 # Use current page size for border
-                pw, ph = c._pagesize  # reportlab stores current page size
-                c.rect(border_inset, border_inset, int(pw) - 2 * border_inset, int(ph) - 2 * border_inset, stroke=1, fill=0)
+                pw, ph = c._pagesize  # reportlab stores current page size (points)
+                c.rect(border_inset, border_inset, pw - 2 * border_inset, ph - 2 * border_inset, stroke=1, fill=0)
                 packing_decisions.append(page_meta)
                 c.showPage()
 
@@ -457,7 +485,7 @@ class PDFComposer:
             else:
                 # Fallback to advanced packer which always consumes from the head
                 # Ensure portrait page for advanced packer
-                c.setPageSize((self.A4_W, self.A4_H))
+                c.setPageSize((self._px_to_pt(self.A4_W), self._px_to_pt(self.A4_H)))
                 cells, used, allow_upscale, stretch = self._pack_page_advanced(infos[i:], margin)
 
                 # draw page with cells
@@ -469,17 +497,23 @@ class PDFComposer:
                     rw, rh = int(info.width * scale), int(info.height * scale)
                     ox = int(x + (w - rw) // 2)
                     oy = int(y + (h - rh) // 2)
-                    c.drawImage(str(info.path), ox, oy, width=rw, height=rh, preserveAspectRatio=True, anchor='c')
+                    c.drawImage(
+                        str(info.path),
+                        self._px_to_pt(ox), self._px_to_pt(oy),
+                        width=self._px_to_pt(rw), height=self._px_to_pt(rh),
+                        preserveAspectRatio=True, anchor='c'
+                    )
                     page_meta["items"].append({
                         "file": str(info.path),
                         "orig": [info.width, info.height],
                         "placed": [ox, oy, rw, rh],
                         "cls": info.cls,
                     })
-                border_inset = self._mm_to_px(5.0)
+                border_inset_px = self._mm_to_px(5.0)
+                border_inset = self._px_to_pt(border_inset_px)
                 c.setLineWidth(1)
                 pw, ph = c._pagesize
-                c.rect(border_inset, border_inset, int(pw) - 2 * border_inset, int(ph) - 2 * border_inset, stroke=1, fill=0)
+                c.rect(border_inset, border_inset, pw - 2 * border_inset, ph - 2 * border_inset, stroke=1, fill=0)
                 packing_decisions.append(page_meta)
                 c.showPage()
                 i += used
