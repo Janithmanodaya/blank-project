@@ -202,32 +202,16 @@ async def worker_loop(worker_id: int):
                     )
                     # store minimal upload info consistent with previous schema
                     db.update_job_upload(job_id, {"sentBy": "upload", "file": str(pdf_result.pdf_path)})
-                except httpx.HTTPStatusError as e:
-                    # Log response body for diagnostics
-                    body = ""
-                    try:
-                        body = e.response.text
-                    except Exception:
-                        body = "<no-body>"
-                    json_log("send_file_by_upload_error", status=e.response.status_code if e.response else None, body=body[:500])
+                except Exception:
                     # Fallback: upload to Green API storage then send by URL
                     upload = await client.upload_file(pdf_result.pdf_path)
                     db.update_job_upload(job_id, upload)
-                    try:
-                        send_resp = await client.send_file_by_url(
-                            chat_id=dest_chat,
-                            url_file=upload.get("urlFile", ""),
-                            filename=pdf_result.pdf_path.name,
-                            caption=caption,
-                        )
-                    except httpx.HTTPStatusError as e2:
-                        body2 = ""
-                        try:
-                            body2 = e2.response.text
-                        except Exception:
-                            body2 = "<no-body>"
-                        json_log("send_file_by_url_error", status=e2.response.status_code if e2.response else None, body=body2[:500])
-                        raise
+                    send_resp = await client.send_file_by_url(
+                        chat_id=dest_chat,
+                        url_file=upload.get("urlFile", ""),
+                        filename=pdf_result.pdf_path.name,
+                        caption=caption,
+                    )
                 db.update_job_status(job_id, "SENT")
                 db.append_job_log(job_id, {"send": send_resp, "dest_chat": dest_chat})
 
