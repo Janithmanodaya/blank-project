@@ -385,6 +385,24 @@ def ui(db: Database = Depends(get_db), token: Optional[str] = Query(default=None
     </div>
     """
 
+    # Optional WhatsApp Web gateway QR/status panel if base URL is not the official Green API host
+    gw = (green_base or "").lower()
+    show_gateway_panel = ("green-api.com" not in gw) and bool(gw)
+
+    gateway_panel = ""
+    if show_gateway_panel:
+        # Use a simple iframe to the gateway's QR endpoint; auto-refresh every 5s via meta refresh
+        gateway_panel = f"""
+        <div class="card">
+          <h3>WhatsApp Session</h3>
+          <div class="row muted">Scan the QR code with your WhatsApp to start the local session.</div>
+          <div class="row">
+            <img src="{gw.rstrip('/')}/qr" alt="QR" style="width:100%;max-width:320px;border-radius:12px;border:1px solid rgba(255,255,255,0.12);" />
+          </div>
+          <div class="hint">Status: fetch <code>{gw.rstrip('/')}/status</code>. This panel assumes you run the local gateway.</div>
+        </div>
+        """
+
     body = f"""
     <div class="layout">
       <div class="stack">
@@ -414,6 +432,7 @@ def ui(db: Database = Depends(get_db), token: Optional[str] = Query(default=None
       </div>
 
       <aside class="stack">
+        {gateway_panel}
         <div class="card">
           <h3>Recent PDFs</h3>
           <div class="scroll">

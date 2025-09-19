@@ -11,7 +11,12 @@ from .db import Database
 class GreenAPIClient:
     def __init__(self, base_url: str, id_instance: str, api_token: str):
         self.base_url = base_url.rstrip("/")
-        self.media_base_url = "https://media.green-api.com"  # per docs for upload endpoints
+        # If the base_url is not the official Green API host, assume it's a local gateway that also serves media endpoints.
+        # This lets us plug in a local whatsapp-web.js gateway that mimics the Green API paths.
+        if "green-api.com" in self.base_url:
+            self.media_base_url = "https://media.green-api.com"
+        else:
+            self.media_base_url = self.base_url
         self.id_instance = id_instance
         self.api_token = api_token
 
