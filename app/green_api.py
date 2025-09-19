@@ -62,10 +62,10 @@ class GreenAPIClient:
             resp.raise_for_status()
             return resp.json()
 
-    async def send_image_by_url(self, chat_id: str, url_file: str, caption: Optional[str] = None) -> Dict[str, Any]:
+    async def send_image_by_url(self, chat_id: str, url_file: str, caption: Optional[str] = None, filename: Optional[str] = None) -> Dict[str, Any]:
         """
-        Use dedicated image endpoint so WhatsApp treats the media as an image,
-        avoiding misclassification as a video/document.
+        Prefer the dedicated image endpoint so WhatsApp treats the media as an image.
+        If the plan/instance forbids sendImageByUrl (403), gracefully fall back to sendFileByUrl.
         """
         url = self._url("sendImageByUrl")
         payload = {
@@ -74,10 +74,18 @@ class GreenAPIClient:
         }
         if caption:
             payload["caption"] = caption
-        async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(url, json=payload)
-            resp.raise_for_status()
-            return resp.json()
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                resp = await client.post(url, json=payload)
+                resp.raise_for_status()
+                return resp.json()
+        except httpx.HTTPStatusError as e:
+            # Some Green API tariffs return 403 for sendImageByUrl; use generic file endpoint instead.
+            if e.response is not None and e.response.status_code == 403:
+                # Ensure we pass a sensible filename with image extension to avoid media misclassification
+                fallback_name = filename or "image.jpg"
+                return await self.send_file_by_url(chat_id=chat_id, url_file=url_file, filename=fallback_name, caption=caption)
+            raise
 
     async def send_file_by_id(self, chat_id: str, file_id: str, filename: str, caption: Optional[str] = None) -> Dict[str, Any]:
         """
