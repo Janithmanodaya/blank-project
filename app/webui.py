@@ -2,8 +2,10 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, RedirectResponse
+import httpx
+import time
 
 from .db import Database, get_db
 from .tasks import job_queue
@@ -413,7 +415,7 @@ def ui(db: Database = Depends(get_db), token: Optional[str] = Query(default=None
 
     gateway_panel = ""
     if show_gateway_panel:
-        # Explain HTTPS mixed-content caveat and provide a direct link fallback
+        # Explain HTTPS mixed-content caveat and provide a server-side proxy to avoid it
         gbase = gw.rstrip("/")
         gateway_panel = f"""
         <div class="card">
@@ -424,25 +426,22 @@ def ui(db: Database = Depends(get_db), token: Optional[str] = Query(default=None
             then scan this QR in WhatsApp.
           </div>
           <div class="row">
-            <img id="waqr" src="{gbase}/qr" alt="QR code will appear when the gateway is running" style="width:100%;max-width:320px;border-radius:12px;border:1px solid rgba(255,255,255,0.12);" />
+            <img id="waqr" src="/ui/local/qr?token={token or ''}" alt="QR code will appear when the gateway is running" style="width:100%;max-width:320px;border-radius:12px;border:1px solid rgba(255,255,255,0.12);" />
           </div>
           <div class="hint">
-            Note: This page is served over HTTPS. Browsers may block loading images from <code>http://127.0.0.1:3000</code>
-            (mixed content). If the QR does not appear, open it in a new tab:
-            <a class="button" href="{gbase}/qr" target="_blank" rel="noreferrer">Open QR</a>
+            If the QR does not appear, click:
+            <a class="button" href="/ui/local/qr?token={token or ''}" target="_blank" rel="noreferrer">Open QR</a>
             &nbsp;|&nbsp;
-            <a class="button" href="{gbase}/status" target="_blank" rel="noreferrer">Gateway Status</a>
+            <a class="button" href="/ui/local/status?token={token or ''}" target="_blank" rel="noreferrer">Gateway Status</a>
           </div>
-          <div class="hint">Base URL currently set to: <code>{gbase}</code>. Consider using an HTTPS tunnel (e.g. ngrok) and set it in GREEN_API_BASE_URL.</div>
+          <div class="hint">Configured Base URL: <code>{gbase}</code>.{" <b>Warning:</b> this points to Green API cloud; set it to your local gateway (e.g. http://127.0.0.1:3000 or an HTTPS tunnel) to use Local mode." if "green-api.com" in (gbase or "").lower() else ""}</div>
           <script>
             (function() {{
-              // Auto-refresh QR every 3s to avoid caching; ignore errors silently
+              // Auto-refresh QR via proxied endpoint every 3s
               var img = document.getElementById('waqr');
               function refreshQR() {{
-                var base = {repr(gbase)};
-                img.src = base + '/qr?ts=' + Date.now();
+                img.src = '/ui/local/qr?token={token or ""}&ts=' + Date.now();
               }}
-              // Try periodic refresh; if gateway becomes ready it will return 204 and the image may clear
               setInterval(refreshQR, 3000);
             }})();
           </script>
@@ -641,3 +640,36 @@ async def save_settings(request: Request, db: Database = Depends(get_db), token:
             db.set_setting(key, (val or "").strip())
 
     return RedirectResponse(url=f"/ui?token={token}", status_code=302)
+
+@router.get("/ui/local/status")
+async def gateway_status(db: Database = Depends(get_db), token: Optional[str] = Query(default=None)):
+    check_auth(token, db)
+    base = db.get_setting("GREEN_API_BASE_URL", os.getenv("GREEN_API_BASE_URL", "http://127.0.0.1:3000")) or "http://127.0.0.1:3000"
+    url = (base.rstrip("/") + "/status")
+    try:
+        async with httpx.AsyncClient(timeout=5) as hc:
+            r = await hc.get(url)
+            if r.status_code == 200:
+                return JSONResponse(r.json(), status_code=200)
+            return JSONResponse({"ok": False, "status": r.status_code, "base": base}, status_code=r.status_code)
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e), "base": base}, status_code=502)
+
+@router.get("/ui/local/qr")
+async def gateway_qr(db: Database = Depends(get_db), token: Optional[str] = Query(default=None)):
+    check_auth(token, db)
+    base = db.get_setting("GREEN_API_BASE_URL", os.getenv("GREEN_API_BASE_URL", "http://127.0.0.1:3000")) or "http://127.0.0.1:3000"
+    # If base is still set to cloud, QR is not available
+    if "green-api.com" in (base or "").lower():
+        return HTMLResponse("<div style='padding:10px;font-family:sans-serif;color:#fff;background:#8a120f'>Local gateway not configured. Set GREEN_API_BASE_URL to your local gateway (e.g. http://127.0.0.1:3000 or an HTTPS tunnel).</div>", status_code=400)
+    url = (base.rstrip("/") + "/qr")
+    try:
+        async with httpx.AsyncClient(timeout=5) as hc:
+            r = await hc.get(url, headers={"Cache-Control": "no-cache"}, params={"ts": int(time.time())})
+            # When client is already ready, gateway returns 204 No Content
+            if r.status_code == 204 or not r.content:
+                return Response(status_code=204)
+            ctype = r.headers.get("content-type", "image/png")
+            return Response(content=r.content, media_type=ctype)
+    except Exception as e:
+        return HTMLResponse(f"<div style='padding:10px;font-family:sans-serif;color:#fff;background:#8a120f'>Failed to fetch QR from {base}: {e}</div>", status_code=502)
