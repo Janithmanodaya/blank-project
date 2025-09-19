@@ -111,7 +111,8 @@ class GeminiFileQA:
             or db.get_setting("GEMINI_MODEL", None)
             or os.getenv("GEMINI_MODEL")
         )
-        model = configured or "gemma-3n-E4B-it"
+        # Default to a multimodal model suitable for PDFs/images and multilingual (Sinhala) answers
+        model = configured or "gemini-1.5-flash"
         genai.configure(api_key=api_key)
         self.model = genai.GenerativeModel(model)
 
@@ -140,13 +141,13 @@ class GeminiFileQA:
         handles = self._upload_for_session(chat_id, sess.id, files)
         if not handles:
             return "Couldn't read the file(s). Please try sending them again."
-        # Instruction upgraded to explicitly allow translation/explanation in any target language.
+        # Instruction upgraded to support Sinhala and any language explicitly.
         instructions = system_prompt or (
-            "You are a helpful assistant answering strictly and only using the provided files. "
-            "If the user asks you to translate or explain content in a specific language, respond in that language, "
-            "even if the source file text is in another language (translate as needed). "
-            "Do not refuse solely due to language differences. "
-            "If the requested information truly is not present in the files, say you don't know."
+            "You are a helpful assistant that answers STRICTLY using the provided files. "
+            "Detect the user's requested language and respond in that language. "
+            "If the user requests Sinhala (සිංහල) translation or explanation, answer in natural, fluent Sinhala. "
+            "Translate as needed even if the source content is in another language. "
+            "If the requested information is not present in the files, say you don't know."
         )
         # Use list-of-parts; google-generativeai supports passing a list
         parts: List[object] = [{"text": instructions}]
@@ -166,7 +167,7 @@ class GeminiFileQA:
 
 # Broader YouTube URL matcher: supports watch, youtu.be, shorts, and mobile links with extra params
 YOUTUBE_RE = re.compile(
-    r"(https?://(?:www\.)?(?:m\.)?(?:youtube\.com/(?:watch\?[^ \n]+|shorts/[^ \n]+)|youtu\.be/[^ \n]+))",
+    r"(https?://(?:www\\.)?(?:m\\.)?(?:youtube\\.com/(?:watch\\?[^ \\n]+|shorts/[^ \\n]+)|youtu\\.be/[^ \\n]+))",
     re.IGNORECASE,
 )
 

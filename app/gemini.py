@@ -1,5 +1,5 @@
 import os
-from typing import Optional
+from typing import Optional, Tuple
 
 import google.generativeai as genai
 
@@ -43,3 +43,45 @@ class GeminiResponder:
             except Exception:
                 text = ""
         return text.strip() or "Thanks for your message."
+
+    def rewrite_search_query(self, user_query: str) -> str:
+        """
+        Make search queries sharper and add key terms/aliases.
+        """
+        try:
+            prompt = (
+                "Rewrite the following web search query to be concise and specific. "
+                "Include key synonyms and proper nouns if relevant. Return only the improved query.\n\n"
+                f"Query: {user_query}"
+            )
+            resp = self.model.generate_content(prompt)
+            return (resp.text or "").strip() or user_query
+        except Exception:
+            return user_query
+
+    def verify_image_against_query(self, image_path: str, query: str) -> Tuple[bool, str]:
+        """
+        Ask the model if the image matches the user's request.
+        Returns (is_match, brief_reason).
+        """
+        try:
+            handle = genai.upload_file(path=image_path)
+            parts = [
+                {"text": (
+                    "You are verifying if an image matches a user's request. "
+                    "Answer strictly in this JSON format: {\"match\": true|false, \"reason\": \"...\"}. "
+                    "Be tolerant of close matches and typical variations. "
+                    "If it's generic scenery or unrelated, respond with match:false."
+                )},
+                handle,
+                {"text": f"User request: {query}"},
+            ]
+            resp = self.model.generate_content(parts)
+            txt = (resp.text or "").strip()
+            # naive parse
+            low = txt.lower()
+            is_true = "\"match\": true" in low or "match: true" in low or low.startswith("true")
+            reason = txt
+            return is_true, reason[:280]
+        except Exception as e:
+            return False, f"verification_error: {e}"
