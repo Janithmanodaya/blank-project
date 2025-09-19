@@ -10,6 +10,11 @@
  *  - GET  /waInstance:instance/ReceiveNotification/:token (long poll-ish)
  *  - DELETE /waInstance:instance/DeleteNotification/:token/:receiptId
  *  - POST   /waInstance:instance/DeleteNotification/:token {receiptId}
+ *  - POST /waInstance:instance/sendReaction/:token
+ *  - POST /waInstance:instance/sendPoll/:token
+ *  - POST /waInstance:instance/sendContact/:token
+ *  - POST /waInstance:instance/sendStickerByUrl/:token
+ *  - POST /waInstance:instance/SendStickerByUpload/:token (multipart)
  *
  * Notes:
  *  - We do not validate instance or token; they are pass-through to be compatible with the Python client.
@@ -93,7 +98,9 @@ client.on("message", async (message) => {
       },
       messageData: {
         typeMessage: "textMessage",
-        textMessageData: { textMessage: message.body || "" },
+        textMessageData: { textMessage: message.body || "",
+          // keep id for reaction targets
+        },
         chatId: message.from,
         idMessage: message.id.id || message.id._serialized,
       },
@@ -186,9 +193,9 @@ function parseDestination(body) {
 // Mimic Green-API path handling
 function withPaths(p) {
   // Accept both with and without trailing slash
-  app.post(new RegExp(`^/waInstance[^/]+/${p}/[^/]+/?$`), ...Array.prototype.slice.call(arguments, 1));
-  app.get(new RegExp(`^/waInstance[^/]+/${p}/[^/]+/?$`), ...Array.prototype.slice.call(arguments, 1));
-  app.delete(new RegExp(`^/waInstance[^/]+/${p}/[^/]+/[^/]+/?$`), ...Array.prototype.slice.call(arguments, 1));
+  app.post(new RegExp(`^/waInstance[^/]+/${p}/[^/]+/?), ...Array.prototype.slice.call(arguments, 1));
+  app.get(new RegExp(`^/waInstance[^/]+/${p}/[^/]+/?), ...Array.prototype.slice.call(arguments, 1));
+  app.delete(new RegExp(`^/waInstance[^/]+/${p}/[^/]+/[^/]+/?), ...Array.prototype.slice.call(arguments, 1));
 }
 
 // ReceiveNotification (GET)
@@ -300,9 +307,104 @@ app.post(/^\/waInstance[^/]+\/uploadFile\/[^/]+\/?$/, upload.single("file"), asy
   }
 });
 
+// sendReaction
+app.post(/^\/waInstance[^/]+\/sendReaction\/[^/]+\/?$/, async (req, res) => {
+  try {
+    const { idMessage, emoji } = req.body || {};
+    const chatId = parseDestination(req.body || {});
+    if (!chatId || !idMessage || !emoji) {
+      return res.status(400).json({ ok: false, error: "chatId, idMessage and emoji required" });
+    }
+    const msg = await client.getMessageById(idMessage);
+    if (!msg) {
+      return res.status(404).json({ ok: false, error: "message not found" });
+    }
+    await msg.react(emoji);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// sendPoll
+app.post(/^\/waInstance[^/]+\/sendPoll\/[^/]+\/?$/, async (req, res) => {
+  try {
+    const { name, options, selectableCount } = req.body || {};
+    const chatId = parseDestination(req.body || {});
+    if (!chatId || !name || !Array.isArray(options) || options.length < 2) {
+      return res.status(400).json({ ok: false, error: "chatId, name and at least two options required" });
+    }
+    const opts = { poll: { name, options, selectableCount: Math.max(1, parseInt(selectableCount || 1, 10)) } };
+    const sent = await client.sendMessage(chatId, name, opts);
+    res.json({ idMessage: sent.id._serialized || null, result: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// sendStickerByUrl
+app.post(/^\/waInstance[^/]+\/sendStickerByUrl\/[^/]+\/?$/, async (req, res) => {
+  try {
+    const { urlFile } = req.body || {};
+    const chatId = parseDestination(req.body || {});
+    if (!chatId || !urlFile) {
+      return res.status(400).json({ ok: false, error: "chatId/phoneNumber and urlFile required" });
+    }
+    const r = await axios.get(urlFile, { responseType: "arraybuffer" });
+    const mimeType = r.headers["content-type"] || "image/png";
+    const data = Buffer.from(r.data);
+    const media = new MessageMedia(mimeType, data.toString("base64"), "sticker");
+    const sent = await client.sendMessage(chatId, media, { sendMediaAsSticker: true });
+    res.json({ idMessage: sent.id._serialized || null, result: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// SendStickerByUpload (multipart)
+app.post(/^\/waInstance[^/]+\/SendStickerByUpload\/[^/]+\/?$/, upload.single("file"), async (req, res) => {
+  try {
+    const chatId = parseDestination(req.body || {});
+    if (!chatId || !req.file) {
+      return res.status(400).json({ ok: false, error: "chatId/phoneNumber and file required" });
+    }
+    const filePath = req.file.path;
+    const fileName = req.body.fileName || req.file.originalname || path.basename(filePath);
+    const mimeType = req.file.mimetype || "image/png";
+    const data = fs.readFileSync(filePath);
+    const media = new MessageMedia(mimeType, data.toString("base64"), fileName);
+    const sent = await client.sendMessage(chatId, media, { sendMediaAsSticker: true });
+    res.json({ idMessage: sent.id._serialized || null, result: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// sendContact (vCard)
+app.post(/^\/waInstance[^/]+\/sendContact\/[^/]+\/?$/, async (req, res) => {
+  try {
+    const { name, phoneNumber } = req.body || {};
+    const chatId = parseDestination(req.body || {});
+    if (!chatId || !name || !phoneNumber) {
+      return res.status(400).json({ ok: false, error: "chatId, name and phoneNumber required" });
+    }
+    const vcard =
+      "BEGIN:VCARD\n" +
+      "VERSION:3.0\n" +
+      `FN:${name}\n` +
+      `TEL;TYPE=CELL:${phoneNumber}\n` +
+      "END:VCARD";
+    const media = new MessageMedia("text/vcard", Buffer.from(vcard, "utf8").toString("base64"), "contact.vcf");
+    const sent = await client.sendMessage(chatId, media);
+    res.json({ idMessage: sent.id._serialized || null, result: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
 // Health
 app.get("/health", (req, res) => {
-  res.json({ ok: true, version: "0.1.0" });
+  res.json({ ok: true, version: "0.1.1" });
 });
 
 app.listen(PORT, () => {

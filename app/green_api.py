@@ -20,6 +20,9 @@ class GreenAPIClient:
         self.id_instance = id_instance
         self.api_token = api_token
 
+    def _is_local_gateway(self) -> bool:
+        return "green-api.com" not in (self.base_url or "")
+
     @classmethod
     def from_env(cls) -> "GreenAPIClient":
         # Prefer DB settings if available, fall back to environment variables
@@ -199,3 +202,57 @@ class GreenAPIClient:
                 return
             # If both failed, raise last error
             resp2.raise_for_status()
+
+    # Local-gateway-only features (whatsapp-web.js). Green API will not support these endpoints.
+    async def send_reaction(self, chat_id: str, id_message: str, emoji: str) -> Dict[str, Any]:
+        if not self._is_local_gateway():
+            raise RuntimeError("send_reaction is only available in local gateway mode")
+        url = self._url("sendReaction")
+        payload = {"chatId": chat_id, "idMessage": id_message, "emoji": emoji}
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(url, json=payload)
+            r.raise_for_status()
+            return r.json()
+
+    async def send_poll(self, chat_id: str, question: str, options: list[str], selectable_count: int = 1) -> Dict[str, Any]:
+        if not self._is_local_gateway():
+            raise RuntimeError("send_poll is only available in local gateway mode")
+        url = self._url("sendPoll")
+        payload = {"chatId": chat_id, "name": question, "options": options, "selectableCount": selectable_count}
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(url, json=payload)
+            r.raise_for_status()
+            return r.json()
+
+    async def send_contact_card(self, chat_id: str, name: str, phone_number: str) -> Dict[str, Any]:
+        if not self._is_local_gateway():
+            raise RuntimeError("send_contact_card is only available in local gateway mode")
+        url = self._url("sendContact")
+        payload = {"chatId": chat_id, "name": name, "phoneNumber": phone_number}
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(url, json=payload)
+            r.raise_for_status()
+            return r.json()
+
+    async def send_sticker_by_url(self, chat_id: str, url_file: str) -> Dict[str, Any]:
+        if not self._is_local_gateway():
+            raise RuntimeError("send_sticker_by_url is only available in local gateway mode")
+        url = self._url("sendStickerByUrl")
+        payload = {"chatId": chat_id, "urlFile": url_file}
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(url, json=payload)
+            r.raise_for_status()
+            return r.json()
+
+    async def send_sticker_by_upload(self, chat_id: str, file_path: Path) -> Dict[str, Any]:
+        if not self._is_local_gateway():
+            raise RuntimeError("send_sticker_by_upload is only available in local gateway mode")
+        url = f"{self.media_base_url}/waInstance{self.id_instance}/SendStickerByUpload/{self.api_token}"
+        data: Dict[str, Any] = {}
+        data.update(self._chat_destination_fields(chat_id))
+        async with httpx.AsyncClient(timeout=300) as client:
+            with file_path.open("rb") as f:
+                files = {"file": (file_path.name, f, mimetypes.guess_type(str(file_path))[0] or "application/octet-stream")}
+                r = await client.post(url, data=data, files=files)
+            r.raise_for_status()
+            return r.json()

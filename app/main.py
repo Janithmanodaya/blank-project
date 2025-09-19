@@ -22,6 +22,9 @@ from .pdf_packer import PDFComposer, PDFComposeResult
 from .storage import Storage
 from .tasks import job_queue, workers
 
+# Transient quiz state per chat for local-mode polls
+quiz_state: Dict[str, Dict[str, Any]] = {}
+
 # Transient store for pending yt-dlp choices per sender
 ytdl_pending: Dict[str, Dict[str, Any]] = {}
 
@@ -848,6 +851,79 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
 
     text_msg = _extract_text_from_payload(payload) or ""
 
+    # Local-mode utility commands: sticker/contact/reaction/poll
+    # These endpoints are available only when using the local whatsapp-web.js gateway.
+    try:
+        base = Database().get_setting("GREEN_API_BASE_URL", os.getenv("GREEN_API_BASE_URL", "")) or ""
+        local_mode = ("green-api.com" not in (base or "").lower())
+    except Exception:
+        local_mode = False
+
+    if text_msg and local_mode:
+        lowtxt = text_msg.strip().lower()
+
+        # Send sticker from URL: "sticker: https://...."
+        if lowtxt.startswith("sticker:"):
+            url = text_msg.split(":", 1)[1].strip()
+            if _is_sender_allowed(sender, db):
+                try:
+                    await client.send_sticker_by_url(chat_id=sender, url_file=url)
+                    return {"ok": True, "job_id": None}
+                except Exception as e:
+                    await client.send_message(chat_id=sender, message=f"Couldn't send sticker: {e}")
+                    return {"ok": False}
+
+        # Send contact card: "contact: John Doe, +1234567890"
+        if lowtxt.startswith("contact:"):
+            body = text_msg.split(":", 1)[1].strip()
+            name = body
+            phone = ""
+            # simple parse "Name, phone"
+            if "," in body:
+                parts = [p.strip() for p in body.split(",", 1)]
+                name = parts[0]
+                phone = parts[1]
+            elif " " in body and any(ch.isdigit() for ch in body.split(" ")[-1]):
+                phone = body.split(" ")[-1]
+                name = body.rsplit(" ", 1)[0]
+            if _is_sender_allowed(sender, db):
+                try:
+                    if name and phone:
+                        await client.send_contact_card(chat_id=sender, name=name, phone_number=phone)
+                    else:
+                        await client.send_message(chat_id=sender, message="Please use: contact: Full Name, +123456789")
+                    return {"ok": True, "job_id": None}
+                except Exception as e:
+                    await client.send_message(chat_id=sender, message=f"Couldn't send contact: {e}")
+                    return {"ok": False}
+
+        # React to this message: "react: 👍"
+        if lowtxt.startswith("react:") or lowtxt.startswith("reaction:"):
+            emoji = text_msg.split(":", 1)[1].strip() or "👍"
+            try:
+                await client.send_reaction(chat_id=sender, id_message=str(msg_id), emoji=emoji)
+            except Exception:
+                # ignore in cloud mode or if failure
+                pass
+            return {"ok": True, "job_id": None}
+
+        # Create a poll quickly: "poll: Your question? | Option A | Option B | Option C"
+        if lowtxt.startswith("poll:"):
+            body = text_msg.split(":", 1)[1].strip()
+            parts = [p.strip() for p in body.split("|") if p.strip()]
+            if len(parts) >= 3:
+                q = parts[0]
+                opts = parts[1:]
+                try:
+                    await client.send_poll(chat_id=sender, question=q, options=opts, selectable_count=1)
+                except Exception as e:
+                    await client.send_message(chat_id=sender, message=f"Couldn't create poll: {e}")
+                return {"ok": True, "job_id": None}
+            else:
+                if _is_sender_allowed(sender, db):
+                    await client.send_message(chat_id=sender, message="Use: poll: Question | Option A | Option B")
+                return {"ok": True, "job_id": None}
+
     # One-time PDF packer command: "PDF:N" where N = images per page
     if text_msg:
         m = re.match(r"^\s*pdf\s*:\s*(\d+)\s*$", text_msg, flags=re.IGNORECASE)
@@ -1296,6 +1372,89 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
             if _is_sender_allowed(sender, db):
                 await client.send_message(chat_id=sender, message=f"Deleted session {sid}.")
             return {"ok": True, "job_id": None}
+
+        # Quiz: ask me any question about the active file(s)
+        triggers = {"quiz", "ask me", "ask me any question", "test me"}
+        if low in triggers:
+            # require an active session
+            if not _state.list_sessions(sender):
+                if _is_sender_allowed(sender, db):
+                    await client.send_message(chat_id=sender, message="Please send a PDF or images first. Then say 'quiz'.")
+                return {"ok": True, "job_id": None}
+            try:
+                qa = GeminiFileQA()
+                # Ask the model for a single multiple-choice question in JSON
+                prompt = (
+                    "Create one multiple-choice question (MCQ) strictly from the provided file(s). "
+                    "Return ONLY valid JSON with keys: question (string), options (array of 4 concise strings), correct_index (0-3). "
+                    "Keep it simple and verifiable from the document."
+                )
+                jtxt = qa.answer(sender, prompt)
+                data = {}
+                try:
+                    data = json.loads(jtxt)
+                except Exception:
+                    # try to extract JSON substring
+                    m = re.search(r'\\{[\\s\\S]*\\}', jtxt)
+                    if m:
+                        data = json.loads(m.group(0))
+                q = str(data.get("question") or "").strip()
+                opts = data.get("options") or []
+                ci = data.get("correct_index", 0)
+                if not q or not isinstance(opts, list) or len(opts) < 2:
+                    raise ValueError("model did not return a proper MCQ")
+                # store quiz state
+                quiz_state[sender] = {"question": q, "options": opts, "correct_index": int(ci)}
+                # Prefer poll in local mode; otherwise send as text
+                base = Database().get_setting("GREEN_API_BASE_URL", os.getenv("GREEN_API_BASE_URL", "")) or ""
+                local_mode = ("green-api.com" not in (base or "").lower())
+                if local_mode:
+                    try:
+                        await client.send_poll(chat_id=sender, question=q, options=opts, selectable_count=1)
+                        await client.send_message(chat_id=sender, message="Reply with the option text if you can't vote in the poll.")
+                    except Exception:
+                        await client.send_message(chat_id=sender, message=f"{q}\n- " + "\n- ".join(opts) + "\nReply with your answer.")
+                else:
+                    await client.send_message(chat_id=sender, message=f"{q}\n- " + "\n- ".join(opts) + "\nReply with your answer.")
+            except Exception as e:
+                if _is_sender_allowed(sender, db):
+                    await client.send_message(chat_id=sender, message=f"Couldn't create a question: {e}")
+            return {"ok": True, "job_id": None}
+
+        # If user replies and a quiz is active, try to evaluate their answer
+        if sender in quiz_state and text_msg.strip():
+            qs = quiz_state.get(sender) or {}
+            opts = [str(o) for o in (qs.get("options") or [])]
+            correct_i = int(qs.get("correct_index", 0))
+            chosen_i = None
+            t = text_msg.strip()
+            # match by index "1/2/3/4" or by text
+            if t.isdigit():
+                k = int(t)
+                if 1 <= k <= len(opts):
+                    chosen_i = k - 1
+            if chosen_i is None:
+                # case-insensitive match against options
+                for i, o in enumerate(opts):
+                    if t.lower() == o.strip().lower():
+                        chosen_i = i
+                        break
+            if chosen_i is not None:
+                is_correct = (chosen_i == correct_i)
+                msg = "Correct ✅" if is_correct else f"Not quite. The right answer is: {opts[correct_i]}"
+                if _is_sender_allowed(sender, db):
+                    await client.send_message(chat_id=sender, message=msg)
+                    # react to their message in local mode
+                    try:
+                        base = Database().get_setting("GREEN_API_BASE_URL", os.getenv("GREEN_API_BASE_URL", "")) or ""
+                        if "green-api.com" not in (base or "").lower():
+                            await client.send_reaction(chat_id=sender, id_message=str(msg_id), emoji="👍" if is_correct else "👎")
+                    except Exception:
+                        pass
+                # clear quiz
+                quiz_state.pop(sender, None)
+                return {"ok": True, "job_id": None}
+
         # If we have any sessions, answer from active one
         if _state.list_sessions(sender):
             try:
