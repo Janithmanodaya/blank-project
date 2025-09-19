@@ -552,12 +552,7 @@ async def _search_verify_send_image(sender: str, query: str, prefer_ext: str, db
     Sends a short 'please wait' message to the user up-front.
     """
     client = GreenAPIClient.from_env()
-    # Inform user that we're searching (non-blocking)
-    try:
-        if _is_sender_allowed(sender, db):
-            await client.send_message(chat_id=sender, message="Searching for an image… please wait a few seconds.")
-    except Exception:
-        pass
+    # Avoid sending a preliminary message to prevent duplicate-looking replies.
 
     tmp_dir = storage.base / "tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -671,18 +666,20 @@ async def _search_verify_send_image(sender: str, query: str, prefer_ext: str, db
                     pass
                 continue
 
-            # Upload and send (use dedicated image endpoint to avoid misclassification)
-            up = await client.upload_file(out_proc)
+            # Prefer direct upload-and-send to ensure WhatsApp treats it as an image and avoid URL/plan issues.
             if _is_sender_allowed(sender, db):
                 cap = f"Image for: {query}"
-                # Try dedicated image endpoint first; it ensures correct media type on WhatsApp.
-                # Our GreenAPI client will gracefully fall back to sendFileByUrl if 403.
-                await client.send_image_by_url(
-                    chat_id=sender,
-                    url_file=up.get("urlFile", ""),
-                    caption=cap,
-                    filename=out_proc.name,
-                )
+                try:
+                    await client.send_file_by_upload(chat_id=sender, file_path=out_proc, caption=cap)
+                except Exception:
+                    # Fallback: upload to Green API storage then send by image endpoint (with internal fallback to file)
+                    up = await client.upload_file(out_proc)
+                    await client.send_image_by_url(
+                        chat_id=sender,
+                        url_file=up.get("urlFile", ""),
+                        caption=cap,
+                        filename=out_proc.name,
+                    )
             try:
                 bin_path.unlink(missing_ok=True)
                 if out_proc != bin_path:
