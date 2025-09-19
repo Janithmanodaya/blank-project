@@ -300,7 +300,7 @@ class PDFComposer:
             if ipp == 2:
                 i = 0
                 gutter = max(self._mm_to_px(GUTTER_MM), 8)
-                while i &lt; len(infos):
+                while i < len(infos):
                     # Landscape page: width=height of portrait, height=width of portrait
                     c.setPageSize((self.A4_H, self.A4_W))
                     page_w = self.A4_H - 2 * margin
@@ -329,7 +329,7 @@ class PDFComposer:
                     i += 1
 
                     # Right (if available)
-                    if i &lt; len(infos):
+                    if i < len(infos):
                         info_r = infos[i]
                         x, y, w, h = right_cell
                         scale = min(w / info_r.width, h / info_r.height, 1.0)
@@ -368,7 +368,7 @@ class PDFComposer:
             else:
                 # General custom mode: use advanced packer capped to N images per (portrait) page for maximal fill
                 i = 0
-                while i &lt; len(infos):
+                while i < len(infos):
                     c.setPageSize((self.A4_W, self.A4_H))  # portrait only
                     cells, used, allow_upscale, stretch = self._pack_page_advanced(infos[i:], margin, limit=ipp)
                     page_meta = {"items": [], "orientation": "portrait", "images_per_page": ipp}
