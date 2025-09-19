@@ -463,6 +463,8 @@ def ui(db: Database = Depends(get_db), token: Optional[str] = Query(default=None
 
         {settings_html}
 
+        {pair_ui}
+
         <div class="card">
           <h3>Recent Jobs</h3>
           <div class="scroll">
