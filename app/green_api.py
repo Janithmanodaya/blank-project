@@ -11,6 +11,7 @@ from .db import Database
 class GreenAPIClient:
     def __init__(self, base_url: str, id_instance: str, api_token: str):
         self.base_url = base_url.rstrip("/")
+        self.media_base_url = "https://media.green-api.com"  # per docs for upload endpoints
         self.id_instance = id_instance
         self.api_token = api_token
 
@@ -101,6 +102,24 @@ class GreenAPIClient:
             payload["caption"] = caption
         async with httpx.AsyncClient(timeout=60) as client:
             resp = await client.post(url, json=payload)
+            resp.raise_for_status()
+            return resp.json()
+
+    async def send_file_by_upload(self, chat_id: str, file_path: Path, caption: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Directly upload and send a single file in one request (multipart/form-data).
+        This bypasses URL-based sending and avoids plan restrictions on sendImageByUrl.
+        Endpoint is hosted on media.green-api.com per documentation.
+        """
+        url = f"{self.media_base_url}/waInstance{self.id_instance}/SendFileByUpload/{self.api_token}"
+        ctype = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
+        data = {"chatId": chat_id}
+        if caption:
+            data["caption"] = caption
+        async with httpx.AsyncClient(timeout=300) as client:
+            with file_path.open("rb") as f:
+                files = {"file": (file_path.name, f, ctype)}
+                resp = await client.post(url, data=data, files=files)
             resp.raise_for_status()
             return resp.json()
 
