@@ -457,55 +457,117 @@ async def _ytdl_prepare_choices(url: str) -> List[Dict[str, Any]]:
         return []
 
 
-async def _download_and_send_image(sender: str, query: str, prefer_ext: str, db: Database) -> bool:
+async def _wiki_image_candidates(query: str) -> List[str]:
+    """
+    Fetch a few candidate image URLs from Wikimedia Commons for a query.
+    No API key required.
+    """
+    try:
+        params = {
+            "action": "query",
+            "generator": "search",
+            "gsrsearch": query,
+            "gsrlimit": "6",
+            "gsrnamespace": "6",  # File namespace
+            "prop": "imageinfo",
+            "iiprop": "url",
+            "iiurlwidth": "1280",
+            "format": "json",
+            "origin": "*",
+        }
+        async with httpx.AsyncClient(timeout=20) as hc:
+            r = await hc.get("https://commons.wikimedia.org/w/api.php", params=params, headers={"User-Agent": "RelayBot/1.0"})
+            if r.status_code != 200:
+                return []
+            data = r.json()
+        pages = (data.get("query") or {}).get("pages") or {}
+        urls: List[str] = []
+        for _, p in pages.items():
+            ii = (p.get("imageinfo") or [])
+            if ii and isinstance(ii, list):
+                url = ii[0].get("url")
+                if isinstance(url, str) and url.lower().startswith("http"):
+                    urls.append(url)
+        return urls[:5]
+    except Exception:
+        return []
+
+async def _search_verify_send_image(sender: str, query: str, prefer_ext: str, db: Database) -> bool:
+    """
+    Search for an image, download the best candidate, verify it with Gemma 3n, then send.
+    """
     client = GreenAPIClient.from_env()
     tmp_dir = storage.base / "tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
     ext = ".jpg" if prefer_ext.lower() in {"jpg", "jpeg"} else ".png"
-    name = f"img_{int(datetime.utcnow().timestamp())}_{random.randint(1000,9999)}{ext}"
-    out_path = tmp_dir / name
 
-    # Select a reliable source
-    url = ""
-    qlow = (query or "").strip().lower()
-    if "cat" in qlow and ("image" in qlow or "photo" in qlow or "jpg" in qlow or "jpeg" in qlow):
-        # Deterministic cute cat
-        w, h = 800, 600
-        seed = random.randint(1, 1_000_000)
-        url = f"https://placekitten.com/seed/{seed}/{w}/{h}"
-        ext = ".jpg"
-        out_path = tmp_dir / (out_path.stem + ".jpg")
-    else:
-        # Unsplash Source supports keyword without API key
-        url = f"https://source.unsplash.com/800x600/?{quote_plus(query)}"
-
+    # Try sharpening the query with Gemma/Gemini
     try:
-        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as hc:
-            r = await hc.get(url, headers={"User-Agent": "Mozilla/5.0"})
-            if r.status_code != 200 or not r.content:
-                return False
-            with out_path.open("wb") as f:
-                f.write(r.content)
-        up = await client.upload_file(out_path)
-        if _is_sender_allowed(sender, db):
-            await client.send_file_by_url(chat_id=sender, url_file=up.get("urlFile", ""), filename=out_path.name, caption=f"Image for: {query}")
+        if GeminiResponder is not None:
+            gr = GeminiResponder()
+            query = await asyncio.to_thread(gr.rewrite_search_query, query)
+    except Exception:
+        pass
+
+    # Candidate sources: Wikimedia first, then Unsplash fallback
+    candidates = await _wiki_image_candidates(query)
+    if not candidates:
+        candidates = [f"https://source.unsplash.com/1000x700/?{quote_plus(query)}"]
+
+    for idx, url in enumerate(candidates, start=1):
+        name = f"img_{int(datetime.utcnow().timestamp())}_{random.randint(1000,9999)}_{idx}{ext}"
+        out_path = tmp_dir / name
         try:
-            out_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-        return True
-    except Exception as e:
-        json_log("image_fetch_error", error=str(e), query=query)
-        try:
-            out_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-        if _is_sender_allowed(sender, db):
+            async with httpx.AsyncClient(timeout=30, follow_redirects=True) as hc:
+                r = await hc.get(url, headers={"User-Agent": "Mozilla/5.0"})
+                if r.status_code != 200 or not r.content:
+                    continue
+                with out_path.open("wb") as f:
+                    f.write(r.content)
+
+            # Verify with Gemma 3n if available
+            verified = True
+            reason = "ok"
+            if GeminiResponder is not None:
+                try:
+                    gr = GeminiResponder()
+                    verified, reason = await asyncio.to_thread(gr.verify_image_against_query, str(out_path), query)
+                except Exception as e:
+                    verified = False
+                    reason = f"verify_error: {e}"
+
+            if not verified:
+                json_log("image_candidate_rejected", url=url, reason=reason)
+                try:
+                    out_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                continue
+
+            up = await client.upload_file(out_path)
+            if _is_sender_allowed(sender, db):
+                cap = f"Image for: {query}"
+                await client.send_file_by_url(chat_id=sender, url_file=up.get("urlFile", ""), filename=out_path.name, caption=cap)
             try:
-                await client.send_message(chat_id=sender, message="I couldn't fetch an image right now.")
+                out_path.unlink(missing_ok=True)
             except Exception:
                 pass
-        return False
+            return True
+        except Exception as e:
+            json_log("image_fetch_error", error=str(e), query=query, source=url)
+            try:
+                out_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            continue
+
+    # If none verified/sent
+    if _is_sender_allowed(sender, db):
+        try:
+            await client.send_message(chat_id=sender, message="I couldn't find a suitable image for that request.")
+        except Exception:
+            pass
+    return False
 
 
 async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict[str, Any]:
@@ -555,19 +617,27 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
 
     media_list: List[Dict[str, Any]] = []
     try:
-        type_message = message_data.get("typeMessage")
-        if type_message in {"imageMessage", "videoMessage", "documentMessage", "audioMessage"}:
-            img = (
-                message_data.get("imageMessageData")
-                or message_data.get("fileMessageData")
-                or message_data.get("documentMessageData")
-                or message_data.get("audioMessageData")
-                or {}
-            )
-            if img:
-                media_list.append(img)
+        type_message = (message_data.get("typeMessage") or "").lower()
+        # Collect known single-media payloads
+        candidates = [
+            message_data.get("imageMessageData"),
+            message_data.get("videoMessageData"),
+            message_data.get("fileMessageData"),
+            message_data.get("documentMessageData"),
+            message_data.get("audioMessageData"),
+            message_data.get("voiceMessageData"),  # some providers use this for PTT/voice notes
+        ]
+        for c in candidates:
+            if isinstance(c, dict) and c:
+                media_list.append(c)
+        # Heuristic: if type mentions 'voice' and we have no explicit payload, treat audioMessageData as voice
+        if ("voice" in type_message or "ptt" in type_message) and not media_list:
+            amd = message_data.get("audioMessageData")
+            if isinstance(amd, dict) and amd:
+                media_list.append(amd)
+        # Multiple medias array
         if "medias" in message_data and isinstance(message_data["medias"], list):
-            media_list.extend(message_data["medias"])
+            media_list.extend([m for m in message_data["medias"] if isinstance(m, dict)])
     except Exception:
         pass
 
@@ -724,14 +794,35 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
 
     # Simple internet search command: "search: ..."
     if text_msg.lower().startswith("search:") or text_msg.lower().startswith("search "):
-        query = text_msg.split(":", 1)[1].strip() if ":" in text_msg else text_msg.split(" ", 1)[1].strip()
+        raw_query = text_msg.split(":", 1)[1].strip() if ":" in text_msg else text_msg.split(" ", 1)[1].strip()
+        # Let Gemma/Gemini sharpen the query
+        query = raw_query
+        try:
+            if GeminiResponder is not None:
+                gr = GeminiResponder()
+                query = await asyncio.to_thread(gr.rewrite_search_query, raw_query)
+        except Exception:
+            query = raw_query
         links = await _web_search_links(query)
         if _is_sender_allowed(sender, db):
             if not links:
-                await client.send_message(chat_id=sender, message="No results found.")
+                await client.send_message(chat_id=sender, message=f"No results found for \"{query}\".")
             else:
-                head = "\n".join(links[:8])
-                await client.send_message(chat_id=sender, message=f"Top results for \"{query}\":\n{head}")
+                # Nicely formatted top results. We can ask model to create a short intro.
+                intro = f"Top results for \"{query}\":"
+                try:
+                    if GeminiResponder is not None:
+                        gr = GeminiResponder()
+                        intro = await asyncio.to_thread(
+                            gr.generate,
+                            f"Write a short, friendly one-line intro for search results about: {query}",
+                            "You are a concise assistant."
+                        )
+                except Exception:
+                    pass
+                top = links[:8]
+                numbered = "\n".join(f"{i+1}. {u}" for i, u in enumerate(top))
+                await client.send_message(chat_id=sender, message=f"{intro}\n{numbered}")
         return {"ok": True, "job_id": None}
 
     # Image fetch command: "image: cats jpg" or "img: cat"
@@ -743,7 +834,7 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
             prefer_ext = "png"
         elif "jpeg" in low or "jpg" in low:
             prefer_ext = "jpg"
-        ok_img = await _download_and_send_image(sender, body, prefer_ext, db)
+        ok_img = await _search_verify_send_image(sender, body, prefer_ext, db)
         if ok_img:
             return {"ok": True, "job_id": None}
         # if failed, fall through to other handlers
