@@ -58,7 +58,15 @@ const client = new Client({
   authStrategy: new LocalAuth({ dataPath: path.join(DATA_DIR, "auth") }),
   puppeteer: {
     headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox"],
+    executablePath: process.env.CHROME_PATH || undefined,
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-gpu",
+      "--no-zygote",
+      "--disable-features=VizDisplayCompositor",
+    ],
   },
 });
 

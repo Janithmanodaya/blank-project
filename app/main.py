@@ -9,6 +9,7 @@ import random
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union, TextIO
+import subprocess
 
 import httpx
 from fastapi import Depends, FastAPI, Request
@@ -114,6 +115,37 @@ async def on_startup():
     db.init()
     json_log("startup", version=VERSION)
 
+    # Optionally start the embedded whatsapp gateway (Node) when in local mode or when GREEN_API_BASE_URL points to localhost
+    try:
+        mode = (db.get_setting("WHATSAPP_MODE", os.getenv("WHATSAPP_MODE", "green")) or "green").lower()
+        base = db.get_setting("GREEN_API_BASE_URL", os.getenv("GREEN_API_BASE_URL", "")) or ""
+        want_local = (mode == "local") or ("127.0.0.1:3000" in base or "localhost:3000" in base)
+        if want_local:
+            # Spawn `node server.js` in whatsapp_gateway; rely on build step having run npm install
+            gw_dir = Path(__file__).resolve().parent.parent / "whatsapp_gateway"
+            if (gw_dir / "server.js").exists():
+                env = os.environ.copy()
+                # Expose public URL base to gateway if needed (not required when accessed via /ui/local/* proxy)
+                env.setdefault("GATEWAY_PORT", "3000")
+                # Chromium path is provided via CHROME_PATH in render.yaml
+                proc = subprocess.Popen(
+                    ["node", "server.js"],
+                    cwd=str(gw_dir),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    env=env,
+                )
+                # Store pid in DB settings to allow inspection (optional)
+                try:
+                    db.set_setting("LOCAL_GATEWAY_PID", str(proc.pid))
+                except Exception:
+                    pass
+                json_log("local_gateway_spawned", pid=proc.pid)
+            else:
+                json_log("local_gateway_missing", path=str(gw_dir))
+    except Exception as e:
+        json_log("local_gateway_spawn_error", error=str(e))
+
     # Launch workers
     worker_count = int(os.getenv("WORKERS", "2"))
     for i in range(worker_count):
@@ -135,6 +167,16 @@ async def on_shutdown():
     for w in workers:
         w.cancel()
     await asyncio.gather(*workers, return_exceptions=True)
+    # Try to stop embedded gateway if we started it
+    try:
+        db = Database()
+        pid_txt = db.get_setting("LOCAL_GATEWAY_PID", None)
+        if pid_txt:
+            pid = int(pid_txt)
+            os.kill(pid, 15)  # SIGTERM
+            db.set_setting("LOCAL_GATEWAY_PID", "")
+    except Exception:
+        pass
 
 
 async def worker_loop(worker_id: int):
