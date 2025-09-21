@@ -86,6 +86,38 @@ class PDFComposer:
         """Convert pixels at self.dpi to points."""
         return (px * 72.0) / float(self.dpi)
 
+    # --- rotation helpers for better fit on landscape pages ---
+    def _should_rotate_for_cell(self, iw: int, ih: int, cell_w: int, cell_h: int) -> bool:
+        """
+        Decide if 90° rotation yields a better fit inside (cell_w, cell_h).
+        Uses a small hysteresis to avoid unnecessary rotations.
+        """
+        if iw <= 0 or ih <= 0 or cell_w <= 0 or cell_h <= 0:
+            return False
+        scale_no = min(cell_w / iw, cell_h / ih)
+        scale_rot = min(cell_w / ih, cell_h / iw)
+        return scale_rot > scale_no * 1.02  # 2% better
+
+    def _rotate_image_tmp(self, path: Path) -> Path:
+        """
+        Rotate image 90 degrees (counter-clockwise), save to storage/tmp, and return the new path.
+        """
+        tmpdir = self.storage.base / "tmp"
+        tmpdir.mkdir(parents=True, exist_ok=True)
+        ext = path.suffix.lower() or ".jpg"
+        out = tmpdir / f"{path.stem}_rot90{ext}"
+        i = 1
+        while out.exists():
+            out = tmpdir / f"{path.stem}_rot90_{i}{ext}"
+            i += 1
+        with Image.open(path) as im:
+            rotated = im.rotate(90, expand=True)
+            if ext in {".jpg", ".jpeg"}:
+                rotated.save(out, quality=92)
+            else:
+                rotated.save(out)
+        return out
+
     def _classify(self, w: int, h: int) -> str:
         a4w, a4h = self.A4_W, self.A4_H
         def meets(pct: float) -> bool:
@@ -320,12 +352,28 @@ class PDFComposer:
                     # Left
                     info = infos[i]
                     x, y, w, h = left_cell
-                    scale = min(w / info.width, h / info.height, 1.0)
-                    rw, rh = int(info.width * scale), int(info.height * scale)
+                    # RULE: Always align the image long side to the cell long side (rotate if needed)
+                    img_path = str(info.path)
+                    iw, ih = info.width, info.height
+                    cell_long = w if w >= h else h
+                    img_is_landscape = iw >= ih
+                    cell_is_landscape = w >= h
+                    if img_is_landscape != cell_is_landscape:
+                        try:
+                            rot_path = self._rotate_image_tmp(info.path)
+                            img_path = str(rot_path)
+                            iw, ih = ih, iw
+                        except Exception:
+                            img_path = str(info.path)
+                            iw, ih = info.width, info.height
+                    img_long = max(iw, ih)
+                    # Scale to fill the long side exactly (allow upscaling to satisfy the rule)
+                    scale = cell_long / max(img_long, 1)
+                    rw, rh = int(iw * scale), int(ih * scale)
                     ox = int(x + (w - rw) // 2)
                     oy = int(y + (h - rh) // 2)
                     c.drawImage(
-                        str(info.path),
+                        img_path,
                         self._px_to_pt(ox), self._px_to_pt(oy),
                         width=self._px_to_pt(rw), height=self._px_to_pt(rh),
                         preserveAspectRatio=True, anchor='c'
@@ -342,12 +390,28 @@ class PDFComposer:
                     if i < len(infos):
                         info_r = infos[i]
                         x, y, w, h = right_cell
-                        scale = min(w / info_r.width, h / info_r.height, 1.0)
-                        rw, rh = int(info_r.width * scale), int(info_r.height * scale)
+                        # RULE: Always align the image long side to the cell long side (rotate if needed)
+                        img_path_r = str(info_r.path)
+                        iw, ih = info_r.width, info_r.height
+                        cell_long = w if w >= h else h
+                        img_is_landscape = iw >= ih
+                        cell_is_landscape = w >= h
+                        if img_is_landscape != cell_is_landscape:
+                            try:
+                                rot_path_r = self._rotate_image_tmp(info_r.path)
+                                img_path_r = str(rot_path_r)
+                                iw, ih = ih, iw
+                            except Exception:
+                                img_path_r = str(info_r.path)
+                                iw, ih = info_r.width, info_r.height
+                        img_long = max(iw, ih)
+                        # Scale to fill the long side exactly (allow upscaling to satisfy the rule)
+                        scale = cell_long / max(img_long, 1)
+                        rw, rh = int(iw * scale), int(ih * scale)
                         ox = int(x + (w - rw) // 2)
                         oy = int(y + (h - rh) // 2)
                         c.drawImage(
-                            str(info_r.path),
+                            img_path_r,
                             self._px_to_pt(ox), self._px_to_pt(oy),
                             width=self._px_to_pt(rw), height=self._px_to_pt(rh),
                             preserveAspectRatio=True, anchor='c'
@@ -449,14 +513,25 @@ class PDFComposer:
                 # draw page with cells
                 page_meta = {"items": [], "orientation": "landscape" if landscape_page else "portrait"}
                 for info, (x, y, w, h) in cells:
-                    scale = min(w / info.width, h / info.height)
+                    # If this is a landscape A5 pair page, rotate portrait images to fill better
+                    img_path = str(info.path)
+                    iw, ih = info.width, info.height
+                    if landscape_page and self._should_rotate_for_cell(iw, ih, w, h):
+                        try:
+                            rot_path = self._rotate_image_tmp(info.path)
+                            img_path = str(rot_path)
+                            iw, ih = ih, iw
+                        except Exception:
+                            img_path = str(info.path)
+                            iw, ih = info.width, info.height
+                    scale = min(w / iw, h / ih)
                     if not allow_upscale:
                         scale = min(scale, 1.0)
-                    rw, rh = int(info.width * scale), int(info.height * scale)
+                    rw, rh = int(iw * scale), int(ih * scale)
                     ox = int(x + (w - rw) // 2)
                     oy = int(y + (h - rh) // 2)
                     c.drawImage(
-                        str(info.path),
+                        img_path,
                         self._px_to_pt(ox), self._px_to_pt(oy),
                         width=self._px_to_pt(rw), height=self._px_to_pt(rh),
                         preserveAspectRatio=True, anchor='c'
