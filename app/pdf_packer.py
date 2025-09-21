@@ -352,10 +352,13 @@ class PDFComposer:
                     # Left
                     info = infos[i]
                     x, y, w, h = left_cell
-                    # If rotating helps in landscape cell, rotate to better fill
+                    # RULE: Always align the image long side to the cell long side (rotate if needed)
                     img_path = str(info.path)
                     iw, ih = info.width, info.height
-                    if self._should_rotate_for_cell(iw, ih, w, h):
+                    cell_long = w if w >= h else h
+                    img_is_landscape = iw >= ih
+                    cell_is_landscape = w >= h
+                    if img_is_landscape != cell_is_landscape:
                         try:
                             rot_path = self._rotate_image_tmp(info.path)
                             img_path = str(rot_path)
@@ -363,7 +366,9 @@ class PDFComposer:
                         except Exception:
                             img_path = str(info.path)
                             iw, ih = info.width, info.height
-                    scale = min(w / iw, h / ih, 1.0)
+                    img_long = max(iw, ih)
+                    # Scale to fill the long side exactly (allow upscaling to satisfy the rule)
+                    scale = cell_long / max(img_long, 1)
                     rw, rh = int(iw * scale), int(ih * scale)
                     ox = int(x + (w - rw) // 2)
                     oy = int(y + (h - rh) // 2)
@@ -385,9 +390,13 @@ class PDFComposer:
                     if i < len(infos):
                         info_r = infos[i]
                         x, y, w, h = right_cell
+                        # RULE: Always align the image long side to the cell long side (rotate if needed)
                         img_path_r = str(info_r.path)
                         iw, ih = info_r.width, info_r.height
-                        if self._should_rotate_for_cell(iw, ih, w, h):
+                        cell_long = w if w >= h else h
+                        img_is_landscape = iw >= ih
+                        cell_is_landscape = w >= h
+                        if img_is_landscape != cell_is_landscape:
                             try:
                                 rot_path_r = self._rotate_image_tmp(info_r.path)
                                 img_path_r = str(rot_path_r)
@@ -395,7 +404,9 @@ class PDFComposer:
                             except Exception:
                                 img_path_r = str(info_r.path)
                                 iw, ih = info_r.width, info_r.height
-                        scale = min(w / iw, h / ih, 1.0)
+                        img_long = max(iw, ih)
+                        # Scale to fill the long side exactly (allow upscaling to satisfy the rule)
+                        scale = cell_long / max(img_long, 1)
                         rw, rh = int(iw * scale), int(ih * scale)
                         ox = int(x + (w - rw) // 2)
                         oy = int(y + (h - rh) // 2)
