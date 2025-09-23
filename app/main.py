@@ -6,6 +6,7 @@ import sys
 import io
 import re
 import random
+import ast
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union, TextIO
@@ -294,6 +295,122 @@ def _extract_text_from_payload(payload: Dict[str, Any]) -> Optional[str]:
                 return cap
 
     return None
+
+
+# --- Simple, safe math evaluator for common questions (e.g., "2+2", "what is 3^2?", "7 * (8-3)") ---
+
+_ALLOWED_AST_NODES = {
+    ast.Expression, ast.BinOp, ast.UnaryOp, ast.Num, ast.Constant,
+    ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod, ast.Pow,
+    ast.UAdd, ast.USub, ast.Load, ast.Tuple
+}
+
+def _safe_eval_expr(expr: str) -> Optional[float]:
+    """
+    Evaluate a math expression safely using AST.
+    Supports +, -, *, /, //, %, ^ (treated as **), parentheses, and unary +/-.
+    Returns a float (or int-castable) or None if not evaluable.
+    """
+    try:
+        # Normalize: caret to power
+        s = expr.replace("^", "**")
+        # Insert implicit multiplication: "2(3+4)" -> "2*(3+4)" and "(2+3)4" -> "(2+3)*4"
+        s = re.sub(r"(?<=\d)\s*(?=\()", "*", s)
+        s = re.sub(r"(?<=\))\s*(?=\d)", "*", s)
+        # Handle simple 'x' between numbers as multiply: 2x3 -> 2*3
+        s = re.sub(r"(?<=\d)\s*[xX]\s*(?=\d)", "*", s)
+        # Parse
+        node = ast.parse(s, mode="eval")
+        # Validate nodes
+        for n in ast.walk(node):
+            if type(n) not in _ALLOWED_AST_NODES:
+                return None
+        def _eval(n):
+            if isinstance(n, ast.Expression):
+                return _eval(n.body)
+            if isinstance(n, ast.Constant):
+                if isinstance(n.value, (int, float)):
+                    return n.value
+                return None
+            if isinstance(n, ast.Num):  # Py<3.8 compatibility
+                return n.n
+            if isinstance(n, ast.BinOp):
+                l = _eval(n.left); r = _eval(n.right)
+                if l is None or r is None:
+                    return None
+                if isinstance(n.op, ast.Add): return l + r
+                if isinstance(n.op, ast.Sub): return l - r
+                if isinstance(n.op, ast.Mult): return l * r
+                if isinstance(n.op, ast.Div): return l / r
+                if isinstance(n.op, ast.FloorDiv): return l // r
+                if isinstance(n.op, ast.Mod): return l % r
+                if isinstance(n.op, ast.Pow): return l ** r
+                return None
+            if isinstance(n, ast.UnaryOp):
+                v = _eval(n.operand)
+                if v is None:
+                    return None
+                if isinstance(n.op, ast.UAdd): return +v
+                if isinstance(n.op, ast.USub): return -v
+                return None
+            return None
+        res = _eval(node)
+        if isinstance(res, (int, float)):
+            return float(res)
+        return None
+    except Exception:
+        return None
+
+_MATH_TRIGGER_WORDS = ("what is", "calculate", "calc", "solve", "evaluate")
+
+def _maybe_answer_math_text(txt: str) -> Optional[str]:
+    """
+    Try to detect a math question and compute it.
+    Returns a short answer string if computed, else None.
+    """
+    if not txt or not isinstance(txt, str):
+        return None
+    s = txt.strip()
+    low = s.lower()
+
+    # Heuristic: if string contains only math characters (plus some spaces), treat as expression
+    if re.fullmatch(r"[0-9\.\s\+\-\*\/\^\%\(\)xX]+", s):
+        val = _safe_eval_expr(s)
+        if val is not None:
+            # Beautify: show as int if close
+            if abs(val - round(val)) < 1e-12:
+                return f"{int(round(val))}"
+            return f"{val}"
+        return None
+
+    # Otherwise, try to extract the math expression from common phrasings
+    if any(w in low for w in _MATH_TRIGGER_WORDS) or re.search(r"\d", s):
+        # Keep only math-relevant characters
+        expr = "".join(ch for ch in s if ch in "0123456789.+-*/%^()xX ")
+        expr = re.sub(r"\s+", "", expr)
+        # Require at least one operator
+        if re.search(r"[\+\-\*\/\^\%\)]", expr):
+            val = _safe_eval_expr(expr)
+            if val is not None:
+                if abs(val - round(val)) < 1e-12:
+                    return f"{int(round(val))}"
+                return f"{val}"
+    return None
+
+def _looks_like_math_intent(txt: str) -> bool:
+    if not isinstance(txt, str):
+        return False
+    s = txt.strip()
+    low = s.lower()
+    # explicit triggers or contains digits with at least one operator/symbol
+    if any(w in low for w in _MATH_TRIGGER_WORDS):
+        return True
+    if re.search(r"\d", s) and re.search(r"[\+\-\*\/\^\%\(\)xX]", s):
+        return True
+    # simple fraction or decimal patterns
+    if re.fullmatch(r"\d+(\.\d+)?\s*/\s*\d+(\.\d+)?", s):
+        return True
+    return False
 
 
 def _extract_event_time(payload: Dict[str, Any]) -> Optional[datetime]:
@@ -898,7 +1015,7 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
 
     text_msg = _extract_text_from_payload(payload) or ""
 
-    # Simple greeting and addition handlers (single concise replies)
+    # Simple greeting and math handlers (single concise replies)
     if text_msg:
         try:
             low_txt = text_msg.strip().lower()
@@ -910,27 +1027,30 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
                     await client.send_message(chat_id=sender, message="Hello! How can I help you today?")
                 return {"ok": True, "job_id": None}
 
-            # Addition intent: match patterns like "2+2" or "add 2 and 2"
-            add_match = re.match(r"^\s*(\d+)\s*\+\s*(\d+)\s*$", text_msg.strip())
-            if add_match:
-                a = int(add_match.group(1))
-                b = int(add_match.group(2))
+            # General math detection and answer (covers 2+2, 7*(3+4), 3^2, etc.)
+            math_ans = _maybe_answer_math_text(text_msg)
+            if math_ans is not None:
                 if _is_sender_allowed(sender, db) and sender != "unknown":
-                    await client.send_message(chat_id=sender, message=f"{a}+{b} equals {a+b}.")
+                    await client.send_message(chat_id=sender, message=math_ans)
                 return {"ok": True, "job_id": None}
-
-            add_words = re.match(r"^\s*(addition|add)\b[^\d]*(\d+)[^\d]+(\d+)\s*$", low_txt)
-            if add_words:
-                a = int(add_words.group(2))
-                b = int(add_words.group(3))
-                if _is_sender_allowed(sender, db) and sender != "unknown":
-                    await client.send_message(chat_id=sender, message=f"{a}+{b} equals {a+b}.")
-                return {"ok": True, "job_id": None}
+            # If it looks like a math question but local engine couldn't compute, fall back to Gemini immediately.
+            if _looks_like_math_intent(text_msg) and GeminiResponder is not None:
+                try:
+                    responder = GeminiResponder()
+                    # Calculator-style prompt: force numeric result only
+                    calc_prompt = "You are a calculator. Compute the expression and return ONLY the final numeric result."
+                    reply = await asyncio.to_thread(responder.generate, text_msg, calc_prompt)
+                    if _is_sender_allowed(sender, db) and sender != "unknown":
+                        await client.send_message(chat_id=sender, message=reply.strip())
+                    return {"ok": True, "job_id": None}
+                except Exception:
+                    # If Gemini fails here, continue to other handlers; final fallback will try Gemini again.
+                    pass
 
             # If user just says "addition" without numbers, guide them once
             if low_txt.strip() in {"addition", "add"}:
                 if _is_sender_allowed(sender, db) and sender != "unknown":
-                    await client.send_message(chat_id=sender, message="Send two numbers like 2+2.")
+                    await client.send_message(chat_id=sender, message="Send a calculation like 2+2 or 7*(3+4).")
                 return {"ok": True, "job_id": None}
         except Exception:
             # fall through to other handlers
