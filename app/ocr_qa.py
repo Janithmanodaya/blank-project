@@ -27,6 +27,21 @@ class ChatState:
         # gemini uploaded handles per chat_id per session_id
         self.gemini_files: Dict[str, Dict[str, List[object]]] = {}
         self.pending_ytdl: Dict[str, Optional[str]] = {}
+        # rolling Q&A history (last 20) per chat_id per session_id - IN-MEMORY ONLY
+        # each item: {"ts": float, "q": str, "a": str, "corr": Optional[str]}
+        self.history: Dict[str, Dict[str, List[Dict[str, Optional[str]]]]] = {}
+
+    def get_recent_history(self, chat_id: str, session_id: str, limit: int = 20) -> List[Dict[str, Optional[str]]]:
+        items = list((self.history.get(chat_id, {})).get(session_id, []) or [])
+        return items[-limit:]
+
+    def append_history(self, chat_id: str, session_id: str, question: str, answer: str, correction: Optional[str]):
+        chat_hist = self.history.setdefault(chat_id, {})
+        items = chat_hist.setdefault(session_id, [])
+        items.append({"ts": time.time(), "q": question, "a": answer, "corr": correction})
+        # keep only last 20
+        if len(items) > 20:
+            del items[:-20]
 
     def create_session(self, chat_id: str, session_id: str, paths: List[Path]):
         sess = Session(id=session_id, files=list(paths), created_at=time.time())
@@ -68,6 +83,11 @@ class ChatState:
             self.gemini_files.get(chat_id, {}).pop(session_id, None)
         except Exception:
             pass
+        # clear in-memory history
+        try:
+            self.history.get(chat_id, {}).pop(session_id, None)
+        except Exception:
+            pass
         # adjust active if needed
         if self.active.get(chat_id) == session_id:
             self.active.pop(chat_id, None)
@@ -78,6 +98,7 @@ class ChatState:
         self.sessions.pop(chat_id, None)
         self.gemini_files.pop(chat_id, None)
         self.pending_ytdl.pop(chat_id, None)
+        self.history.pop(chat_id, None)
 
     def purge_old(self, storage: Storage, max_age_seconds: int = 24 * 3600):
         now = time.time()
@@ -163,6 +184,65 @@ class GeminiFileQA:
             return text.strip() or "I couldn't extract an answer from the provided files."
         except Exception as e:
             return f"Error while answering: {e}"
+
+    def answer_with_correction(
+        self,
+        chat_id: str,
+        question: str,
+        system_prompt: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> Tuple[str, Optional[str]]:
+        """
+        Returns a tuple: (answer_from_files, corrected_answer_or_None).
+
+        - The first answer is STRICTLY from the provided files (same as answer()).
+        - The second answer, if present, is a concise corrected/verified answer based on model knowledge.
+          If the model believes the file-derived answer is fully correct, None is returned.
+        """
+        # First, get the strict/file-based answer.
+        file_only_answer = self.answer(chat_id, question, system_prompt, session_id)
+
+        # If the first step failed in a clear way, do not attempt correction.
+        if file_only_answer.startswith("Error while answering") or "can't find that file" in file_only_answer or "Couldn't read the file" in file_only_answer:
+            return file_only_answer, None
+
+        # Now ask the model to verify and, if needed, provide a corrected answer.
+        try:
+            verify_instructions = (
+                "You will be given a user question and an answer derived strictly from the user's files. "
+                "Act as a careful reviewer with general world knowledge. "
+                "1) If the file-derived answer is fully correct, reply with EXACT_OK and nothing else. "
+                "2) If the answer appears incomplete, incorrect, unsafe, or outdated, provide a short, corrected answer. "
+                "Keep the corrected answer concise and clear in the user's language. Do not include references."
+            )
+            parts: List[object] = [{"text": verify_instructions}]
+            parts.append({"text": f"User question: {question}"})
+            parts.append({"text": f"Answer from files: {file_only_answer}"})
+            resp = self.model.generate_content(parts)
+            corr = ""
+            try:
+                corr = (resp.text or "").strip()
+            except Exception:
+                corr = ""
+            if not corr or corr.upper().startswith("EXACT_OK"):
+                corr_opt: Optional[str] = None
+            else:
+                corr_opt = corr
+
+            # Save to rolling history (last 20)
+            try:
+                state.append_history(chat_id, state.get_session(chat_id, session_id).id if state.get_session(chat_id, session_id) else "unknown", question, file_only_answer, corr_opt)
+            except Exception:
+                pass
+
+            return file_only_answer, corr_opt
+        except Exception:
+            # If verification fails, just return the file-only answer.
+            try:
+                state.append_history(chat_id, state.get_session(chat_id, session_id).id if state.get_session(chat_id, session_id) else "unknown", question, file_only_answer, None)
+            except Exception:
+                pass
+            return file_only_answer, None
 
 
 # Broader YouTube URL matcher: supports watch, youtu.be, shorts, and mobile links with extra params

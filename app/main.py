@@ -1514,9 +1514,13 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
                     "GEMINI_SYSTEM_PROMPT", "Answer strictly from the provided file(s)."
                 )
                 qa = GeminiFileQA()
-                ans = qa.answer(sender, text_msg, system_prompt)
+                ans, correction = qa.answer_with_correction(sender, text_msg, system_prompt)
                 if _is_sender_allowed(sender, db):
+                    # First send the exact/file-based answer
                     await client.send_message(chat_id=sender, message=ans)
+                    # Then, if the model produced a correction, send it separately
+                    if correction:
+                        await client.send_message(chat_id=sender, message=f"Verified/corrected answer:\n{correction}")
             except Exception as e:
                 if _is_sender_allowed(sender, db):
                     await client.send_message(chat_id=sender, message=f"Error answering from files: {e}")
