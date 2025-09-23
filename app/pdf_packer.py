@@ -308,6 +308,100 @@ class PDFComposer:
         # no special packing
         return [], 0, False, [], False
 
+    def _pack_page_equal_group(self, remaining: List[ImageInfo], margin: int, tol: float = 0.12) -> Tuple[List[Tuple[ImageInfo, Tuple[int,int,int,int]]], int, List[int], bool]:
+        """
+        Detect the largest group of images within `remaining` that are "almost the same size"
+        (per-dimension within tol or uniformly scaled within tol), and pack them into equal-sized
+        cells on a single page.
+
+        - If the best group has size >= 2, we place as many from that group on one page with equal cells.
+        - For n == 2, use LANDSCAPE side-by-side equal halves.
+        - For n >= 3, use PORTRAIT and a near-square grid (cols ~ sqrt(n), rows = ceil(n/cols)).
+        Returns (cells, used_count, used_indices_rel_to_remaining, landscape_page).
+        """
+        n = len(remaining)
+        if n < 2:
+            return [], 0, [], False
+
+        def similar(a: ImageInfo, b: ImageInfo) -> bool:
+            wi, hi = a.width, a.height
+            wj, hj = b.width, b.height
+            # per-dimension tolerance (relative to the larger dimension to be scale-invariant enough)
+            def within(x, y) -> bool:
+                m = max(x, y, 1)
+                return abs(x - y) / m <= tol
+            dim_ok = within(wi, wj) and within(hi, hj)
+            if dim_ok:
+                return True
+            # uniform scale check (both sides scaled by roughly the same factor)
+            rw = wj / max(wi, 1)
+            rh = hj / max(hi, 1)
+            return abs(rw - rh) <= tol and abs(rw - 1.0) <= (1.0 + tol)
+
+        # Build groups by greedy pairwise similarity
+        best_group: List[int] = []
+        for i in range(n):
+            group = [i]
+            for j in range(i + 1, n):
+                if similar(remaining[i], remaining[j]):
+                    group.append(j)
+            if len(group) > len(best_group):
+                best_group = group
+        if len(best_group) < 2:
+            return [], 0, [], False
+
+        # Decide how many to take in one page (cap to 8 to avoid tiny tiles)
+        max_take = min(8, len(best_group))
+        take_indices = best_group[:max_take]
+
+        gutter = max(self._mm_to_px(GUTTER_MM), 8)
+        x0, y0 = margin, margin
+
+        cells: List[Tuple[ImageInfo, Tuple[int,int,int,int]]] = []
+
+        if len(take_indices) == 2:
+            # Portrait vertical stack (two equal-height cells, full width)
+            page_w = self.A4_W - 2 * margin
+            page_h = self.A4_H - 2 * margin
+            cell_h = (page_h - gutter) // 2
+            top = (x0, y0 + cell_h + gutter, page_w, cell_h)
+            bottom = (x0, y0, page_w, cell_h)
+            cells = [
+                (remaining[take_indices[0]], top),
+                (remaining[take_indices[1]], bottom),
+            ]
+            return cells, 2, take_indices, False
+
+        # Portrait grid for 3..8 items
+        page_w = self.A4_W - 2 * margin
+        page_h = self.A4_H - 2 * margin
+
+        # Choose near-square grid
+        k = len(take_indices)
+        cols = max(1, int(math.ceil(math.sqrt(k))))
+        rows = int(math.ceil(k / cols))
+        # Re-balance if very elongated
+        while (cols - 1) * rows >= k and cols > rows:
+            cols -= 1
+
+        cell_w = (page_w - gutter * (cols - 1)) // max(cols, 1)
+        cell_h = (page_h - gutter * (rows - 1)) // max(rows, 1)
+
+        # Build cells top to bottom
+        idx = 0
+        for r in range(rows):
+            for c_ in range(cols):
+                if idx >= k:
+                    break
+                x = x0 + c_ * (cell_w + gutter)
+                # place from top row downward: convert to bottom-left origin
+                y = y0 + (rows - 1 - r) * (cell_h + gutter)
+                info = remaining[take_indices[idx]]
+                cells.append((info, (x, y, cell_w, cell_h)))
+                idx += 1
+
+        return cells, len(take_indices), take_indices, False
+
     def compose(self, job: Dict, image_files: List[Path]) -> PDFComposeResult:
         if not image_files:
             raise ValueError("No images to compose")
@@ -446,58 +540,194 @@ class PDFComposer:
                 meta_path.write_text(__import__("json").dumps(meta, indent=2), encoding="utf-8")
                 return PDFComposeResult(pdf_path=pdf_path, meta_path=meta_path)
             else:
-                # General custom mode: use advanced packer capped to N images per (portrait) page for maximal fill
-                i = 0
-                while i < len(infos):
-                    c.setPageSize((self._px_to_pt(self.A4_W), self._px_to_pt(self.A4_H)))  # portrait only
-                    cells, used, allow_upscale, stretch = self._pack_page_advanced(infos[i:], margin, limit=ipp)
-                    page_meta = {"items": [], "orientation": "portrait", "images_per_page": ipp}
-                    for info, (x, y, w, h) in cells:
-                        scale = min(w / info.width, h / info.height)
-                        if not allow_upscale:
-                            scale = min(scale, 1.0)
-                        rw, rh = int(info.width * scale), int(info.height * scale)
-                        ox = int(x + (w - rw) // 2)
-                        oy = int(y + (h - rh) // 2)
-                        canvas_draw_path = str(info.path)
-                        c.drawImage(
-                            canvas_draw_path,
-                            self._px_to_pt(ox), self._px_to_pt(oy),
-                            width=self._px_to_pt(rw), height=self._px_to_pt(rh),
-                            preserveAspectRatio=True, anchor='c'
-                        )
-                        page_meta["items"].append({
-                            "file": str(info.path),
-                            "orig": [info.width, info.height],
-                            "placed": [ox, oy, rw, rh],
-                            "cls": info.cls,
-                        })
-                    border_inset_px = self._mm_to_px(5.0)
-                    border_inset = self._px_to_pt(border_inset_px)
-                    c.setLineWidth(1)
-                    pw, ph = c._pagesize
-                    c.rect(border_inset, border_inset, pw - 2 * border_inset, ph - 2 * border_inset, stroke=1, fill=0)
-                    packing_decisions.append(page_meta)
-                    c.showPage()
-                    i += used
+                # Special case: exactly 4 images per page -> 2x2 equal grid (portrait), balanced cells
+                if ipp == 4:
+                    i = 0
+                    gutter = max(self._mm_to_px(GUTTER_MM), 8)
+                    while i &lt; len(infos):
+                        # Portrait A4
+                        c.setPageSize((self._px_to_pt(self.A4_W), self._px_to_pt(self.A4_H)))
+                        page_w = self.A4_W - 2 * margin
+                        page_h = self.A4_H - 2 * margin
+                        x0, y0 = margin, margin
 
-                c.save()
-                meta = {
-                    "sender": job.get("sender"),
-                    "msg_id": job.get("msg_id"),
-                    "dpi": self.dpi,
-                    "page_size_px": [self.A4_W, self.A4_H],
-                    "margin_px": margin,
-                    "files": [str(p.path) for p in infos],
-                    "packing": packing_decisions,
-                    "images_per_page": ipp,
-                }
-                meta_path.write_text(__import__("json").dumps(meta, indent=2), encoding="utf-8")
-                return PDFComposeResult(pdf_path=pdf_path, meta_path=meta_path)
+                        # 2x2 grid with equal cells, single gutter between columns and rows
+                        cell_w = (page_w - gutter) // 2
+                        cell_h = (page_h - gutter) // 2
+
+                        cells = [
+                            (x0, y0 + cell_h + gutter, cell_w, cell_h),                       # top-left
+                            (x0 + cell_w + gutter, y0 + cell_h + gutter, cell_w, cell_h),     # top-right
+                            (x0, y0, cell_w, cell_h),                                        # bottom-left
+                            (x0 + cell_w + gutter, y0, cell_w, cell_h),                      # bottom-right
+                        ]
+
+                        page_meta = {"items": [], "orientation": "portrait", "images_per_page": 4}
+
+                        for ci in range(4):
+                            if i + ci &gt;= len(infos):
+                                break
+                            info = infos[i + ci]
+                            x, y, w, h = cells[ci]
+
+                            # Align image orientation with cell for maximal equal fill; rotate if better
+                            img_path = str(info.path)
+                            iw, ih = info.width, info.height
+                            if self._should_rotate_for_cell(iw, ih, w, h):
+                                try:
+                                    rot_path = self._rotate_image_tmp(info.path)
+                                    img_path = str(rot_path)
+                                    iw, ih = ih, iw
+                                except Exception:
+                                    img_path = str(info.path)
+                                    iw, ih = info.width, info.height
+
+                            # Scale to fit inside the equal cell (no upscale if not needed)
+                            scale = min(w / max(iw, 1), h / max(ih, 1))
+                            rw, rh = int(iw * scale), int(ih * scale)
+                            ox = int(x + (w - rw) // 2)
+                            oy = int(y + (h - rh) // 2)
+
+                            c.drawImage(
+                                img_path,
+                                self._px_to_pt(ox), self._px_to_pt(oy),
+                                width=self._px_to_pt(rw), height=self._px_to_pt(rh),
+                                preserveAspectRatio=True, anchor='c'
+                            )
+                            page_meta["items"].append({
+                                "file": str(info.path),
+                                "orig": [info.width, info.height],
+                                "placed": [ox, oy, rw, rh],
+                                "cls": info.cls,
+                            })
+
+                        i += 4
+
+                        border_inset_px = self._mm_to_px(5.0)
+                        border_inset = self._px_to_pt(border_inset_px)
+                        c.setLineWidth(1)
+                        pw, ph = c._pagesize
+                        c.rect(border_inset, border_inset, pw - 2 * border_inset, ph - 2 * border_inset, stroke=1, fill=0)
+                        packing_decisions.append(page_meta)
+                        c.showPage()
+
+                    c.save()
+                    meta = {
+                        "sender": job.get("sender"),
+                        "msg_id": job.get("msg_id"),
+                        "dpi": self.dpi,
+                        "page_size_px": [self.A4_W, self.A4_H],
+                        "margin_px": margin,
+                        "files": [str(p.path) for p in infos],
+                        "packing": packing_decisions,
+                        "images_per_page": ipp,
+                    }
+                    meta_path.write_text(__import__("json").dumps(meta, indent=2), encoding="utf-8")
+                    return PDFComposeResult(pdf_path=pdf_path, meta_path=meta_path)
+                else:
+                    # General custom mode: use advanced packer capped to N images per (portrait) page for maximal fill
+                    i = 0
+                    while i &lt; len(infos):
+                        c.setPageSize((self._px_to_pt(self.A4_W), self._px_to_pt(self.A4_H)))  # portrait only
+                        cells, used, allow_upscale, stretch = self._pack_page_advanced(infos[i:], margin, limit=ipp)
+                        page_meta = {"items": [], "orientation": "portrait", "images_per_page": ipp}
+                        for info, (x, y, w, h) in cells:
+                            scale = min(w / info.width, h / info.height)
+                            if not allow_upscale:
+                                scale = min(scale, 1.0)
+                            rw, rh = int(info.width * scale), int(info.height * scale)
+                            ox = int(x + (w - rw) // 2)
+                            oy = int(y + (h - rh) // 2)
+                            canvas_draw_path = str(info.path)
+                            c.drawImage(
+                                canvas_draw_path,
+                                self._px_to_pt(ox), self._px_to_pt(oy),
+                                width=self._px_to_pt(rw), height=self._px_to_pt(rh),
+                                preserveAspectRatio=True, anchor='c'
+                            )
+                            page_meta["items"].append({
+                                "file": str(info.path),
+                                "orig": [info.width, info.height],
+                                "placed": [ox, oy, rw, rh],
+                                "cls": info.cls,
+                            })
+                        border_inset_px = self._mm_to_px(5.0)
+                        border_inset = self._px_to_pt(border_inset_px)
+                        c.setLineWidth(1)
+                        pw, ph = c._pagesize
+                        c.rect(border_inset, border_inset, pw - 2 * border_inset, ph - 2 * border_inset, stroke=1, fill=0)
+                        packing_decisions.append(page_meta)
+                        c.showPage()
+                        i += used
+
+                    c.save()
+                    meta = {
+                        "sender": job.get("sender"),
+                        "msg_id": job.get("msg_id"),
+                        "dpi": self.dpi,
+                        "page_size_px": [self.A4_W, self.A4_H],
+                        "margin_px": margin,
+                        "files": [str(p.path) for p in infos],
+                        "packing": packing_decisions,
+                        "images_per_page": ipp,
+                    }
+                    meta_path.write_text(__import__("json").dumps(meta, indent=2), encoding="utf-8")
+                    return PDFComposeResult(pdf_path=pdf_path, meta_path=meta_path)
 
         i = 0
         while i < len(infos):
-            # Try A5 rules first. This may select non-consecutive indices; if so, we'll remove them explicitly.
+            # 1) Try to find any group of almost-same-size images and place them in equal cells
+            group_cells, group_used, group_indices, group_landscape = self._pack_page_equal_group(infos[i:], margin)
+            if group_used > 0:
+                # Set page size based on orientation
+                if group_landscape:
+                    c.setPageSize((self._px_to_pt(self.A4_H), self._px_to_pt(self.A4_W)))
+                else:
+                    c.setPageSize((self._px_to_pt(self.A4_W), self._px_to_pt(self.A4_H)))
+
+                page_meta = {"items": [], "orientation": "landscape" if group_landscape else "portrait", "mode": "equal_group"}
+                for info, (x, y, w, h) in group_cells:
+                    img_path = str(info.path)
+                    iw, ih = info.width, info.height
+                    # Rotate if it produces better fit inside equal cell
+                    if self._should_rotate_for_cell(iw, ih, w, h):
+                        try:
+                            rot_path = self._rotate_image_tmp(info.path)
+                            img_path = str(rot_path)
+                            iw, ih = ih, iw
+                        except Exception:
+                            img_path = str(info.path)
+                            iw, ih = info.width, info.height
+                    scale = min(w / max(iw, 1), h / max(ih, 1))
+                    rw, rh = int(iw * scale), int(ih * scale)
+                    ox = int(x + (w - rw) // 2)
+                    oy = int(y + (h - rh) // 2)
+                    c.drawImage(
+                        img_path,
+                        self._px_to_pt(ox), self._px_to_pt(oy),
+                        width=self._px_to_pt(rw), height=self._px_to_pt(rh),
+                        preserveAspectRatio=True, anchor='c'
+                    )
+                    page_meta["items"].append({
+                        "file": str(info.path),
+                        "orig": [info.width, info.height],
+                        "placed": [ox, oy, rw, rh],
+                        "cls": info.cls,
+                    })
+                border_inset_px = self._mm_to_px(5.0)
+                border_inset = self._px_to_pt(border_inset_px)
+                c.setLineWidth(1)
+                pw, ph = c._pagesize
+                c.rect(border_inset, border_inset, pw - 2 * border_inset, ph - 2 * border_inset, stroke=1, fill=0)
+                packing_decisions.append(page_meta)
+                c.showPage()
+
+                # Remove used indices relative to current head (i)
+                for rel_idx in sorted(group_indices, reverse=True):
+                    infos.pop(i + rel_idx)
+                continue
+
+            # 2) Try A5-specific rules next
             special = self._pack_page_a5(infos[i:], margin)
             if special[1] > 0:
                 # Unpack extended tuple with landscape flag
@@ -557,41 +787,41 @@ class PDFComposer:
                         infos.pop(i + rel_idx)
                 # Do not advance i; the next item shifts into position i
                 continue
-            else:
-                # Fallback to advanced packer which always consumes from the head
-                # Ensure portrait page for advanced packer
-                c.setPageSize((self._px_to_pt(self.A4_W), self._px_to_pt(self.A4_H)))
-                cells, used, allow_upscale, stretch = self._pack_page_advanced(infos[i:], margin)
 
-                # draw page with cells
-                page_meta = {"items": [], "orientation": "portrait"}
-                for info, (x, y, w, h) in cells:
-                    scale = min(w / info.width, h / info.height)
-                    if not allow_upscale:
-                        scale = min(scale, 1.0)
-                    rw, rh = int(info.width * scale), int(info.height * scale)
-                    ox = int(x + (w - rw) // 2)
-                    oy = int(y + (h - rh) // 2)
-                    c.drawImage(
-                        str(info.path),
-                        self._px_to_pt(ox), self._px_to_pt(oy),
-                        width=self._px_to_pt(rw), height=self._px_to_pt(rh),
-                        preserveAspectRatio=True, anchor='c'
-                    )
-                    page_meta["items"].append({
-                        "file": str(info.path),
-                        "orig": [info.width, info.height],
-                        "placed": [ox, oy, rw, rh],
-                        "cls": info.cls,
-                    })
-                border_inset_px = self._mm_to_px(5.0)
-                border_inset = self._px_to_pt(border_inset_px)
-                c.setLineWidth(1)
-                pw, ph = c._pagesize
-                c.rect(border_inset, border_inset, pw - 2 * border_inset, ph - 2 * border_inset, stroke=1, fill=0)
-                packing_decisions.append(page_meta)
-                c.showPage()
-                i += used
+            # 3) Fallback to advanced packer which always consumes from the head
+            # Ensure portrait page for advanced packer
+            c.setPageSize((self._px_to_pt(self.A4_W), self._px_to_pt(self.A4_H)))
+            cells, used, allow_upscale, stretch = self._pack_page_advanced(infos[i:], margin)
+
+            # draw page with cells
+            page_meta = {"items": [], "orientation": "portrait"}
+            for info, (x, y, w, h) in cells:
+                scale = min(w / info.width, h / info.height)
+                if not allow_upscale:
+                    scale = min(scale, 1.0)
+                rw, rh = int(info.width * scale), int(info.height * scale)
+                ox = int(x + (w - rw) // 2)
+                oy = int(y + (h - rh) // 2)
+                c.drawImage(
+                    str(info.path),
+                    self._px_to_pt(ox), self._px_to_pt(oy),
+                    width=self._px_to_pt(rw), height=self._px_to_pt(rh),
+                    preserveAspectRatio=True, anchor='c'
+                )
+                page_meta["items"].append({
+                    "file": str(info.path),
+                    "orig": [info.width, info.height],
+                    "placed": [ox, oy, rw, rh],
+                    "cls": info.cls,
+                })
+            border_inset_px = self._mm_to_px(5.0)
+            border_inset = self._px_to_pt(border_inset_px)
+            c.setLineWidth(1)
+            pw, ph = c._pagesize
+            c.rect(border_inset, border_inset, pw - 2 * border_inset, ph - 2 * border_inset, stroke=1, fill=0)
+            packing_decisions.append(page_meta)
+            c.showPage()
+            i += used
 
         c.save()
 
