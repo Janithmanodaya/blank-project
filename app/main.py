@@ -1245,30 +1245,31 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
             else:
                 converted.append(p)
 
-        # Only keep PDFs for Q&A mode per new requirement
-        pdf_files = [p for p in converted if p.suffix.lower() == ".pdf"]
+        # Keep files Gemini can read for Q&A: PDFs, images, audio, presentations, Word docs, and text
+        valid_ext = {
+            ".pdf",
+            ".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp",
+            ".mp3", ".wav", ".m4a", ".ogg", ".oga", ".webm",
+            ".ppt", ".pptx",
+            ".doc", ".docx",
+            ".txt"
+        }
+        valid_files = [p for p in converted if p.suffix.lower() in valid_ext]
         from .ocr_qa import state as _state
         # Create a new session id from msg_id (short)
         session_id = str(msg_id)[-8:]
-        if pdf_files:
-            _state.create_session(sender, session_id, pdf_files)
+        if valid_files:
+            _state.create_session(sender, session_id, valid_files)
             if _is_sender_allowed(sender, db):
                 await client.send_message(
                     chat_id=sender,
-                    message=f"Received {len(pdf_files)} PDF file(s). Saved as session {session_id}. Ask questions about this PDF. You can switch with 'use {session_id}', list sessions with 'list', delete with 'delete {session_id}', or send 'Stop' to end and delete.",
+                    message=f"Received {len(valid_files)} file(s). Saved as session {session_id}. Ask questions about this file. You can switch with 'use {session_id}', list sessions with 'list', delete with 'delete {session_id}', or send 'Stop' to end and delete.",
                 )
-            # Clean up any non-PDFs we downloaded/converted
-            try:
-                for p in converted:
-                    if p not in pdf_files:
-                        p.unlink(missing_ok=True)
-            except Exception:
-                pass
         else:
-            # Delete any downloaded non-PDF files; inform user PDFs are required
+            # Delete any downloaded non-usable files
             storage.delete_files(converted)
             if _is_sender_allowed(sender, db):
-                await client.send_message(chat_id=sender, message="Please send a PDF. I only answer questions based on PDFs you send.")
+                await client.send_message(chat_id=sender, message="I couldn't read the file(s) you sent. Please send PDFs, presentations, Word documents, text, images, or audio.")
         return {"ok": True, "job_id": job_id}
 
     # If text and we are in QA mode for this chat
@@ -1302,25 +1303,21 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
             if _is_sender_allowed(sender, db):
                 await client.send_message(chat_id=sender, message=f"Deleted session {sid}.")
             return {"ok": True, "job_id": None}
-        # If we have any sessions with a PDF, answer from the active PDF session; otherwise fall back to Gemini
+        # If we have any sessions, answer from the active session (PDF, presentation, doc, text, image, or audio)
         sessions = _state.list_sessions(sender)
         if sessions:
-            active = _state.get_session(sender, None)
-            has_pdf = bool(active and any(p.suffix.lower() == ".pdf" for p in (active.files if active else [])))
-            if has_pdf:
-                try:
-                    system_prompt = db.get_setting("auto_reply_system_prompt", "") or os.getenv(
-                        "GEMINI_SYSTEM_PROMPT", "Answer strictly from the provided PDF file(s)."
-                    )
-                    qa = GeminiFileQA()
-                    ans = qa.answer(sender, text_msg, system_prompt)
-                    if _is_sender_allowed(sender, db):
-                        await client.send_message(chat_id=sender, message=ans)
-                except Exception as e:
-                    if _is_sender_allowed(sender, db):
-                        await client.send_message(chat_id=sender, message=f"Error answering from PDF: {e}")
-                return {"ok": True, "job_id": None}
-            # If sessions exist but none have a PDF, do not answer from files; fall through to Gemini response below
+            try:
+                system_prompt = db.get_setting("auto_reply_system_prompt", "") or os.getenv(
+                    "GEMINI_SYSTEM_PROMPT", "Answer strictly from the provided file(s)."
+                )
+                qa = GeminiFileQA()
+                ans = qa.answer(sender, text_msg, system_prompt)
+                if _is_sender_allowed(sender, db):
+                    await client.send_message(chat_id=sender, message=ans)
+            except Exception as e:
+                if _is_sender_allowed(sender, db):
+                    await client.send_message(chat_id=sender, message=f"Error answering from files: {e}")
+            return {"ok": True, "job_id": None}
 
     # If no media and not QA/text special, create a job just to track non-media message; complete immediately
     job_id = db.create_job(sender=sender, msg_id=str(msg_id), payload=payload, instance_id=str(instance_id))
