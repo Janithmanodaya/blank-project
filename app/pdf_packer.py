@@ -446,54 +446,139 @@ class PDFComposer:
                 meta_path.write_text(__import__("json").dumps(meta, indent=2), encoding="utf-8")
                 return PDFComposeResult(pdf_path=pdf_path, meta_path=meta_path)
             else:
-                # General custom mode: use advanced packer capped to N images per (portrait) page for maximal fill
-                i = 0
-                while i < len(infos):
-                    c.setPageSize((self._px_to_pt(self.A4_W), self._px_to_pt(self.A4_H)))  # portrait only
-                    cells, used, allow_upscale, stretch = self._pack_page_advanced(infos[i:], margin, limit=ipp)
-                    page_meta = {"items": [], "orientation": "portrait", "images_per_page": ipp}
-                    for info, (x, y, w, h) in cells:
-                        scale = min(w / info.width, h / info.height)
-                        if not allow_upscale:
-                            scale = min(scale, 1.0)
-                        rw, rh = int(info.width * scale), int(info.height * scale)
-                        ox = int(x + (w - rw) // 2)
-                        oy = int(y + (h - rh) // 2)
-                        canvas_draw_path = str(info.path)
-                        c.drawImage(
-                            canvas_draw_path,
-                            self._px_to_pt(ox), self._px_to_pt(oy),
-                            width=self._px_to_pt(rw), height=self._px_to_pt(rh),
-                            preserveAspectRatio=True, anchor='c'
-                        )
-                        page_meta["items"].append({
-                            "file": str(info.path),
-                            "orig": [info.width, info.height],
-                            "placed": [ox, oy, rw, rh],
-                            "cls": info.cls,
-                        })
-                    border_inset_px = self._mm_to_px(5.0)
-                    border_inset = self._px_to_pt(border_inset_px)
-                    c.setLineWidth(1)
-                    pw, ph = c._pagesize
-                    c.rect(border_inset, border_inset, pw - 2 * border_inset, ph - 2 * border_inset, stroke=1, fill=0)
-                    packing_decisions.append(page_meta)
-                    c.showPage()
-                    i += used
+                # Special case: exactly 4 images per page -> 2x2 equal grid (portrait), balanced cells
+                if ipp == 4:
+                    i = 0
+                    gutter = max(self._mm_to_px(GUTTER_MM), 8)
+                    while i &lt; len(infos):
+                        # Portrait A4
+                        c.setPageSize((self._px_to_pt(self.A4_W), self._px_to_pt(self.A4_H)))
+                        page_w = self.A4_W - 2 * margin
+                        page_h = self.A4_H - 2 * margin
+                        x0, y0 = margin, margin
 
-                c.save()
-                meta = {
-                    "sender": job.get("sender"),
-                    "msg_id": job.get("msg_id"),
-                    "dpi": self.dpi,
-                    "page_size_px": [self.A4_W, self.A4_H],
-                    "margin_px": margin,
-                    "files": [str(p.path) for p in infos],
-                    "packing": packing_decisions,
-                    "images_per_page": ipp,
-                }
-                meta_path.write_text(__import__("json").dumps(meta, indent=2), encoding="utf-8")
-                return PDFComposeResult(pdf_path=pdf_path, meta_path=meta_path)
+                        # 2x2 grid with equal cells, single gutter between columns and rows
+                        cell_w = (page_w - gutter) // 2
+                        cell_h = (page_h - gutter) // 2
+
+                        cells = [
+                            (x0, y0 + cell_h + gutter, cell_w, cell_h),                       # top-left
+                            (x0 + cell_w + gutter, y0 + cell_h + gutter, cell_w, cell_h),     # top-right
+                            (x0, y0, cell_w, cell_h),                                        # bottom-left
+                            (x0 + cell_w + gutter, y0, cell_w, cell_h),                      # bottom-right
+                        ]
+
+                        page_meta = {"items": [], "orientation": "portrait", "images_per_page": 4}
+
+                        for ci in range(4):
+                            if i + ci &gt;= len(infos):
+                                break
+                            info = infos[i + ci]
+                            x, y, w, h = cells[ci]
+
+                            # Align image orientation with cell for maximal equal fill; rotate if better
+                            img_path = str(info.path)
+                            iw, ih = info.width, info.height
+                            if self._should_rotate_for_cell(iw, ih, w, h):
+                                try:
+                                    rot_path = self._rotate_image_tmp(info.path)
+                                    img_path = str(rot_path)
+                                    iw, ih = ih, iw
+                                except Exception:
+                                    img_path = str(info.path)
+                                    iw, ih = info.width, info.height
+
+                            # Scale to fit inside the equal cell (no upscale if not needed)
+                            scale = min(w / max(iw, 1), h / max(ih, 1))
+                            rw, rh = int(iw * scale), int(ih * scale)
+                            ox = int(x + (w - rw) // 2)
+                            oy = int(y + (h - rh) // 2)
+
+                            c.drawImage(
+                                img_path,
+                                self._px_to_pt(ox), self._px_to_pt(oy),
+                                width=self._px_to_pt(rw), height=self._px_to_pt(rh),
+                                preserveAspectRatio=True, anchor='c'
+                            )
+                            page_meta["items"].append({
+                                "file": str(info.path),
+                                "orig": [info.width, info.height],
+                                "placed": [ox, oy, rw, rh],
+                                "cls": info.cls,
+                            })
+
+                        i += 4
+
+                        border_inset_px = self._mm_to_px(5.0)
+                        border_inset = self._px_to_pt(border_inset_px)
+                        c.setLineWidth(1)
+                        pw, ph = c._pagesize
+                        c.rect(border_inset, border_inset, pw - 2 * border_inset, ph - 2 * border_inset, stroke=1, fill=0)
+                        packing_decisions.append(page_meta)
+                        c.showPage()
+
+                    c.save()
+                    meta = {
+                        "sender": job.get("sender"),
+                        "msg_id": job.get("msg_id"),
+                        "dpi": self.dpi,
+                        "page_size_px": [self.A4_W, self.A4_H],
+                        "margin_px": margin,
+                        "files": [str(p.path) for p in infos],
+                        "packing": packing_decisions,
+                        "images_per_page": ipp,
+                    }
+                    meta_path.write_text(__import__("json").dumps(meta, indent=2), encoding="utf-8")
+                    return PDFComposeResult(pdf_path=pdf_path, meta_path=meta_path)
+                else:
+                    # General custom mode: use advanced packer capped to N images per (portrait) page for maximal fill
+                    i = 0
+                    while i &lt; len(infos):
+                        c.setPageSize((self._px_to_pt(self.A4_W), self._px_to_pt(self.A4_H)))  # portrait only
+                        cells, used, allow_upscale, stretch = self._pack_page_advanced(infos[i:], margin, limit=ipp)
+                        page_meta = {"items": [], "orientation": "portrait", "images_per_page": ipp}
+                        for info, (x, y, w, h) in cells:
+                            scale = min(w / info.width, h / info.height)
+                            if not allow_upscale:
+                                scale = min(scale, 1.0)
+                            rw, rh = int(info.width * scale), int(info.height * scale)
+                            ox = int(x + (w - rw) // 2)
+                            oy = int(y + (h - rh) // 2)
+                            canvas_draw_path = str(info.path)
+                            c.drawImage(
+                                canvas_draw_path,
+                                self._px_to_pt(ox), self._px_to_pt(oy),
+                                width=self._px_to_pt(rw), height=self._px_to_pt(rh),
+                                preserveAspectRatio=True, anchor='c'
+                            )
+                            page_meta["items"].append({
+                                "file": str(info.path),
+                                "orig": [info.width, info.height],
+                                "placed": [ox, oy, rw, rh],
+                                "cls": info.cls,
+                            })
+                        border_inset_px = self._mm_to_px(5.0)
+                        border_inset = self._px_to_pt(border_inset_px)
+                        c.setLineWidth(1)
+                        pw, ph = c._pagesize
+                        c.rect(border_inset, border_inset, pw - 2 * border_inset, ph - 2 * border_inset, stroke=1, fill=0)
+                        packing_decisions.append(page_meta)
+                        c.showPage()
+                        i += used
+
+                    c.save()
+                    meta = {
+                        "sender": job.get("sender"),
+                        "msg_id": job.get("msg_id"),
+                        "dpi": self.dpi,
+                        "page_size_px": [self.A4_W, self.A4_H],
+                        "margin_px": margin,
+                        "files": [str(p.path) for p in infos],
+                        "packing": packing_decisions,
+                        "images_per_page": ipp,
+                    }
+                    meta_path.write_text(__import__("json").dumps(meta, indent=2), encoding="utf-8")
+                    return PDFComposeResult(pdf_path=pdf_path, meta_path=meta_path)
 
         i = 0
         while i < len(infos):
