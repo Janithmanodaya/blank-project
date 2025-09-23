@@ -1245,24 +1245,30 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
             else:
                 converted.append(p)
 
-        # Filter to files Gemini can read (images, pdf, audio)
-        valid_ext = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp", ".mp3", ".wav", ".m4a", ".ogg", ".oga", ".webm"}
-        valid_files = [p for p in converted if p.suffix.lower() in valid_ext]
+        # Only keep PDFs for Q&A mode per new requirement
+        pdf_files = [p for p in converted if p.suffix.lower() == ".pdf"]
         from .ocr_qa import state as _state
         # Create a new session id from msg_id (short)
         session_id = str(msg_id)[-8:]
-        if valid_files:
-            _state.create_session(sender, session_id, valid_files)
+        if pdf_files:
+            _state.create_session(sender, session_id, pdf_files)
             if _is_sender_allowed(sender, db):
                 await client.send_message(
                     chat_id=sender,
-                    message=f"Received {len(valid_files)} file(s). Saved as session {session_id}. Ask questions about this file. You can switch with 'use {session_id}', list sessions with 'list', delete with 'delete {session_id}', or send 'Stop' to end and delete.",
+                    message=f"Received {len(pdf_files)} PDF file(s). Saved as session {session_id}. Ask questions about this PDF. You can switch with 'use {session_id}', list sessions with 'list', delete with 'delete {session_id}', or send 'Stop' to end and delete.",
                 )
+            # Clean up any non-PDFs we downloaded/converted
+            try:
+                for p in converted:
+                    if p not in pdf_files:
+                        p.unlink(missing_ok=True)
+            except Exception:
+                pass
         else:
-            # Delete any downloaded non-usable files
+            # Delete any downloaded non-PDF files; inform user PDFs are required
             storage.delete_files(converted)
             if _is_sender_allowed(sender, db):
-                await client.send_message(chat_id=sender, message="I couldn't read the file(s) you sent. Please send images, audio, or PDFs.")
+                await client.send_message(chat_id=sender, message="Please send a PDF. I only answer questions based on PDFs you send.")
         return {"ok": True, "job_id": job_id}
 
     # If text and we are in QA mode for this chat
@@ -1296,36 +1302,41 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
             if _is_sender_allowed(sender, db):
                 await client.send_message(chat_id=sender, message=f"Deleted session {sid}.")
             return {"ok": True, "job_id": None}
-        # If we have any sessions, answer from active one
-        if _state.list_sessions(sender):
-            try:
-                system_prompt = db.get_setting("auto_reply_system_prompt", "") or os.getenv(
-                    "GEMINI_SYSTEM_PROMPT", "Answer strictly from the provided file(s)."
-                )
-                qa = GeminiFileQA()
-                ans = qa.answer(sender, text_msg, system_prompt)
-                if _is_sender_allowed(sender, db):
-                    await client.send_message(chat_id=sender, message=ans)
-            except Exception as e:
-                if _is_sender_allowed(sender, db):
-                    await client.send_message(chat_id=sender, message=f"Error answering from files: {e}")
-            return {"ok": True, "job_id": None}
+        # If we have any sessions with a PDF, answer from the active PDF session; otherwise fall back to Gemini
+        sessions = _state.list_sessions(sender)
+        if sessions:
+            active = _state.get_session(sender, None)
+            has_pdf = bool(active and any(p.suffix.lower() == ".pdf" for p in (active.files if active else [])))
+            if has_pdf:
+                try:
+                    system_prompt = db.get_setting("auto_reply_system_prompt", "") or os.getenv(
+                        "GEMINI_SYSTEM_PROMPT", "Answer strictly from the provided PDF file(s)."
+                    )
+                    qa = GeminiFileQA()
+                    ans = qa.answer(sender, text_msg, system_prompt)
+                    if _is_sender_allowed(sender, db):
+                        await client.send_message(chat_id=sender, message=ans)
+                except Exception as e:
+                    if _is_sender_allowed(sender, db):
+                        await client.send_message(chat_id=sender, message=f"Error answering from PDF: {e}")
+                return {"ok": True, "job_id": None}
+            # If sessions exist but none have a PDF, do not answer from files; fall through to Gemini response below
 
     # If no media and not QA/text special, create a job just to track non-media message; complete immediately
     job_id = db.create_job(sender=sender, msg_id=str(msg_id), payload=payload, instance_id=str(instance_id))
     db.update_job_status(job_id, "COMPLETED")
     json_log("no_media_payload_stored", job_id=job_id)
 
-    # Fallback intent understanding with Gemini when auto-reply is disabled or nothing matched
+    # Always use Gemini for general questions when no PDF session was used above
     if text_msg and GeminiResponder is not None and _is_sender_allowed(sender, db):
-        auto_enabled = (db.get_setting("auto_reply_enabled", "0") or "0") == "1"
-        if not auto_enabled:
-            try:
-                system_prompt = db.get_setting("auto_reply_system_prompt", "") or os.getenv(
-                    "GEMINI_SYSTEM_PROMPT", "You are a helpful assistant. Identify the user's intent and respond concisely."
-                )
-                responder = GeminiResponder()
-                # Offload blocking SDK call to a thread to keep loop responsive
+        try:
+            system_prompt = db.get_setting("auto_reply_system_prompt", "") or os.getenv(
+                "GEMINI_SYSTEM_PROMPT", "You are a helpful assistant. Identify the user's intent and respond concisely."
+            )
+            responder = GeminiResponder()
+            # Offload blocking SDK call to a thread to keep loop responsive
+            reply = await asyncio.to_thread(responder.generate, text_msg, system_prompt)
+            await client.send_message(chat_id=p responsive
                 reply = await asyncio.to_thread(responder.generate, text_msg, system_prompt)
                 await client.send_message(chat_id=sender, message=reply)
                 json_log("fallback_gemini_reply_sent", chat_id=sender)
