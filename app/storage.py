@@ -20,7 +20,6 @@ class Storage:
             self.base / "pdf_meta",
             self.base / "quarantine",
             self.base / "tmp",
-            self.base / "qa_history",
         ]:
             p.mkdir(parents=True, exist_ok=True)
 

@@ -27,53 +27,21 @@ class ChatState:
         # gemini uploaded handles per chat_id per session_id
         self.gemini_files: Dict[str, Dict[str, List[object]]] = {}
         self.pending_ytdl: Dict[str, Optional[str]] = {}
-        # rolling Q&A history (last 20) per chat_id per session_id
+        # rolling Q&A history (last 20) per chat_id per session_id - IN-MEMORY ONLY
         # each item: {"ts": float, "q": str, "a": str, "corr": Optional[str]}
         self.history: Dict[str, Dict[str, List[Dict[str, Optional[str]]]]] = {}
 
-    def _history_path(self, chat_id: str, session_id: str) -> Path:
-        base = Storage().base / "qa_history"
-        base.mkdir(parents=True, exist_ok=True)
-        safe_chat = "".join(c for c in chat_id if c.isalnum() or c in ("@", "_", "-", "."))[:80]
-        safe_sid = "".join(c for c in session_id if c.isalnum() or c in ("@", "_", "-", "."))[:40]
-        return base / f"{safe_chat}__{safe_sid}.json"
-
-    def _load_history_if_needed(self, chat_id: str, session_id: str) -> List[Dict[str, Optional[str]]]:
-        chat_hist = self.history.setdefault(chat_id, {})
-        if session_id in chat_hist:
-            return chat_hist[session_id]
-        # try load from disk
-        p = self._history_path(chat_id, session_id)
-        items: List[Dict[str, Optional[str]]] = []
-        try:
-            if p.exists():
-                import json
-                items = json.loads(p.read_text(encoding="utf-8")) or []
-                # ensure structure
-                if not isinstance(items, list):
-                    items = []
-        except Exception:
-            items = []
-        chat_hist[session_id] = items
-        return items
-
     def get_recent_history(self, chat_id: str, session_id: str, limit: int = 20) -> List[Dict[str, Optional[str]]]:
-        items = list(self._load_history_if_needed(chat_id, session_id))
+        items = list((self.history.get(chat_id, {})).get(session_id, []) or [])
         return items[-limit:]
 
     def append_history(self, chat_id: str, session_id: str, question: str, answer: str, correction: Optional[str]):
-        items = self._load_history_if_needed(chat_id, session_id)
+        chat_hist = self.history.setdefault(chat_id, {})
+        items = chat_hist.setdefault(session_id, [])
         items.append({"ts": time.time(), "q": question, "a": answer, "corr": correction})
         # keep only last 20
         if len(items) > 20:
             del items[:-20]
-        # persist
-        try:
-            import json
-            p = self._history_path(chat_id, session_id)
-            p.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception:
-            pass
 
     def create_session(self, chat_id: str, session_id: str, paths: List[Path]):
         sess = Session(id=session_id, files=list(paths), created_at=time.time())
@@ -115,6 +83,11 @@ class ChatState:
             self.gemini_files.get(chat_id, {}).pop(session_id, None)
         except Exception:
             pass
+        # clear in-memory history
+        try:
+            self.history.get(chat_id, {}).pop(session_id, None)
+        except Exception:
+            pass
         # adjust active if needed
         if self.active.get(chat_id) == session_id:
             self.active.pop(chat_id, None)
@@ -125,6 +98,7 @@ class ChatState:
         self.sessions.pop(chat_id, None)
         self.gemini_files.pop(chat_id, None)
         self.pending_ytdl.pop(chat_id, None)
+        self.history.pop(chat_id, None)
 
     def purge_old(self, storage: Storage, max_age_seconds: int = 24 * 3600):
         now = time.time()
