@@ -100,6 +100,35 @@ Packaging with PyInstaller
   The binary will be at dist/greenapi-relay (or .exe on Windows).
   Run it with the same environment variables as above.
 
+Deploying on Render
+- A render.yaml is included for convenience.
+- The service runs with: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+- A persistent disk is mounted at /opt/render/project/src/storage.
+
+Deploying on Northflank (new)
+- This project now includes a Dockerfile for Northflank deployment.
+- Steps:
+  1) Push this repository to GitHub/GitLab/Bitbucket.
+  2) In Northflank, create a Project → Create Service → choose "Combined" (build & deploy from git).
+  3) Under Build options, select "Dockerfile" and set the path to /Dockerfile.
+  4) Under Networking, add a public HTTP port:
+     - Port: 8080
+     - Protocol: HTTP
+     - Public: enabled
+  5) Under Secrets, create a Secret group for environment variables:
+     - GREEN_API_BASE_URL (optional; default https://api.green-api.com)
+     - GREEN_API_INSTANCE_ID (required)
+     - GREEN_API_API_TOKEN (required)
+     - ADMIN_CHAT_ID (required)
+     - ADMIN_PASSWORD (optional)
+     - GEMINI_API_KEY (required for LLM features)
+     - GEMINI_MODEL (optional)
+     - HOST=0.0.0.0
+     - PORT=8080
+  6) (Optional) Volumes: create a persistent volume and mount it at /app/storage to keep SQLite DB and files across deploys.
+  7) Create Service to build & deploy. After build, use the public URL shown in the Northflank dashboard.
+- Health endpoint: GET /health returns {"ok": true, "version": "..."} for container health checks.
+
 Notes and next steps
 - Webhook validation: add signature/origin checks if provided by Green-API
 - QR/status: expose a panel if using Green-API endpoints to fetch QR/status
