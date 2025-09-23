@@ -502,7 +502,7 @@ async def maybe_auto_reply(payload: Dict[str, Any], db: Database):
         client = GreenAPIClient.from_env()
         responder = GeminiResponder()
         prompt = f"{base_system}\nRespond in one short sentence. Plain text only."
-        reply = await asyncio.to_thread(responder.generate, text, prompt)
+        reply = await asyncio.to_thread(responder.generate, text, prompt, chat_id)
         await client.send_message(chat_id=chat_id, message=reply)
         json_log("auto_reply_sent_single", chat_id=chat_id)
     except Exception as e:
@@ -1048,7 +1048,7 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
                         responder = GeminiResponder()
                         # Calculator-style prompt: force numeric result only
                         calc_prompt = "You are a calculator. Compute the expression and return ONLY the final numeric result."
-                        reply = await asyncio.to_thread(responder.generate, text_msg, calc_prompt)
+                        reply = await asyncio.to_thread(responder.generate, text_msg, calc_prompt,
                         if _is_sender_allowed(sender, db) and sender != "unknown":
                             await client.send_message(chat_id=sender, message=reply.strip())
                         return {"ok": True, "job_id": None}
@@ -1539,7 +1539,7 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
             )
             responder = GeminiResponder()
             # Offload blocking SDK call to a thread to keep loop responsive
-            reply = await asyncio.to_thread(responder.generate, text_msg, system_prompt)
+            reply = await asyncio.to_thread(responder.generate, text_msg, system_prompt, sender)
             await client.send_message(chat_id=sender, message=reply)
             json_log("fallback_gemini_reply_sent", chat_id=sender)
         except Exception as e:

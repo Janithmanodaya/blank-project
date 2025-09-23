@@ -1,9 +1,29 @@
 import os
-from typing import Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import google.generativeai as genai
 
 from .db import Database
+
+
+# In-memory rolling chat history for normal (non-Q&A) mode.
+# Stores the last 20 messages (user/assistant combined) per chat_id.
+_CHAT_HISTORY: Dict[str, List[Dict[str, str]]] = {}
+
+
+def _append_chat_history(chat_id: str, role: str, content: str, limit: int = 20) -> None:
+    if not chat_id:
+        return
+    items = _CHAT_HISTORY.setdefault(chat_id, [])
+    items.append({"role": role, "content": content})
+    if len(items) > limit:
+        del items[:-limit]
+
+
+def _get_chat_history(chat_id: Optional[str], limit: int = 20) -> List[Dict[str, str]]:
+    if not chat_id:
+        return []
+    return (_CHAT_HISTORY.get(chat_id) or [])[-limit:]
 
 
 class GeminiResponder:
@@ -21,13 +41,30 @@ class GeminiResponder:
         genai.configure(api_key=api_key)
         self.model = genai.GenerativeModel(model)
 
-    def generate(self, user_text: str, system_prompt: Optional[str] = None) -> str:
-        # Simple text generation path
-        prompt = ""
+    def generate(self, user_text: str, system_prompt: Optional[str] = None, chat_id: Optional[str] = None) -> str:
+        """
+        Text generation with short-term memory for normal chat mode.
+        If chat_id is provided, we include the last 20 messages (user/assistant) as context and
+        then append this turn to the rolling memory.
+        """
+        # Build parts: system, history turns, current user, and assistant cue
+        parts: List[object] = []
         if system_prompt:
-            prompt += f"{system_prompt.strip()}\\n\\n"
-        prompt += f"User: {user_text.strip()}\\nAssistant:"
-        resp = self.model.generate_content(prompt)
+            parts.append({"text": system_prompt.strip()})
+
+        # Include last N turns as simple "User:" / "Assistant:" text snippets
+        history = _get_chat_history(chat_id, limit=20)
+        for h in history:
+            role = h.get("role", "user")
+            content = h.get("content", "")
+            prefix = "User" if role == "user" else "Assistant"
+            parts.append({"text": f"{prefix}: {content}"})
+
+        # Current user message and assistant cue
+        parts.append({"text": f"User: {user_text.strip()}"})
+        parts.append({"text": "Assistant:"})
+
+        resp = self.model.generate_content(parts)
         text = ""
         try:
             text = resp.text or ""
@@ -36,7 +73,14 @@ class GeminiResponder:
                 text = "".join(p.text for p in resp.candidates[0].content.parts)
             except Exception:
                 text = ""
-        return text.strip() or "Thanks for your message."
+        reply = (text.strip() or "Thanks for your message.")
+
+        # Persist to in-memory history
+        if chat_id:
+            _append_chat_history(chat_id, "user", user_text.strip())
+            _append_chat_history(chat_id, "assistant", reply)
+
+        return reply
 
     def rewrite_search_query(self, user_query: str) -> str:
         """
@@ -45,7 +89,7 @@ class GeminiResponder:
         try:
             prompt = (
                 "Rewrite the following web search query to be concise and specific. "
-                "Include key synonyms and proper nouns if relevant. Return only the improved query.\n\n"
+                "Include key synonyms and proper nouns if relevant. Return only the improved query.\\n\\n"
                 f"Query: {user_query}"
             )
             resp = self.model.generate_content(prompt)
