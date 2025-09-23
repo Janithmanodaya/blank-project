@@ -25,6 +25,9 @@ from .tasks import job_queue, workers
 # Transient store for pending yt-dlp choices per sender
 ytdl_pending: Dict[str, Dict[str, Any]] = {}
 
+# Suppress Gemini replies for a period after a PDF-from-images job completes
+suppress_after_pdf: Dict[str, float] = {}  # chat_id -> unix_ts_until
+
 try:
     from .gemini import GeminiResponder  # optional; only used if enabled
 except Exception:
@@ -228,6 +231,15 @@ async def worker_loop(worker_id: int):
                 except Exception:
                     pass
 
+                # Suppress Gemini replies for a short period after a PDF-from-images job (PDF:N flow)
+                try:
+                    suppress_sec = int(os.getenv("SUPPRESS_GEMINI_AFTER_PDF_SECONDS", "300"))
+                    # If job had 'images_per_page' set from PDF:N, treat as pdf_once job
+                    if (job.get("images_per_page") is not None) and job.get("sender"):
+                        suppress_after_pdf[str(job.get("sender"))] = datetime.utcnow().timestamp() + max(0, suppress_sec)
+                except Exception:
+                    pass
+
                 json_log("job_sent", worker_id=worker_id, job_id=job_id)
             except asyncio.CancelledError:
                 raise
@@ -335,6 +347,17 @@ def _is_sender_allowed(chat_id: Optional[str], db: Database) -> bool:
         return chat_id not in blocks
     return True  # everyone
 
+def _is_suppressed_from_gemini(chat_id: Optional[str]) -> bool:
+    try:
+        if not chat_id:
+            return False
+        until = suppress_after_pdf.get(chat_id)
+        if not until:
+            return False
+        return (datetime.utcnow().timestamp() < until)
+    except Exception:
+        return False
+
 async def maybe_auto_reply(payload: Dict[str, Any], db: Database):
     # settings gate
     enabled = (db.get_setting("auto_reply_enabled", "0") or "0") == "1"
@@ -342,6 +365,8 @@ async def maybe_auto_reply(payload: Dict[str, Any], db: Database):
     if not chat_id:
         return
     if not _is_sender_allowed(chat_id, db):
+        return
+    if _is_suppressed_from_gemini(chat_id):
         return
     text = _extract_text_from_payload(payload)
     if not text:
@@ -1337,8 +1362,8 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
     db.update_job_status(job_id, "COMPLETED")
     json_log("no_media_payload_stored", job_id=job_id)
 
-    # Always use Gemini for general questions when no PDF session was used above
-    if text_msg and GeminiResponder is not None and _is_sender_allowed(sender, db):
+    # Use Gemini for general questions when no document session handled it, unless suppressed after PDF generation
+    if text_msg and GeminiResponder is not None and _is_sender_allowed(sender, db) and not _is_suppressed_from_gemini(sender):
         try:
             system_prompt = db.get_setting("auto_reply_system_prompt", "") or os.getenv(
                 "GEMINI_SYSTEM_PROMPT", "You are a helpful assistant. Identify the user's intent and respond concisely."
@@ -1346,12 +1371,10 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
             responder = GeminiResponder()
             # Offload blocking SDK call to a thread to keep loop responsive
             reply = await asyncio.to_thread(responder.generate, text_msg, system_prompt)
-            await client.send_message(chat_id=p responsive
-                reply = await asyncio.to_thread(responder.generate, text_msg, system_prompt)
-                await client.send_message(chat_id=sender, message=reply)
-                json_log("fallback_gemini_reply_sent", chat_id=sender)
-            except Exception as e:
-                json_log("fallback_gemini_reply_error", error=str(e))
+            await client.send_message(chat_id=sender, message=reply)
+            json_log("fallback_gemini_reply_sent", chat_id=sender)
+        except Exception as e:
+            json_log("fallback_gemini_reply_error", error=str(e))
 
     # Try auto reply (non-blocking) if enabled
     asyncio.create_task(maybe_auto_reply(payload, db))
