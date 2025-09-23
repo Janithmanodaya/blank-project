@@ -1048,7 +1048,7 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
                         responder = GeminiResponder()
                         # Calculator-style prompt: force numeric result only
                         calc_prompt = "You are a calculator. Compute the expression and return ONLY the final numeric result."
-                        reply = await asyncio.to_thread(responder.generate, text_msg, calc_prompt,
+                        reply = await asyncio.to_thread(responder.generate, text_msg, calc_prompt, sender)
                         if _is_sender_allowed(sender, db) and sender != "unknown":
                             await client.send_message(chat_id=sender, message=reply.strip())
                         return {"ok": True, "job_id": None}
