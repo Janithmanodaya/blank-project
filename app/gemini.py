@@ -8,8 +8,7 @@ from .db import Database
 
 class GeminiResponder:
     """
-    Responder for general intents, classification, and non-document answers.
-    Uses a configurable Gemini model; defaults to a valid multimodal/text model.
+    Responder for all intents and features. Always uses Gemini 2.5 Flash-Lite.
     """
     def __init__(self, api_key: Optional[str] = None, model_name: Optional[str] = None):
         db = Database()
@@ -17,14 +16,8 @@ class GeminiResponder:
             api_key = db.get_setting("GEMINI_API_KEY", None) or os.getenv("GEMINI_API_KEY")
         if not api_key:
             raise RuntimeError("GEMINI_API_KEY is not set")
-        # Prefer explicit parameter, then DB/env, then sane default
-        configured = (
-            model_name
-            or db.get_setting("GEMINI_MODEL", None)
-            or os.getenv("GEMINI_MODEL")
-        )
-        # Default to a valid Google Generative AI model
-        model = configured or "gemini-2.5-flash-lite"
+        # Force a single model across the app to avoid duplicate behaviors
+        model = "gemini-2.5-flash-lite"
         genai.configure(api_key=api_key)
         self.model = genai.GenerativeModel(model)
 

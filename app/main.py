@@ -359,7 +359,9 @@ def _is_suppressed_from_gemini(chat_id: Optional[str]) -> bool:
         return False
 
 async def maybe_auto_reply(payload: Dict[str, Any], db: Database):
-    # Auto-reply is always enabled
+    """
+    Send a single concise auto-reply (no duplicates, no secondary variants).
+    """
     chat_id = payload.get("senderData", {}).get("chatId")
     if not chat_id:
         return
@@ -381,30 +383,11 @@ async def maybe_auto_reply(payload: Dict[str, Any], db: Database):
 
     try:
         client = GreenAPIClient.from_env()
-
-        # Primary model: concise plain text
-        responder_primary = GeminiResponder()
-        prompt_plain = f"{base_system}\nRespond in 1–2 sentences. Plain text. No markdown, no numbering."
-        reply_plain = await asyncio.to_thread(responder_primary.generate, text, prompt_plain)
-
-        # Secondary model or formatted variant: bullet points
-        second_model = os.getenv("SECOND_GEMINI_MODEL") or os.getenv("GEMINI_MODEL_2")
-        if second_model:
-            responder_secondary = GeminiResponder(model_name=second_model)
-        else:
-            responder_secondary = responder_primary  # fall back to same model
-
-        prompt_bullets = (
-            "Format the answer as short bullet points with clear actions or key facts only. "
-            "Keep it compact and readable. Use simple markdown dashes (- ...)."
-        )
-        reply_bullets = await asyncio.to_thread(responder_secondary.generate, text, f"{base_system}\n{prompt_bullets}")
-
-        # Send both variants (different format), back-to-back
-        await client.send_message(chat_id=chat_id, message=reply_plain)
-        await client.send_message(chat_id=chat_id, message=reply_bullets)
-
-        json_log("auto_reply_sent_dual", chat_id=chat_id)
+        responder = GeminiResponder()
+        prompt = f"{base_system}\nRespond in one short sentence. Plain text only."
+        reply = await asyncio.to_thread(responder.generate, text, prompt)
+        await client.send_message(chat_id=chat_id, message=reply)
+        json_log("auto_reply_sent_single", chat_id=chat_id)
     except Exception as e:
         json_log("auto_reply_failed", error=str(e))
 
@@ -915,6 +898,44 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
 
     text_msg = _extract_text_from_payload(payload) or ""
 
+    # Simple greeting and addition handlers (single concise replies)
+    if text_msg:
+        try:
+            low_txt = text_msg.strip().lower()
+
+            # Greeting intent
+            greeting_words = {"hi", "hello", "hey", "good morning", "good afternoon", "good evening"}
+            if any(low_txt.startswith(w) or w in low_txt for w in greeting_words):
+                if _is_sender_allowed(sender, db) and sender != "unknown":
+                    await client.send_message(chat_id=sender, message="Hello! How can I help you today?")
+                return {"ok": True, "job_id": None}
+
+            # Addition intent: match patterns like "2+2" or "add 2 and 2"
+            add_match = re.match(r"^\s*(\d+)\s*\+\s*(\d+)\s*$", text_msg.strip())
+            if add_match:
+                a = int(add_match.group(1))
+                b = int(add_match.group(2))
+                if _is_sender_allowed(sender, db) and sender != "unknown":
+                    await client.send_message(chat_id=sender, message=f"{a}+{b} equals {a+b}.")
+                return {"ok": True, "job_id": None}
+
+            add_words = re.match(r"^\s*(addition|add)\b[^\d]*(\d+)[^\d]+(\d+)\s*$", low_txt)
+            if add_words:
+                a = int(add_words.group(2))
+                b = int(add_words.group(3))
+                if _is_sender_allowed(sender, db) and sender != "unknown":
+                    await client.send_message(chat_id=sender, message=f"{a}+{b} equals {a+b}.")
+                return {"ok": True, "job_id": None}
+
+            # If user just says "addition" without numbers, guide them once
+            if low_txt.strip() in {"addition", "add"}:
+                if _is_sender_allowed(sender, db) and sender != "unknown":
+                    await client.send_message(chat_id=sender, message="Send two numbers like 2+2.")
+                return {"ok": True, "job_id": None}
+        except Exception:
+            # fall through to other handlers
+            pass
+
     # One-time PDF packer command: "PDF:N" where N = images per page
     if text_msg:
         m = re.match(r"^\s*pdf\s*:\s*(\d+)\s*$", text_msg, flags=re.IGNORECASE)
@@ -1240,7 +1261,6 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
                 result_job_id = job_id
         # Continue processing any non-image media immediately below
         if not other_media:
-            asyncio.create_task(maybe_auto_reply(payload, db))
             return {"ok": True, "job_id": result_job_id}
 
     # If we have any non-image media OR packer is disabled (process all media immediately)
@@ -1391,9 +1411,6 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
             json_log("fallback_gemini_reply_sent", chat_id=sender)
         except Exception as e:
             json_log("fallback_gemini_reply_error", error=str(e))
-
-    # Try auto reply (non-blocking) if enabled
-    asyncio.create_task(maybe_auto_reply(payload, db))
 
     return {"ok": True, "job_id": job_id}
 
