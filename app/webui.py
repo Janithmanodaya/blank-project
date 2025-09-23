@@ -229,7 +229,7 @@ def ui(db: Database = Depends(get_db), token: Optional[str] = Query(default=None
         return "<span class='badge ok'>Set</span>" if (val and len(val) > 0) else "<span class='badge'>Not set</span>"
 
     gemini_set = status_badge(db.get_setting("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY")))
-    gemini_model = db.get_setting("GEMINI_MODEL", os.getenv("GEMINI_MODEL", "gemini-1.5-flash")) or "gemini-1.5-flash"
+    gemini_model = db.get_setting("GEMINI_MODEL", os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")) or "gemini-2.5-flash-lite"
     green_base = db.get_setting("GREEN_API_BASE_URL", os.getenv("GREEN_API_BASE_URL", "https://api.green-api.com")) or ""
     green_id = db.get_setting("GREEN_API_INSTANCE_ID", os.getenv("GREEN_API_INSTANCE_ID", "")) or ""
     green_token_set = status_badge(db.get_setting("GREEN_API_API_TOKEN", os.getenv("GREEN_API_API_TOKEN")))

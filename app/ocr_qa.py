@@ -112,7 +112,7 @@ class GeminiFileQA:
             or os.getenv("GEMINI_MODEL")
         )
         # Default to a multimodal model suitable for PDFs/images and multilingual (Sinhala) answers
-        model = configured or "gemini-1.5-flash"
+        model = configured or "gemini-2.5-flash-lite"
         genai.configure(api_key=api_key)
         self.model = genai.GenerativeModel(model)
 

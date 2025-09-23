@@ -359,8 +359,8 @@ def _is_suppressed_from_gemini(chat_id: Optional[str]) -> bool:
         return False
 
 async def maybe_auto_reply(payload: Dict[str, Any], db: Database):
-    # settings gate
-    enabled = (db.get_setting("auto_reply_enabled", "0") or "0") == "1"
+    # Auto-reply is always enabled
+    enabled = True
     chat_id = payload.get("senderData", {}).get("chatId")
     if not chat_id:
         return
@@ -379,8 +379,7 @@ async def maybe_auto_reply(payload: Dict[str, Any], db: Database):
     if GeminiResponder is None:
         json_log("auto_reply_error", reason="gemini_module_missing")
         return
-    if not enabled:
-        return
+    # enabled is always True; keep variable for clarity
 
     try:
         responder = GeminiResponder()
