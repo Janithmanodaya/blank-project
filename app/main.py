@@ -1016,45 +1016,54 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
     text_msg = _extract_text_from_payload(payload) or ""
 
     # Simple greeting and math handlers (single concise replies)
+    # IMPORTANT: If the chat has an active document Q&A session, skip math/greeting heuristics
+    # and let the QA block handle the message strictly from the files.
     if text_msg:
         try:
-            low_txt = text_msg.strip().lower()
-
-            # Greeting intent
-            greeting_words = {"hi", "hello", "hey", "good morning", "good afternoon", "good evening"}
-            if any(low_txt.startswith(w) or w in low_txt for w in greeting_words):
-                if _is_sender_allowed(sender, db) and sender != "unknown":
-                    await client.send_message(chat_id=sender, message="Hello! How can I help you today?")
-                return {"ok": True, "job_id": None}
-
-            # General math detection and answer (covers 2+2, 7*(3+4), 3^2, etc.)
-            math_ans = _maybe_answer_math_text(text_msg)
-            if math_ans is not None:
-                if _is_sender_allowed(sender, db) and sender != "unknown":
-                    await client.send_message(chat_id=sender, message=math_ans)
-                return {"ok": True, "job_id": None}
-            # If it looks like a math question but local engine couldn't compute, fall back to Gemini immediately.
-            if _looks_like_math_intent(text_msg) and GeminiResponder is not None:
-                try:
-                    responder = GeminiResponder()
-                    # Calculator-style prompt: force numeric result only
-                    calc_prompt = "You are a calculator. Compute the expression and return ONLY the final numeric result."
-                    reply = await asyncio.to_thread(responder.generate, text_msg, calc_prompt)
-                    if _is_sender_allowed(sender, db) and sender != "unknown":
-                        await client.send_message(chat_id=sender, message=reply.strip())
-                    return {"ok": True, "job_id": None}
-                except Exception:
-                    # If Gemini fails here, continue to other handlers; final fallback will try Gemini again.
-                    pass
-
-            # If user just says "addition" without numbers, guide them once
-            if low_txt.strip() in {"addition", "add"}:
-                if _is_sender_allowed(sender, db) and sender != "unknown":
-                    await client.send_message(chat_id=sender, message="Send a calculation like 2+2 or 7*(3+4).")
-                return {"ok": True, "job_id": None}
+            from .ocr_qa import state as _qa_state_for_gate  # local import to avoid cycles
+            has_active_sessions = bool(_qa_state_for_gate.list_sessions(sender))
         except Exception:
-            # fall through to other handlers
-            pass
+            has_active_sessions = False
+
+        if not has_active_sessions:
+            try:
+                low_txt = text_msg.strip().lower()
+
+                # Greeting intent
+                greeting_words = {"hi", "hello", "hey", "good morning", "good afternoon", "good evening"}
+                if any(low_txt.startswith(w) or w in low_txt for w in greeting_words):
+                    if _is_sender_allowed(sender, db) and sender != "unknown":
+                        await client.send_message(chat_id=sender, message="Hello! How can I help you today?")
+                    return {"ok": True, "job_id": None}
+
+                # General math detection and answer (covers 2+2, 7*(3+4), 3^2, etc.)
+                math_ans = _maybe_answer_math_text(text_msg)
+                if math_ans is not None:
+                    if _is_sender_allowed(sender, db) and sender != "unknown":
+                        await client.send_message(chat_id=sender, message=math_ans)
+                    return {"ok": True, "job_id": None}
+                # If it looks like a math question but local engine couldn't compute, fall back to Gemini immediately.
+                if _looks_like_math_intent(text_msg) and GeminiResponder is not None:
+                    try:
+                        responder = GeminiResponder()
+                        # Calculator-style prompt: force numeric result only
+                        calc_prompt = "You are a calculator. Compute the expression and return ONLY the final numeric result."
+                        reply = await asyncio.to_thread(responder.generate, text_msg, calc_prompt)
+                        if _is_sender_allowed(sender, db) and sender != "unknown":
+                            await client.send_message(chat_id=sender, message=reply.strip())
+                        return {"ok": True, "job_id": None}
+                    except Exception:
+                        # If Gemini fails here, continue to other handlers; final fallback will try Gemini again.
+                        pass
+
+                # If user just says "addition" without numbers, guide them once
+                if low_txt.strip() in {"addition", "add"}:
+                    if _is_sender_allowed(sender, db) and sender != "unknown":
+                        await client.send_message(chat_id=sender, message="Send a calculation like 2+2 or 7*(3+4).")
+                    return {"ok": True, "job_id": None}
+            except Exception:
+                # fall through to other handlers
+                pass
 
     # One-time PDF packer command: "PDF:N" where N = images per page
     if text_msg:
