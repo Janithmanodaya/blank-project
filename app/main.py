@@ -25,6 +25,9 @@ from .tasks import job_queue, workers
 # Transient store for pending yt-dlp choices per sender
 ytdl_pending: Dict[str, Dict[str, Any]] = {}
 
+# Suppress Gemini replies for a period after a PDF-from-images job completes
+suppress_after_pdf: Dict[str, float] = {}  # chat_id -> unix_ts_until
+
 try:
     from .gemini import GeminiResponder  # optional; only used if enabled
 except Exception:
@@ -215,6 +218,28 @@ async def worker_loop(worker_id: int):
                 db.update_job_status(job_id, "SENT")
                 db.append_job_log(job_id, {"send": send_resp, "dest_chat": dest_chat})
 
+                # Immediately delete source images used for this PDF
+                try:
+                    for fp in downloaded_files:
+                        Path(fp).unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+                # Schedule deletion of generated PDF and its metadata after 3 hours (10800 seconds)
+                try:
+                    asyncio.create_task(_delete_files_after_delay([pdf_result.pdf_path, pdf_result.meta_path], 10800))
+                except Exception:
+                    pass
+
+                # Suppress Gemini replies for a short period after a PDF-from-images job (PDF:N flow)
+                try:
+                    suppress_sec = int(os.getenv("SUPPRESS_GEMINI_AFTER_PDF_SECONDS", "300"))
+                    # If job had 'images_per_page' set from PDF:N, treat as pdf_once job
+                    if (job.get("images_per_page") is not None) and job.get("sender"):
+                        suppress_after_pdf[str(job.get("sender"))] = datetime.utcnow().timestamp() + max(0, suppress_sec)
+                except Exception:
+                    pass
+
                 json_log("job_sent", worker_id=worker_id, job_id=job_id)
             except asyncio.CancelledError:
                 raise
@@ -322,6 +347,17 @@ def _is_sender_allowed(chat_id: Optional[str], db: Database) -> bool:
         return chat_id not in blocks
     return True  # everyone
 
+def _is_suppressed_from_gemini(chat_id: Optional[str]) -> bool:
+    try:
+        if not chat_id:
+            return False
+        until = suppress_after_pdf.get(chat_id)
+        if not until:
+            return False
+        return (datetime.utcnow().timestamp() < until)
+    except Exception:
+        return False
+
 async def maybe_auto_reply(payload: Dict[str, Any], db: Database):
     # settings gate
     enabled = (db.get_setting("auto_reply_enabled", "0") or "0") == "1"
@@ -329,6 +365,8 @@ async def maybe_auto_reply(payload: Dict[str, Any], db: Database):
     if not chat_id:
         return
     if not _is_sender_allowed(chat_id, db):
+        return
+    if _is_suppressed_from_gemini(chat_id):
         return
     text = _extract_text_from_payload(payload)
     if not text:
@@ -354,6 +392,19 @@ async def maybe_auto_reply(payload: Dict[str, Any], db: Database):
     except Exception as e:
         json_log("auto_reply_failed", error=str(e))
 
+
+async def _delete_files_after_delay(paths: List[Path], delay_seconds: int):
+    try:
+        await asyncio.sleep(delay_seconds)
+        for p in paths:
+            try:
+                Path(p).unlink(missing_ok=True)
+            except Exception:
+                pass
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        pass
 
 async def _enqueue_batch_later(sender: str, db: Database):
     try:
@@ -888,7 +939,7 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
                 )
             return {"ok": True, "job_id": job_id}
 
-    # If user sends any text (without images) while a one-time PDF batch is active -> cancel that batch
+    # If user sends text (without images) while a one-time PDF batch is active -> do NOT cancel; just inform
     try:
         if text_msg:
             md0 = payload.get("messageData") or {}
@@ -897,22 +948,9 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
                 async with pending_lock:
                     b = pending_batches.get(sender)
                     if b and b.get("mode") == "pdf_once":
-                        # Cancel timer if any
-                        try:
-                            t = b.get("task")
-                            if t:
-                                t.cancel()
-                        except Exception:
-                            pass
-                        # Mark job cancelled and drop batch
-                        try:
-                            db.update_job_status(b["job_id"], "CANCELLED")
-                        except Exception:
-                            pass
-                        pending_batches.pop(sender, None)
                         if _is_sender_allowed(sender, db):
-                            await client.send_message(chat_id=sender, message="Okay, canceled the PDF packer.")
-                        return {"ok": True, "job_id": None}
+                            await client.send_message(chat_id=sender, message="PDF mode is active. Please continue sending images. Reply 'cancel' to cancel.")
+                        return {"ok": True, "job_id": b.get("job_id")}
     except Exception:
         pass
 
@@ -1245,8 +1283,15 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
             else:
                 converted.append(p)
 
-        # Filter to files Gemini can read (images, pdf, audio)
-        valid_ext = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp", ".mp3", ".wav", ".m4a", ".ogg", ".oga", ".webm"}
+        # Keep files Gemini can read for Q&A: PDFs, images, audio, presentations, Word docs, and text
+        valid_ext = {
+            ".pdf",
+            ".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp",
+            ".mp3", ".wav", ".m4a", ".ogg", ".oga", ".webm",
+            ".ppt", ".pptx",
+            ".doc", ".docx",
+            ".txt"
+        }
         valid_files = [p for p in converted if p.suffix.lower() in valid_ext]
         from .ocr_qa import state as _state
         # Create a new session id from msg_id (short)
@@ -1262,7 +1307,7 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
             # Delete any downloaded non-usable files
             storage.delete_files(converted)
             if _is_sender_allowed(sender, db):
-                await client.send_message(chat_id=sender, message="I couldn't read the file(s) you sent. Please send images, audio, or PDFs.")
+                await client.send_message(chat_id=sender, message="I couldn't read the file(s) you sent. Please send PDFs, presentations, Word documents, text, images, or audio.")
         return {"ok": True, "job_id": job_id}
 
     # If text and we are in QA mode for this chat
@@ -1296,8 +1341,9 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
             if _is_sender_allowed(sender, db):
                 await client.send_message(chat_id=sender, message=f"Deleted session {sid}.")
             return {"ok": True, "job_id": None}
-        # If we have any sessions, answer from active one
-        if _state.list_sessions(sender):
+        # If we have any sessions, answer from the active session (PDF, presentation, doc, text, image, or audio)
+        sessions = _state.list_sessions(sender)
+        if sessions:
             try:
                 system_prompt = db.get_setting("auto_reply_system_prompt", "") or os.getenv(
                     "GEMINI_SYSTEM_PROMPT", "Answer strictly from the provided file(s)."
@@ -1316,21 +1362,19 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
     db.update_job_status(job_id, "COMPLETED")
     json_log("no_media_payload_stored", job_id=job_id)
 
-    # Fallback intent understanding with Gemini when auto-reply is disabled or nothing matched
-    if text_msg and GeminiResponder is not None and _is_sender_allowed(sender, db):
-        auto_enabled = (db.get_setting("auto_reply_enabled", "0") or "0") == "1"
-        if not auto_enabled:
-            try:
-                system_prompt = db.get_setting("auto_reply_system_prompt", "") or os.getenv(
-                    "GEMINI_SYSTEM_PROMPT", "You are a helpful assistant. Identify the user's intent and respond concisely."
-                )
-                responder = GeminiResponder()
-                # Offload blocking SDK call to a thread to keep loop responsive
-                reply = await asyncio.to_thread(responder.generate, text_msg, system_prompt)
-                await client.send_message(chat_id=sender, message=reply)
-                json_log("fallback_gemini_reply_sent", chat_id=sender)
-            except Exception as e:
-                json_log("fallback_gemini_reply_error", error=str(e))
+    # Use Gemini for general questions when no document session handled it, unless suppressed after PDF generation
+    if text_msg and GeminiResponder is not None and _is_sender_allowed(sender, db) and not _is_suppressed_from_gemini(sender):
+        try:
+            system_prompt = db.get_setting("auto_reply_system_prompt", "") or os.getenv(
+                "GEMINI_SYSTEM_PROMPT", "You are a helpful assistant. Identify the user's intent and respond concisely."
+            )
+            responder = GeminiResponder()
+            # Offload blocking SDK call to a thread to keep loop responsive
+            reply = await asyncio.to_thread(responder.generate, text_msg, system_prompt)
+            await client.send_message(chat_id=sender, message=reply)
+            json_log("fallback_gemini_reply_sent", chat_id=sender)
+        except Exception as e:
+            json_log("fallback_gemini_reply_error", error=str(e))
 
     # Try auto reply (non-blocking) if enabled
     asyncio.create_task(maybe_auto_reply(payload, db))
