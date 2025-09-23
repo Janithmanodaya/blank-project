@@ -360,7 +360,6 @@ def _is_suppressed_from_gemini(chat_id: Optional[str]) -> bool:
 
 async def maybe_auto_reply(payload: Dict[str, Any], db: Database):
     # Auto-reply is always enabled
-    enabled = True
     chat_id = payload.get("senderData", {}).get("chatId")
     if not chat_id:
         return
@@ -372,22 +371,40 @@ async def maybe_auto_reply(payload: Dict[str, Any], db: Database):
     if not text:
         return
 
-    system_prompt = db.get_setting("auto_reply_system_prompt", "") or os.getenv(
+    base_system = db.get_setting("auto_reply_system_prompt", "") or os.getenv(
         "GEMINI_SYSTEM_PROMPT", "You are a concise helpful WhatsApp assistant."
     )
 
     if GeminiResponder is None:
         json_log("auto_reply_error", reason="gemini_module_missing")
         return
-    # enabled is always True; keep variable for clarity
 
     try:
-        responder = GeminiResponder()
-        # Offload blocking SDK call to a thread to avoid event loop stalls
-        reply = await asyncio.to_thread(responder.generate, text, system_prompt)
         client = GreenAPIClient.from_env()
-        await client.send_message(chat_id=chat_id, message=reply)
-        json_log("auto_reply_sent", chat_id=chat_id)
+
+        # Primary model: concise plain text
+        responder_primary = GeminiResponder()
+        prompt_plain = f"{base_system}\nRespond in 1–2 sentences. Plain text. No markdown, no numbering."
+        reply_plain = await asyncio.to_thread(responder_primary.generate, text, prompt_plain)
+
+        # Secondary model or formatted variant: bullet points
+        second_model = os.getenv("SECOND_GEMINI_MODEL") or os.getenv("GEMINI_MODEL_2")
+        if second_model:
+            responder_secondary = GeminiResponder(model_name=second_model)
+        else:
+            responder_secondary = responder_primary  # fall back to same model
+
+        prompt_bullets = (
+            "Format the answer as short bullet points with clear actions or key facts only. "
+            "Keep it compact and readable. Use simple markdown dashes (- ...)."
+        )
+        reply_bullets = await asyncio.to_thread(responder_secondary.generate, text, f"{base_system}\n{prompt_bullets}")
+
+        # Send both variants (different format), back-to-back
+        await client.send_message(chat_id=chat_id, message=reply_plain)
+        await client.send_message(chat_id=chat_id, message=reply_bullets)
+
+        json_log("auto_reply_sent_dual", chat_id=chat_id)
     except Exception as e:
         json_log("auto_reply_failed", error=str(e))
 
