@@ -215,6 +215,19 @@ async def worker_loop(worker_id: int):
                 db.update_job_status(job_id, "SENT")
                 db.append_job_log(job_id, {"send": send_resp, "dest_chat": dest_chat})
 
+                # Immediately delete source images used for this PDF
+                try:
+                    for fp in downloaded_files:
+                        Path(fp).unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+                # Schedule deletion of generated PDF and its metadata after 3 hours (10800 seconds)
+                try:
+                    asyncio.create_task(_delete_files_after_delay([pdf_result.pdf_path, pdf_result.meta_path], 10800))
+                except Exception:
+                    pass
+
                 json_log("job_sent", worker_id=worker_id, job_id=job_id)
             except asyncio.CancelledError:
                 raise
@@ -354,6 +367,19 @@ async def maybe_auto_reply(payload: Dict[str, Any], db: Database):
     except Exception as e:
         json_log("auto_reply_failed", error=str(e))
 
+
+async def _delete_files_after_delay(paths: List[Path], delay_seconds: int):
+    try:
+        await asyncio.sleep(delay_seconds)
+        for p in paths:
+            try:
+                Path(p).unlink(missing_ok=True)
+            except Exception:
+                pass
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        pass
 
 async def _enqueue_batch_later(sender: str, db: Database):
     try:
@@ -888,7 +914,7 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
                 )
             return {"ok": True, "job_id": job_id}
 
-    # If user sends any text (without images) while a one-time PDF batch is active -> cancel that batch
+    # If user sends text (without images) while a one-time PDF batch is active -> do NOT cancel; just inform
     try:
         if text_msg:
             md0 = payload.get("messageData") or {}
@@ -897,22 +923,9 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
                 async with pending_lock:
                     b = pending_batches.get(sender)
                     if b and b.get("mode") == "pdf_once":
-                        # Cancel timer if any
-                        try:
-                            t = b.get("task")
-                            if t:
-                                t.cancel()
-                        except Exception:
-                            pass
-                        # Mark job cancelled and drop batch
-                        try:
-                            db.update_job_status(b["job_id"], "CANCELLED")
-                        except Exception:
-                            pass
-                        pending_batches.pop(sender, None)
                         if _is_sender_allowed(sender, db):
-                            await client.send_message(chat_id=sender, message="Okay, canceled the PDF packer.")
-                        return {"ok": True, "job_id": None}
+                            await client.send_message(chat_id=sender, message="PDF mode is active. Please continue sending images. Reply 'cancel' to cancel.")
+                        return {"ok": True, "job_id": b.get("job_id")}
     except Exception:
         pass
 
