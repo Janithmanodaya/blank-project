@@ -360,17 +360,17 @@ class PDFComposer:
         cells: List[Tuple[ImageInfo, Tuple[int,int,int,int]]] = []
 
         if len(take_indices) == 2:
-            # Landscape side-by-side halves
-            page_w = self.A4_H - 2 * margin
-            page_h = self.A4_W - 2 * margin
-            cell_w = (page_w - gutter) // 2
-            left = (x0, y0, cell_w, page_h)
-            right = (x0 + cell_w + gutter, y0, cell_w, page_h)
+            # Portrait vertical stack (two equal-height cells, full width)
+            page_w = self.A4_W - 2 * margin
+            page_h = self.A4_H - 2 * margin
+            cell_h = (page_h - gutter) // 2
+            top = (x0, y0 + cell_h + gutter, page_w, cell_h)
+            bottom = (x0, y0, page_w, cell_h)
             cells = [
-                (remaining[take_indices[0]], left),
-                (remaining[take_indices[1]], right),
+                (remaining[take_indices[0]], top),
+                (remaining[take_indices[1]], bottom),
             ]
-            return cells, 2, take_indices, True
+            return cells, 2, take_indices, False
 
         # Portrait grid for 3..8 items
         page_w = self.A4_W - 2 * margin
