@@ -24,7 +24,7 @@ class GeminiResponder:
             or os.getenv("GEMINI_MODEL")
         )
         # Default to a valid Google Generative AI model
-        model = configured or "gemini-1.5-flash"
+        model = configured or "gemini-2.5-flash-lite"
         genai.configure(api_key=api_key)
         self.model = genai.GenerativeModel(model)
 
