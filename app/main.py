@@ -397,6 +397,21 @@ def _maybe_answer_math_text(txt: str) -> Optional[str]:
                 return f"{val}"
     return None
 
+def _looks_like_math_intent(txt: str) -> bool:
+    if not isinstance(txt, str):
+        return False
+    s = txt.strip()
+    low = s.lower()
+    # explicit triggers or contains digits with at least one operator/symbol
+    if any(w in low for w in _MATH_TRIGGER_WORDS):
+        return True
+    if re.search(r"\d", s) and re.search(r"[\+\-\*\/\^\%\(\)xX]", s):
+        return True
+    # simple fraction or decimal patterns
+    if re.fullmatch(r"\d+(\.\d+)?\s*/\s*\d+(\.\d+)?", s):
+        return True
+    return False
+
 
 def _extract_event_time(payload: Dict[str, Any]) -> Optional[datetime]:
     """
@@ -1018,6 +1033,19 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
                 if _is_sender_allowed(sender, db) and sender != "unknown":
                     await client.send_message(chat_id=sender, message=math_ans)
                 return {"ok": True, "job_id": None}
+            # If it looks like a math question but local engine couldn't compute, fall back to Gemini immediately.
+            if _looks_like_math_intent(text_msg) and GeminiResponder is not None:
+                try:
+                    responder = GeminiResponder()
+                    # Calculator-style prompt: force numeric result only
+                    calc_prompt = "You are a calculator. Compute the expression and return ONLY the final numeric result."
+                    reply = await asyncio.to_thread(responder.generate, text_msg, calc_prompt)
+                    if _is_sender_allowed(sender, db) and sender != "unknown":
+                        await client.send_message(chat_id=sender, message=reply.strip())
+                    return {"ok": True, "job_id": None}
+                except Exception:
+                    # If Gemini fails here, continue to other handlers; final fallback will try Gemini again.
+                    pass
 
             # If user just says "addition" without numbers, guide them once
             if low_txt.strip() in {"addition", "add"}:
