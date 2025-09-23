@@ -544,7 +544,7 @@ class PDFComposer:
                 if ipp == 4:
                     i = 0
                     gutter = max(self._mm_to_px(GUTTER_MM), 8)
-                    while i &lt; len(infos):
+                    while i < len(infos):
                         # Portrait A4
                         c.setPageSize((self._px_to_pt(self.A4_W), self._px_to_pt(self.A4_H)))
                         page_w = self.A4_W - 2 * margin
@@ -565,7 +565,7 @@ class PDFComposer:
                         page_meta = {"items": [], "orientation": "portrait", "images_per_page": 4}
 
                         for ci in range(4):
-                            if i + ci &gt;= len(infos):
+                            if i + ci >= len(infos):
                                 break
                             info = infos[i + ci]
                             x, y, w, h = cells[ci]
@@ -627,7 +627,7 @@ class PDFComposer:
                 else:
                     # General custom mode: use advanced packer capped to N images per (portrait) page for maximal fill
                     i = 0
-                    while i &lt; len(infos):
+                    while i < len(infos):
                         c.setPageSize((self._px_to_pt(self.A4_W), self._px_to_pt(self.A4_H)))  # portrait only
                         cells, used, allow_upscale, stretch = self._pack_page_advanced(infos[i:], margin, limit=ipp)
                         page_meta = {"items": [], "orientation": "portrait", "images_per_page": ipp}
