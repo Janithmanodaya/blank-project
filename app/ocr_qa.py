@@ -164,6 +164,52 @@ class GeminiFileQA:
         except Exception as e:
             return f"Error while answering: {e}"
 
+    def answer_with_correction(
+        self,
+        chat_id: str,
+        question: str,
+        system_prompt: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> Tuple[str, Optional[str]]:
+        """
+        Returns a tuple: (answer_from_files, corrected_answer_or_None).
+
+        - The first answer is STRICTLY from the provided files (same as answer()).
+        - The second answer, if present, is a concise corrected/verified answer based on model knowledge.
+          If the model believes the file-derived answer is fully correct, None is returned.
+        """
+        # First, get the strict/file-based answer.
+        file_only_answer = self.answer(chat_id, question, system_prompt, session_id)
+
+        # If the first step failed in a clear way, do not attempt correction.
+        if file_only_answer.startswith("Error while answering") or "can't find that file" in file_only_answer or "Couldn't read the file" in file_only_answer:
+            return file_only_answer, None
+
+        # Now ask the model to verify and, if needed, provide a corrected answer.
+        try:
+            verify_instructions = (
+                "You will be given a user question and an answer derived strictly from the user's files. "
+                "Act as a careful reviewer with general world knowledge. "
+                "1) If the file-derived answer is fully correct, reply with EXACT_OK and nothing else. "
+                "2) If the answer appears incomplete, incorrect, unsafe, or outdated, provide a short, corrected answer. "
+                "Keep the corrected answer concise and clear in the user's language. Do not include references."
+            )
+            parts: List[object] = [{"text": verify_instructions}]
+            parts.append({"text": f"User question: {question}"})
+            parts.append({"text": f"Answer from files: {file_only_answer}"})
+            resp = self.model.generate_content(parts)
+            corr = ""
+            try:
+                corr = (resp.text or "").strip()
+            except Exception:
+                corr = ""
+            if not corr or corr.upper().startswith("EXACT_OK"):
+                return file_only_answer, None
+            return file_only_answer, corr
+        except Exception:
+            # If verification fails, just return the file-only answer.
+            return file_only_answer, None
+
 
 # Broader YouTube URL matcher: supports watch, youtu.be, shorts, and mobile links with extra params
 YOUTUBE_RE = re.compile(
