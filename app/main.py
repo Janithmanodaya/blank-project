@@ -1027,7 +1027,25 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
                     "• pdf:N-M — Start PDF mode with custom window M minutes (e.g., pdf:10-5 → 10 per page, wait 5 minutes).\n"
                     "• cancel — Cancel the current PDF timer (if active) or a pending video download choice.\n"
                     "\n"
-                    "• Send a YouTube link — I’ll ask which quality to download (e.g., 480p/720p). Reply 1/ ""
+                    "• Send a YouTube link — I'll ask which quality to download (e.g., 480p/720p). Reply 1/2, 480p/720p, yes/ok, or cancel.\n"
+                    "• search: your query — Show top web results.\n"
+                    "• image: cats [jpg|png] — Fetch an image for your query (also works with img: ...).\n"
+                    "\n"
+                    "Document Q&A (send PDFs, images, Word, PPT, text, audio first):\n"
+                    "• list — Show your saved sessions.\n"
+                    "• use <id> — Switch to a session.\n"
+                    "• delete <id> — Delete a session.\n"
+                    "• stop / exit / quit — End Q&A mode and delete your files.\n"
+                    "\n"
+                    "Math:\n"
+                    "• Send calculations like 7*(3+4), 3^2, 10/3, etc.; I'll reply with the result."
+                )
+                try:
+                    await client.send_message(chat_id=sender, message=help_msg)
+                except Exception:
+                    pass
+            json_log("help_requested", sender=sender)
+            return {"ok": True, "job_id": None}
 
     # Simple greeting and math handlers (single concise replies)
     # IMPORTANT: If the chat has an active document Q&A session, skip math/greeting heuristics
