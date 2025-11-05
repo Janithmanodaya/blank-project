@@ -1065,14 +1065,29 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
                 # fall through to other handlers
                 pass
 
-    # One-time PDF packer command: "PDF:N" where N = images per page
+    # One-time PDF packer command:
+    # - "PDF:N" where N = images per page (default 1-minute window)
+    # - "PDF:N-M" where N = images per page, M = wait window in minutes (e.g., pdf:10-5 -> wait 5 min)
     if text_msg:
-        m = re.match(r"^\s*pdf\s*:\s*(\d+)\s*$", text_msg, flags=re.IGNORECASE)
-        if m:
+        m2 = re.match(r"^\s*pdf\s*:\s*(\d+)\s*-\s*(\d+)\s*$", text_msg, flags=re.IGNORECASE)
+        m1 = re.match(r"^\s*pdf\s*:\s*(\d+)\s*$", text_msg, flags=re.IGNORECASE) if not m2 else None
+        if m2 or m1:
             try:
-                per_page = max(1, min(12, int(m.group(1))))
+                per_page = int((m2 or m1).group(1))
+                per_page = max(1, min(12, per_page))
             except Exception:
                 per_page = 4
+            # parse optional minutes
+            window_minutes = 1
+            if m2:
+                try:
+                    window_minutes = int(m2.group(2))
+                except Exception:
+                    window_minutes = 1
+            # clamp reasonable bounds
+            window_minutes = max(1, min(60, window_minutes))
+            window_seconds = window_minutes * 60
+
             # Prepare a dedicated one-time PDF batch; timer will start after first image is received
             async with pending_lock:
                 # Cancel existing batch for this sender if any
@@ -1096,12 +1111,13 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
                     "task": None,
                     "mode": "pdf_once",
                     "per_page": per_page,
-                    "window": 60,
+                    "window": window_seconds,
                 }
             if _is_sender_allowed(sender, db) and sender != "unknown":
+                mins_txt = f"{window_minutes} minute" if window_minutes == 1 else f"{window_minutes} minutes"
                 await client.send_message(
                     chat_id=sender,
-                    message=f"PDF mode enabled for one job. Send images within 1 minute after your first image.\nI'll pack {per_page} image(s) per page."
+                    message=f"PDF mode enabled for one job. Send images within {mins_txt} after your first image.\nI'll pack {per_page} image(s) per page."
                 )
             return {"ok": True, "job_id": job_id}
 
@@ -1357,7 +1373,9 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
                     # Notify timer started
                     if _is_sender_allowed(sender, db):
                         try:
-                            await client.send_message(chat_id=sender, message="Timer started. I'll create the PDF in 1 minute.")
+                            mins = int(max(1, int(b.get("window", 60))) // 60)
+                            mins_txt = f"{mins} minute" if mins == 1 else f"{mins} minutes"
+                            await client.send_message(chat_id=sender, message=f"Timer started. I'll create the PDF in {mins_txt}.")
                         except Exception:
                             pass
                 json_log("pdf_once_batch_appended", sender=sender, job_id=job_id, added=len(image_media))
