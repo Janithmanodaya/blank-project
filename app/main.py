@@ -1015,6 +1015,20 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
 
     text_msg = _extract_text_from_payload(payload) or ""
 
+    # Early help handler to avoid falling through to Gemini fallback
+    if text_msg:
+        low_help = text_msg.strip().lower()
+        if low_help in {"/help", "help", "menu", "commands"} or low_help.startswith("/help"):
+            if _is_sender_allowed(sender, db) and sender != "unknown":
+                help_msg = (
+                    "Commands you can use:\n"
+                    "\n"
+                    "• pdf:N — Start one-time PDF mode; N images per page. Window: 1 minute after your first image.\n"
+                    "• pdf:N-M — Start PDF mode with custom window M minutes (e.g., pdf:10-5 → 10 per page, wait 5 minutes).\n"
+                    "• cancel — Cancel the current PDF timer (if active) or a pending video download choice.\n"
+                    "\n"
+                    "• Send a YouTube link — I’ll ask which quality to download (e.g., 480p/720p). Reply 1/ ""
+
     # Simple greeting and math handlers (single concise replies)
     # IMPORTANT: If the chat has an active document Q&A session, skip math/greeting heuristics
     # and let the QA block handle the message strictly from the files.
@@ -1069,24 +1083,26 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
     # - "PDF:N" where N = images per page (default 1-minute window)
     # - "PDF:N-M" where N = images per page, M = wait window in minutes (e.g., pdf:10-5 -> wait 5 min)
     if text_msg:
-        m2 = re.match(r"^\s*pdf\s*:\s*(\d+)\s*-\s*(\d+)\s*$", text_msg, flags=re.IGNORECASE)
-        m1 = re.match(r"^\s*pdf\s*:\s*(\d+)\s*$", text_msg, flags=re.IGNORECASE) if not m2 else None
-        if m2 or m1:
+        # Be tolerant of extra trailing characters (e.g., "pdf:10-5 =") and whitespace
+        m = re.search(r"pdf\s*:\s*(\d+)(?:\s*-\s*(\d+))?", text_msg, flags=re.IGNORECASE)
+        if m:
             try:
-                per_page = int((m2 or m1).group(1))
+                per_page = int(m.group(1))
                 per_page = max(1, min(12, per_page))
             except Exception:
                 per_page = 4
             # parse optional minutes
             window_minutes = 1
-            if m2:
+            if m.group(2):
                 try:
-                    window_minutes = int(m2.group(2))
+                    window_minutes = int(m.group(2))
                 except Exception:
                     window_minutes = 1
             # clamp reasonable bounds
             window_minutes = max(1, min(60, window_minutes))
             window_seconds = window_minutes * 60
+
+            json_log("pdf_command_parsed", sender=sender, per_page=per_page, window_minutes=window_minutes)
 
             # Prepare a dedicated one-time PDF batch; timer will start after first image is received
             async with pending_lock:
