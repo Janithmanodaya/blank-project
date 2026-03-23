@@ -18,7 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from urllib.parse import quote_plus, urlparse, parse_qs
 
 from .db import Database, get_db
-from .green_api import GreenAPIClient
+from .waha_api import WahaClient
 from .pdf_packer import PDFComposer, PDFComposeResult
 from .storage import Storage
 from .tasks import job_queue, workers
@@ -120,8 +120,7 @@ async def on_startup():
     for i in range(worker_count):
         workers.append(asyncio.create_task(worker_loop(i)))
 
-    # Launch Green API notification poller (for setups without webhooks)
-    workers.append(asyncio.create_task(notification_poller()))
+    # WAHA uses webhooks/websockets for events; no polling loop is needed.
     # Launch QA cleanup loop to purge sessions older than 24h
     workers.append(asyncio.create_task(qa_cleanup_loop()))
 
@@ -140,7 +139,7 @@ async def on_shutdown():
 
 async def worker_loop(worker_id: int):
     db = Database()
-    client = GreenAPIClient.from_env()
+    client = WahaClient.from_env()
     async with httpx.AsyncClient(timeout=30) as http_client:
         while True:
             try:
@@ -194,28 +193,15 @@ async def worker_loop(worker_id: int):
                         pass
                     raise
 
-                # Send the PDF back to the destination chat.
-                # Prefer direct upload-and-send to avoid 400s from sendFileByUrl on some tariffs.
+                # Send the PDF back to the destination chat via WAHA upload
                 dest_chat = os.getenv("ADMIN_CHAT_ID", "") or (job.get("sender") or "")
                 caption = f"PDF from {job['sender']} message {job['msg_id']}"
-                try:
-                    send_resp = await client.send_file_by_upload(
-                        chat_id=dest_chat,
-                        file_path=pdf_result.pdf_path,
-                        caption=caption,
-                    )
-                    # store minimal upload info consistent with previous schema
-                    db.update_job_upload(job_id, {"sentBy": "upload", "file": str(pdf_result.pdf_path)})
-                except Exception:
-                    # Fallback: upload to Green API storage then send by URL
-                    upload = await client.upload_file(pdf_result.pdf_path)
-                    db.update_job_upload(job_id, upload)
-                    send_resp = await client.send_file_by_url(
-                        chat_id=dest_chat,
-                        url_file=upload.get("urlFile", ""),
-                        filename=pdf_result.pdf_path.name,
-                        caption=caption,
-                    )
+                send_resp = await client.send_file_by_upload(
+                    chat_id=dest_chat,
+                    file_path=pdf_result.pdf_path,
+                    caption=caption,
+                )
+                db.update_job_upload(job_id, {"sentBy": "upload", "file": str(pdf_result.pdf_path)})
                 db.update_job_status(job_id, "SENT")
                 db.append_job_log(job_id, {"send": send_resp, "dest_chat": dest_chat})
 
@@ -259,12 +245,8 @@ async def worker_loop(worker_id: int):
 
 def _extract_text_from_payload(payload: Dict[str, Any]) -> Optional[str]:
     """
-    Extract human text from common Green-API payload shapes.
-    Handles:
-      - textMessageData.textMessage (typeMessage == textMessage)
-      - extendedTextMessageData.text (typeMessage == extendedTextMessage)
-      - captions for image/file/document
-    Fallback: None
+    Extract human text from common Green-API-like payload shapes.
+    Also supports normalized WAHA payload via messageData.textMessageData.textMessage.
     """
     md = payload.get("messageData") or {}
     if not md:
@@ -281,7 +263,6 @@ def _extract_text_from_payload(payload: Dict[str, Any]) -> Optional[str]:
     # Extended text (links often live here)
     if t == "extendedtextmessage":
         etd = md.get("extendedTextMessageData") or {}
-        # Green-API usually uses 'text'
         for k in ("text", "description", "title"):
             v = etd.get(k)
             if isinstance(v, str) and v.strip():
@@ -293,6 +274,10 @@ def _extract_text_from_payload(payload: Dict[str, Any]) -> Optional[str]:
             cap = (md.get(k) or {}).get("caption")
             if isinstance(cap, str) and cap.strip():
                 return cap
+
+    # Fallback to top-level body used by normalized WAHA
+    if "body" in md and isinstance(md.get("body"), str):
+        return md.get("body")
 
     return None
 
@@ -499,7 +484,7 @@ async def maybe_auto_reply(payload: Dict[str, Any], db: Database):
         return
 
     try:
-        client = GreenAPIClient.from_env()
+        client = WahaClient.from_env()
         responder = GeminiResponder()
         prompt = f"{base_system}\nRespond in one short sentence. Plain text only."
         reply = await asyncio.to_thread(responder.generate, text, prompt, chat_id)
@@ -543,7 +528,7 @@ async def _enqueue_batch_later(sender: str, db: Database):
         json_log("batch_enqueue_error", sender=sender, error=str(e))
 
 async def _enqueue_pdf_once_later(sender: str, db: Database, window: int = 60):
-    client = GreenAPIClient.from_env()
+    client = WahaClient.from_env()
     try:
         await asyncio.sleep(window)
         async with pending_lock:
@@ -698,7 +683,7 @@ async def _google_images_candidates(query: str) -> List[str]:
         # Strategy 1: extract from /imgres?imgurl=... links
         import re
         from urllib.parse import unquote, urlparse, parse_qs
-        hrefs = re.findall(r'href="/imgres\\?([^"]+)"', html)
+        hrefs = re.findall(r'href=\"/imgres\\?([^\"]+)\"', html)
         urls: List[str] = []
         for h in hrefs:
             qs = parse_qs(h)
@@ -711,7 +696,7 @@ async def _google_images_candidates(query: str) -> List[str]:
 
         # Strategy 2: fallback to direct img src attributes (thumbnails often, but sometimes originals)
         if not urls:
-            srcs = re.findall(r'<img[^>]+src="(https?://[^"]+)"', html)
+            srcs = re.findall(r'<img[^>]+src=\"(https?://[^\"]+)\"', html)
             urls = [s for s in srcs if s.lower().startswith("http") and "gstatic" not in s.lower()]
 
         # Dedup and limit
@@ -771,7 +756,7 @@ async def _search_verify_send_image(sender: str, query: str, prefer_ext: str, db
     - Avoid TIFF/SVG/HEIC and other unsupported formats before sending.
     Sends a short 'please wait' message to the user up-front.
     """
-    client = GreenAPIClient.from_env()
+    client = WahaClient.from_env()
     # Avoid sending a preliminary message to prevent duplicate-looking replies.
 
     tmp_dir = storage.base / "tmp"
@@ -832,7 +817,6 @@ async def _search_verify_send_image(sender: str, query: str, prefer_ext: str, db
                 # Output file path
                 out_path = src_path.with_suffix(".png" if target_fmt == "PNG" else ".jpg")
                 if target_fmt == "PNG":
-                    # PNG compress level; try to keep reasonable size (<5MB) but PNG may be larger
                     im.save(out_path, format="PNG", optimize=True)
                     # If PNG still huge and no alpha, fallback to JPEG
                     if out_path.stat().st_size > 5 * 1024 * 1024 and not has_alpha:
@@ -899,20 +883,14 @@ async def _search_verify_send_image(sender: str, query: str, prefer_ext: str, db
                     pass
                 continue
 
-            # Prefer direct upload-and-send to ensure WhatsApp treats it as an image and avoid URL/plan issues.
+            # Direct upload-and-send via WAHA
             if _is_sender_allowed(sender, db):
                 cap = f"Image for: {query}"
                 try:
-                    await client.send_file_by_upload(chat_id=sender, file_path=out_proc, caption=cap)
+                    await client.send_image_by_upload(chat_id=sender, file_path=out_proc, caption=cap)
                 except Exception:
-                    # Fallback: upload to Green API storage then send by image endpoint (with internal fallback to file)
-                    up = await client.upload_file(out_proc)
-                    await client.send_image_by_url(
-                        chat_id=sender,
-                        url_file=up.get("urlFile", ""),
-                        caption=cap,
-                        filename=out_proc.name,
-                    )
+                    # Fallback to generic file if image endpoint fails
+                    await client.send_file_by_upload(chat_id=sender, file_path=out_proc, caption=cap)
             try:
                 bin_path.unlink(missing_ok=True)
                 if out_proc != bin_path:
@@ -937,12 +915,71 @@ async def _search_verify_send_image(sender: str, query: str, prefer_ext: str, db
     return False
 
 
+def _normalize_waha_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Convert WAHA webhook to a Green-API-like payload our handler expects.
+    WAHA example:
+    {
+      "event": "message",
+      "session": "default",
+      "payload": {
+        "id": "...",
+        "timestamp": 1667561485,
+        "from": "11111111111@c.us",
+        "to": "...",
+        "body": "Hi there!",
+        "hasMedia": false,
+        "media": { "url": "...", "mimetype": "...", "filename": "..." }
+      }
+    }
+    """
+    try:
+        if not isinstance(payload, dict):
+            return None
+        if "event" not in payload or "payload" not in payload:
+            return None
+        ev = str(payload.get("event") or "").lower()
+        if not ev.startswith("message"):
+            # ignore non-message events
+            return None
+        p = payload.get("payload") or {}
+        chat_id = p.get("from") or p.get("participant") or p.get("to")
+        msg_id = p.get("id") or f"{datetime.utcnow().timestamp()}"
+        md: Dict[str, Any] = {"typeMessage": "textMessage", "textMessageData": {"textMessage": p.get("body") or ""}, "timestamp": p.get("timestamp")}
+        medias: List[Dict[str, Any]] = []
+        if p.get("hasMedia") and isinstance(p.get("media"), dict) and p["media"].get("url"):
+            m = p["media"]
+            medias.append({
+                "urlFile": m.get("url"),
+                "mimeType": m.get("mimetype") or m.get("mimeType"),
+                "fileName": m.get("filename") or "",
+                "caption": p.get("body") or "",
+            })
+            # When media present, adjust type
+            md["typeMessage"] = "documentMessage"
+            md["documentMessageData"] = {"caption": p.get("body") or "", "downloadUrl": m.get("url"), "mimeType": m.get("mimetype") or m.get("mimeType")}
+        normalized = {
+            "typeWebhook": "incomingMessageReceived",
+            "idMessage": msg_id,
+            "messageData": md if not medias else {**md, "medias": medias},
+            "senderData": {"chatId": chat_id},
+        }
+        return normalized
+    except Exception:
+        return None
+
+
 async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict[str, Any]:
     # Persist raw payload
     ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
     storage.save_incoming_payload(payload, f"{ts}.json")
 
-    # Validate minimal structure (Green-API incomingMessageReceived)
+    # Normalize WAHA webhook if needed
+    norm = _normalize_waha_payload(payload)
+    if norm is not None:
+        payload = norm
+
+    # Validate minimal structure (incoming message)
     webhook_type = payload.get("typeWebhook")
     if not webhook_type:
         json_log("webhook_ignored", reason="missing_typeWebhook")
@@ -953,7 +990,7 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
         return {"ok": True, "ignored": True}
 
     # Extract sender, message id, media list heuristically
-    instance_id = payload.get("instanceData", {}).get("idInstance") or os.getenv("GREEN_API_INSTANCE_ID", "")
+    instance_id = payload.get("instanceData", {}).get("idInstance") or os.getenv("WAHA_SESSION", "default")
     # Try multiple locations for sender/chat id; some notifications omit senderData
     message_data = payload.get("messageData") or {}
     sender = (
@@ -1011,7 +1048,7 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
     # Feature: OCR/QA, YouTube, and search handling
     from .ocr_qa import GeminiFileQA, state as qa_state, find_youtube_url
 
-    client = GreenAPIClient.from_env()
+    client = WahaClient.from_env()
 
     text_msg = _extract_text_from_payload(payload) or ""
 
@@ -1268,10 +1305,9 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
                 else:
                     video_path = candidates[0]
                     json_log("ytdl_download_succeeded", sender=sender, file=str(video_path))
-                    up = await client.upload_file(video_path)
                     if _is_sender_allowed(sender, db):
                         cap = f"Here is your video ({selected_fmt.get('label','')})."
-                        await client.send_file_by_url(chat_id=sender, url_file=up.get("urlFile", ""), filename=video_path.name, caption=cap)
+                        await client.send_file_by_upload(chat_id=sender, file_path=video_path, caption=cap)
                     try:
                         video_path.unlink()
                     except Exception:
@@ -1600,35 +1636,6 @@ async def handle_incoming_payload(payload: Dict[str, Any], db: Database) -> Dict
     return {"ok": True, "job_id": job_id}
 
 
-async def notification_poller():
-    """
-    Polls Green API ReceiveNotification for incoming messages and routes them
-    through the same handler as the /webhook.
-    """
-    db = Database()
-    client = GreenAPIClient.from_env()
-    while True:
-        try:
-            data = await client.receive_notification()
-            if not data:
-                await asyncio.sleep(0.5)
-                continue
-            receipt_id = data.get("receiptId")
-            body = data.get("body") or data
-            res = await handle_incoming_payload(body, db)
-            json_log("receive_notification_handled", **{"ok": res.get("ok", False), "job_id": res.get("job_id")})
-            if receipt_id is not None:
-                try:
-                    await client.delete_notification(int(receipt_id))
-                except Exception as e:
-                    json_log("delete_notification_error", error=str(e), receipt_id=receipt_id)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            json_log("receive_notification_error", error=str(e))
-            await asyncio.sleep(2.0)
-
-
 async def qa_cleanup_loop():
     """
     Periodically purge per-chat sessions and files older than 24 hours.
@@ -1677,7 +1684,7 @@ async def _web_search_links(query: str) -> List[str]:
                 return []
             html = r.text
             import re
-            links = re.findall(r'<a rel="nofollow" class="result__a" href="([^"]+)"', html)
+            links = re.findall(r'<a rel="nofollow" class="result__a" href="([^\"]+)"', html)
             # Clean /l/?kh=-1&uddg= encoded
             cleaned: List[str] = []
             from urllib.parse import urlparse, parse_qs, unquote
@@ -1706,6 +1713,15 @@ async def health():
 
 
 def run():
+    import uvicorn
+
+    host = os.getenv("HOST", "0.0.0.0")
+    port = int(os.getenv("PORT", "8080"))
+    uvicorn.run("app.main:app", host=host, port=port, reload=False)
+
+
+if __name__ == "__main__":
+    run():
     import uvicorn
 
     host = os.getenv("HOST", "0.0.0.0")
